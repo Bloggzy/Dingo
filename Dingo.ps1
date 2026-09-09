@@ -41,7 +41,8 @@ $script:LanguageChangePending = $false
 $script:InstanceMutex = $null
 $script:PendingApply = $null
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.5.0'
+$script:DingoVersion = '0.5.1'
+$script:DeviceIsManaged = $null
 $automaticArguments = @(Get-Variable -Name args -ValueOnly -ErrorAction SilentlyContinue)
 $script:UnexpectedArguments = @(@($UnexpectedArguments) + $automaticArguments | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
 
@@ -96,6 +97,50 @@ function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-DeviceIsManaged {
+    # Microsoft Edge refuses a subset of its policies unless Windows is joined to
+    # an Active Directory domain, joined to Entra ID, or enrolled in a real MDM
+    # service. Edge reports such a policy at edge://policy as "Error, Ignored:
+    # This policy is blocked, its value will be ignored." Read the join state
+    # from the registry and CIM so no external command runs during a state scan.
+    if ($null -ne $script:DeviceIsManaged) { return $script:DeviceIsManaged }
+    $managed = $false
+    try {
+        if ((Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).PartOfDomain) { $managed = $true }
+    } catch {
+        Write-Log 'WARN' "Could not read the domain join state: $($_.Exception.Message)"
+    }
+    if (-not $managed) {
+        $joinInfo = 'HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo'
+        if ((Test-Path -LiteralPath $joinInfo) -and @(Get-ChildItem -LiteralPath $joinInfo -ErrorAction SilentlyContinue).Count) { $managed = $true }
+    }
+    if (-not $managed) {
+        # Windows ships around thirty placeholder enrollment keys that all report
+        # EnrollmentState 1. A real enrollment also carries a discovery URL or an
+        # enrolled user principal name, so require one of those.
+        foreach ($key in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue)) {
+            $values = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+            if (-not $values) { continue }
+            $state = if ($values.PSObject.Properties['EnrollmentState']) { [int]$values.EnrollmentState } else { 0 }
+            $url = if ($values.PSObject.Properties['DiscoveryServiceFullURL']) { [string]$values.DiscoveryServiceFullURL } else { '' }
+            $upn = if ($values.PSObject.Properties['UPN']) { [string]$values.UPN } else { '' }
+            if ($state -eq 1 -and ($url -or $upn)) { $managed = $true; break }
+        }
+    }
+    $script:DeviceIsManaged = $managed
+    Write-Log 'DEBUG' "Device management state: $(if ($managed) { 'managed' } else { 'not managed' })."
+    return $managed
+}
+
+function Get-SettingAdvisory($Setting) {
+    # A caveat that Dingo cannot fix by writing the setting. Dingo still applies
+    # the value, because it takes effect if the VM is later joined to a domain
+    # or enrolled, but the operator is told plainly that it does nothing today.
+    if (-not $Setting.Requirements.ContainsKey('ManagedDevice')) { return '' }
+    if (Test-DeviceIsManaged) { return '' }
+    return 'Edge blocks this policy because this device is not joined to a domain or Entra ID and is not enrolled in Intune. Dingo writes and verifies the value, but Edge ignores it. Set the search engine by hand at edge://settings/searchEngines, or apply this on a managed image.'
 }
 
 function Initialize-Log {
@@ -405,7 +450,7 @@ function Get-Settings {
         (New-Entry Machine $edge 'DefaultSearchProviderKeyword' 'duckduckgo.com' $script:RemoveValue String),
         (New-Entry Machine $edge 'DefaultSearchProviderSearchURL' 'https://duckduckgo.com/?q={searchTerms}' $script:RemoveValue String),
         (New-Entry Machine $edge 'DefaultSearchProviderSuggestURL' 'https://duckduckgo.com/ac/?q={searchTerms}&type=list' $script:RemoveValue String)
-    )))
+    ) -Requirements @{ ManagedDevice=$true }))
 
     [void]$settings.Add((New-Setting 'terminal-cwd' 'Windows Terminal' 'Windows PowerShell starting directory' 'Use the parent process directory or the user profile.' 'Parent process directory' 'User profile directory' 'Terminal'))
     [void]$settings.Add((New-Setting 'start-bing' 'Start menu' 'Bing/web search' 'Disable or restore default web suggestions in Start/Search.' 'Disabled' 'Enabled/default' 'Registry' @(
@@ -841,7 +886,14 @@ function Get-SettingState($Setting) {
     try {
         $handler = Get-SettingHandler $Setting.Kind
         $readCommand = [string]$handler.Read
-        return & $readCommand $Setting
+        $state = & $readCommand $Setting
+        # A setting can be written and verified and still do nothing, so carry the
+        # caveat with the state rather than reporting an unqualified success.
+        $advisory = Get-SettingAdvisory $Setting
+        if ($advisory) {
+            $state.Details = if ($state.Details) { "$($state.Details) $advisory" } else { $advisory }
+        }
+        return $state
     }
     catch {
         Write-Log 'WARN' "State read failed [$($Setting.Id)]: $($_.Exception.Message)"
@@ -979,11 +1031,15 @@ function Invoke-SettingChange($Item, [hashtable]$AdministratorResults) {
             throw "Windows still reports '$reason' instead of '$($Item.DesiredState)'."
         }
         [void]$components.Add((New-OperationComponent 'Final verification' 'Succeeded' "Windows reports '$($Item.CurrentState.DisplayText)'."))
-        $result = New-ApplyResult $Item.Id @($components) 'Applied and verified.' $Item.RestartExplorer $Item.RestartRequired
+        # The write succeeded, so the outcome and the exit code stay successful.
+        # Only the operator-facing wording changes when a caveat applies.
+        $advisory = Get-SettingAdvisory $Item
+        $message = if ($advisory) { "Applied and verified. $advisory" } else { 'Applied and verified.' }
+        $result = New-ApplyResult $Item.Id @($components) $message $Item.RestartExplorer $Item.RestartRequired
         $Item.LastApplyResult = $result
-        $Item.Status = 'Succeeded'
-        $Item.Details = "Now set to: $($Item.CurrentState.DisplayText)"
-        Write-Log 'INFO' "SUCCESS [$($Item.Id)] => $($Item.CurrentState.DisplayText)"
+        $Item.Status = if ($advisory) { 'Applied with caveat' } else { 'Succeeded' }
+        $Item.Details = if ($advisory) { "Written, but Edge ignores it here. $advisory" } else { "Now set to: $($Item.CurrentState.DisplayText)" }
+        Write-Log $(if ($advisory) { 'WARN' } else { 'INFO' }) "SUCCESS [$($Item.Id)] => $($Item.CurrentState.DisplayText)$(if ($advisory) { " (caveat: $advisory)" })"
         return $result
     } catch {
         $message = $_.Exception.Message
@@ -1332,6 +1388,33 @@ if ($SelfTest) {
         Remove-Item -LiteralPath $keepTestDirectory -Recurse -Force -ErrorAction SilentlyContinue
     }
     if ((Get-Command Remove-WidgetsPackages).Definition -match "Get-Process[^`n]*\*Widget\*") { throw 'Widgets process termination must not use a wildcard name match.' }
+    # Edge blocks its search-provider policy on an unmanaged device. Dingo must
+    # still write it, must not block the plan, and must say plainly that Edge
+    # will ignore it.
+    $searchSetting = $script:Settings | Where-Object Id -eq 'edge-duckduckgo' | Select-Object -First 1
+    if (-not $searchSetting -or -not $searchSetting.Requirements.ContainsKey('ManagedDevice')) {
+        throw 'The Edge search-provider setting must declare that it needs a managed device.'
+    }
+    $savedManagedState = $script:DeviceIsManaged
+    try {
+        $script:DeviceIsManaged = $false
+        $unmanagedAdvisory = Get-SettingAdvisory $searchSetting
+        if ($unmanagedAdvisory -notmatch 'ignores it') { throw 'An unmanaged device must produce a search-provider caveat.' }
+        # The caveat must never stop the setting being applied, or a single
+        # unmanaged VM would block the whole preferred plan.
+        $advisoryPreflight = Test-SettingPreflight $searchSetting
+        if (-not $advisoryPreflight.Available) { throw "The caveat must not fail preflight: $($advisoryPreflight.Message)" }
+        $unmanagedState = Get-SettingState $searchSetting
+        if ($unmanagedState.Details -notmatch 'ignores it') { throw 'The read state must carry the caveat.' }
+        $script:DeviceIsManaged = $true
+        if (Get-SettingAdvisory $searchSetting) { throw 'A managed device must produce no search-provider caveat.' }
+        $script:DeviceIsManaged = $false
+        foreach ($otherSetting in @($script:Settings | Where-Object { $_.Id -ne 'edge-duckduckgo' })) {
+            if (Get-SettingAdvisory $otherSetting) { throw "Setting '$($otherSetting.Id)' must not carry a managed-device caveat." }
+        }
+    } finally {
+        $script:DeviceIsManaged = $savedManagedState
+    }
     $toggleCount = @($script:Settings | Where-Object CanChoose).Count
     if ($toggleCount -lt 20) { throw "Expected at least 20 reversible settings, found $toggleCount." }
     "Self-test passed: 26 settings; $toggleCount reversible."
@@ -1396,6 +1479,7 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
                     Id=$item.Id; Name=$item.Name; Kind=$item.Kind; Scope=$item.DisplayScope; RequiresAdmin=$item.RequiresAdmin
                     Available=$check.Available; PreflightMessage=$check.Message
                     CurrentStatus=$item.CurrentState.Status; CurrentState=$item.CurrentState.DisplayText; Target=$item.PreferredState
+                    Advisory=(Get-SettingAdvisory $item)
                 }
             })
             $exitCode = if ($blocked) { 2 } else { 0 }
@@ -1406,6 +1490,7 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             } else {
                 Write-CliStatus "Dingo dry run: $($selected.Count) preferred setting(s) would be applied. No changes were made."
                 [Console]::Out.WriteLine(($plan | Format-Table Id,Name,Kind,Scope,RequiresAdmin,Available,CurrentStatus,CurrentState,Target -AutoSize | Out-String -Width 240).TrimEnd())
+                foreach ($advised in @($plan | Where-Object Advisory)) { [Console]::Out.WriteLine("[$($advised.Id)] Caveat: $($advised.Advisory)") }
                 foreach ($failure in $blocked) { [Console]::Error.WriteLine("[$($failure.Id)] Preflight failed: $($failure.Message)") }
             }
             Write-Log 'INFO' "Quick-apply dry run completed for $($selected.Count) setting(s)."
@@ -1650,6 +1735,22 @@ function New-SettingCard($Item) {
         $adminBadge.Child = $badgeText
         [void]$about.Children.Add($adminBadge)
     }
+    # Show a caveat that applying the setting cannot resolve, so the card never
+    # implies a result Windows or the target application will not honour.
+    $advisory = Get-SettingAdvisory $Item
+    if ($advisory) {
+        $advisoryBorder = New-Object Windows.Controls.Border
+        $advisoryBorder.Background = '#FFF1F0'
+        $advisoryBorder.BorderBrush = '#F3B3AE'
+        $advisoryBorder.BorderThickness = '1'
+        $advisoryBorder.CornerRadius = '4'
+        $advisoryBorder.Padding = '8,5'
+        $advisoryBorder.Margin = '0,7,8,0'
+        $advisoryText = New-CardText "Has no effect on this VM. $advisory" 11 'SemiBold' '#8A2B21'
+        $advisoryText.Margin = '0'
+        $advisoryBorder.Child = $advisoryText
+        [void]$about.Children.Add($advisoryBorder)
+    }
     Add-CardColumn $grid $about 1
 
     $state = New-Object Windows.Controls.StackPanel
@@ -1736,6 +1837,7 @@ function Refresh-UI {
             'Succeeded' { '#16803C' }
             'Failed' { '#B42318' }
             'Partially applied' { '#B45309' }
+            'Applied with caveat' { '#B45309' }
             'Running' { '#0B6EBD' }
             default { '#334E68' }
         }
