@@ -41,7 +41,7 @@ $script:LanguageChangePending = $false
 $script:InstanceMutex = $null
 $script:PendingApply = $null
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.5.2'
+$script:DingoVersion = '0.5.3'
 $script:DeviceIsManaged = $null
 $automaticArguments = @(Get-Variable -Name args -ValueOnly -ErrorAction SilentlyContinue)
 $script:UnexpectedArguments = @(@($UnexpectedArguments) + $automaticArguments | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
@@ -461,6 +461,30 @@ function Get-Settings {
         (New-Entry Machine $edge 'DefaultSearchProviderKeyword' $script:RemoveValue $script:RemoveValue String),
         (New-Entry Machine $edge 'DefaultSearchProviderSearchURL' $script:RemoveValue $script:RemoveValue String),
         (New-Entry Machine $edge 'DefaultSearchProviderSuggestURL' $script:RemoveValue $script:RemoveValue String)
+    )))
+
+    # None of these are protected policies, so they apply on an unmanaged VM.
+    # The three NewTabPage values are what actually removes the news feed,
+    # weather, and background images; WinUtil's Edge debloat does not cover them.
+    [void]$settings.Add((New-Setting 'edge-debloat' 'Microsoft Edge' 'Clutter, promotions, and new tab page' 'Remove the new tab page news feed, weather, background images, and quick links, plus Collections, shopping, Rewards, wallet donations, Insider and default-browser promotions, the web widget, feedback, telemetry, and the Copilot Discover Chat extension. Sends Do Not Track. Restart Edge to finish applying it.' 'Removed' 'Edge default' 'Registry' @(
+        (New-Entry Machine $edge 'NewTabPageContentEnabled' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'NewTabPageAllowedBackgroundTypes' 3 $script:RemoveValue),
+        (New-Entry Machine $edge 'NewTabPageQuickLinksEnabled' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'EdgeCollectionsEnabled' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'EdgeShoppingAssistantEnabled' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'ShowMicrosoftRewards' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'WalletDonationEnabled' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'MicrosoftEdgeInsiderPromotionEnabled' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'DefaultBrowserSettingsCampaignEnabled' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'WebWidgetAllowed' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'UserFeedbackAllowed' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'AlternateErrorPagesEnabled' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'EdgeAssetDeliveryServiceEnabled' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'DiagnosticData' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'ConfigureDoNotTrack' 1 $script:RemoveValue),
+        (New-Entry Machine 'SOFTWARE\Policies\Microsoft\EdgeUpdate' 'CreateDesktopShortcutDefault' 0 $script:RemoveValue),
+        # Copilot's "Discover Chat" extension.
+        (New-Entry Machine "$edge\ExtensionInstallBlocklist" '1' 'ofefcgjbeghpigppfmkologfjadafddi' $script:RemoveValue String)
     )))
 
     [void]$settings.Add((New-Setting 'terminal-cwd' 'Windows Terminal' 'Windows PowerShell starting directory' 'Use the parent process directory or the user profile.' 'Parent process directory' 'User profile directory' 'Terminal'))
@@ -1282,7 +1306,7 @@ if ($FinalizeInternationalSettings) {
 }
 
 if ($SelfTest) {
-    if ($script:Settings.Count -ne 26) { throw "Expected 26 settings, found $($script:Settings.Count)." }
+    if ($script:Settings.Count -ne 27) { throw "Expected 27 settings, found $($script:Settings.Count)." }
     foreach ($workerHelper in @('Test-DisplayLanguagePackInstalled','Install-DisplayLanguagePack','Write-Utf8FileAtomically','New-ApplyResult','New-OperationComponent')) {
         if (-not (Get-Command $workerHelper -CommandType Function -ErrorAction SilentlyContinue)) { throw "Elevated-worker helper is unavailable: $workerHelper" }
     }
@@ -1423,6 +1447,34 @@ if ($SelfTest) {
             throw "'$suppressor' must be removed by the preferred state; it suppresses ManagedSearchEngines."
         }
     }
+    # The Edge debloat setting must be fully reversible and must include the
+    # three NewTabPage values, which are the ones that remove the news feed,
+    # weather, and background images.
+    $debloatSetting = $script:Settings | Where-Object Id -eq 'edge-debloat' | Select-Object -First 1
+    if (-not $debloatSetting) { throw 'The Edge debloat setting is missing.' }
+    $requiredDebloat = @{
+        NewTabPageContentEnabled=0; NewTabPageAllowedBackgroundTypes=3; NewTabPageQuickLinksEnabled=0
+        EdgeCollectionsEnabled=0; EdgeShoppingAssistantEnabled=0; ShowMicrosoftRewards=0
+        WalletDonationEnabled=0; MicrosoftEdgeInsiderPromotionEnabled=0; DefaultBrowserSettingsCampaignEnabled=0
+        WebWidgetAllowed=0; UserFeedbackAllowed=0; AlternateErrorPagesEnabled=0
+        EdgeAssetDeliveryServiceEnabled=0; DiagnosticData=0; ConfigureDoNotTrack=1
+        CreateDesktopShortcutDefault=0
+    }
+    foreach ($valueName in $requiredDebloat.Keys) {
+        $entry = $debloatSetting.Entries | Where-Object Name -eq $valueName | Select-Object -First 1
+        if (-not $entry) { throw "The Edge debloat setting is missing '$valueName'." }
+        if ([int]$entry.Preferred -ne [int]$requiredDebloat[$valueName]) { throw "'$valueName' has the wrong preferred value." }
+    }
+    if (-not ($debloatSetting.Entries | Where-Object { $_.Path -match 'ExtensionInstallBlocklist$' })) {
+        throw 'The Edge debloat setting must block the Copilot Discover Chat extension.'
+    }
+    # Every entry must be removable, or the setting could not be undone.
+    foreach ($entry in $debloatSetting.Entries) {
+        if ($entry.Alternate -ne $script:RemoveValue) { throw "Debloat entry '$($entry.Name)' is not reversible." }
+        if ($entry.Scope -ne 'Machine') { throw "Debloat entry '$($entry.Name)' must be a computer-wide policy." }
+    }
+    if (-not $debloatSetting.CanChoose) { throw 'The Edge debloat setting must be reversible from the card.' }
+
     # The advisory machinery stays available for future settings even though no
     # shipped setting needs it now, so prove it still works with a stand-in.
     $savedManagedState = $script:DeviceIsManaged
@@ -1443,7 +1495,7 @@ if ($SelfTest) {
     }
     $toggleCount = @($script:Settings | Where-Object CanChoose).Count
     if ($toggleCount -lt 20) { throw "Expected at least 20 reversible settings, found $toggleCount." }
-    "Self-test passed: 26 settings; $toggleCount reversible."
+    "Self-test passed: 27 settings; $toggleCount reversible."
     exit 0
 }
 

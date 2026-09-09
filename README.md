@@ -16,7 +16,7 @@ No installation or PowerShell modules are required. Windows PowerShell 5.1 is in
 
 ## Quick apply without the GUI
 
-Use the same launcher with `-ApplyPreferred` to apply all 26 preferred settings without opening the selection window:
+Use the same launcher with `-ApplyPreferred` to apply all 27 preferred settings without opening the selection window:
 
 ```bat
 Start-Dingo.cmd -ApplyPreferred
@@ -58,7 +58,7 @@ Start-Dingo.cmd -Help
 - Current-state reads distinguish preferred, alternate, partial, unavailable, and error states. A read error is never treated as a missing setting, and **Check only settings that need changing** leaves unreadable settings unchecked.
 - Application results track the user, protected-user, computer-wide, and final-verification components separately, so a mixed setting can be reported as partially applied instead of as an undifferentiated failure.
 - The GUI stays in the signed-in desktop account, so per-user settings affect the correct Windows profile even when separate administrator credentials are needed. Protected per-user policy values are written by the elevated helper directly to that desktop user's SID, not to the administrator's profile.
-- Twenty-one settings offer plainly labelled reversible choices. The five one-way targets—UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal—can be left alone by unticking their cards.
+- Twenty-two settings offer plainly labelled reversible choices. The five one-way targets—UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal—can be left alone by unticking their cards.
 - **Read settings again** rereads every configured value without making changes.
 - Preflight is all-or-nothing: an unsupported plan is stopped before any changes. Once application begins, an individual setting failure does not stop later selected settings from running.
 - Logs are written to the `Logs` folder beside the script, so a copy deployed to `C:\DFIR\Tools\Dingo` logs to `C:\DFIR\Tools\Dingo\Logs`. The GUI can open that folder. Dingo keeps the 20 most recent logs and deletes older ones on the next launch.
@@ -73,6 +73,7 @@ Start-Dingo.cmd -Help
 - The Windows Copilot setting also removes Copilot shortcuts that Windows exposes in the signed-in user's standard taskbar pin folder; it does not uninstall Copilot apps.
 - Windows Terminal's settings.json is serialized and validated before it atomically replaces the live file. Every change creates a uniquely named backup, and Dingo keeps the 10 most recent backups per settings file.
 - Windows Terminal ships its settings as JSONC, which permits `//` and `/* */` comments and trailing commas. Windows PowerShell 5.1 cannot parse those, so Dingo removes them before reading. Text inside string values, such as a `https://` URL, is left alone. Rewriting the file writes plain JSON: any comment you added survives in the backup but not in the new file.
+- The Edge clutter setting removes the new tab page news feed and weather (`NewTabPageContentEnabled`), background images (`NewTabPageAllowedBackgroundTypes` = 3, DisableAll), and quick links (`NewTabPageQuickLinksEnabled`), plus Collections, shopping, Rewards, wallet donations, Insider and default-browser promotions, the web widget, feedback, alternate error pages, asset delivery, and telemetry. It sends Do Not Track and blocks Copilot's Discover Chat extension (`ofefcgjbeghpigppfmkologfjadafddi`). Every value is removable, so the card reverses cleanly. Restart Edge to finish applying it. The three new-tab-page values are the ones that matter most and are not covered by Chris Titus Tech's WinUtil Edge debloat.
 - Showing protected operating-system files is intentionally marked with a caution.
 - On Windows 11 Pro, Enterprise, or Education, the optional **Forensic continuity: manual updates and restarts** policy prevents Windows Update from automatically downloading or installing updates, disables update deadline enforcement, blocks update-driven restarts while a user is signed in, and suppresses all Windows Update notifications. This trades automatic patching for uninterrupted evidence processing: operators must check, install, and restart during a controlled maintenance window.
 
@@ -98,7 +99,7 @@ Start-Dingo.cmd -Help
 - Explorer This PC, hidden files, extensions, protected files, navigation expansion, and long paths
 - OneDrive sync and Windows Copilot policies
 - Forensic-continuity control for manual Windows Update installation/restarts and suppressed update notifications
-- Edge first-run/import controls, password manager, Copilot surfaces, and a Google/DuckDuckGo search engine list with no Bing
+- Edge first-run/import controls, password manager, Copilot surfaces, a Google/DuckDuckGo search engine list with no Bing, and a clutter/new-tab-page cleanup
 - Windows PowerShell parent-process directory in Windows Terminal
 - Start-menu Bing/web search and recommendations
 
