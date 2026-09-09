@@ -41,7 +41,7 @@ $script:LanguageChangePending = $false
 $script:InstanceMutex = $null
 $script:PendingApply = $null
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.5.1'
+$script:DingoVersion = '0.5.2'
 $script:DeviceIsManaged = $null
 $automaticArguments = @(Get-Variable -Name args -ValueOnly -ErrorAction SilentlyContinue)
 $script:UnexpectedArguments = @(@($UnexpectedArguments) + $automaticArguments | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
@@ -444,13 +444,24 @@ function Get-Settings {
         (New-Entry Machine $edge 'AllowBrowsingWithCopilot' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'M365LinksAutoOpenCopilotEnabled' 0 $script:RemoveValue)
     )))
-    [void]$settings.Add((New-Setting 'edge-duckduckgo' 'Microsoft Edge' 'Default search provider' 'Set DuckDuckGo or remove the managed search-provider policy.' 'DuckDuckGo' 'Browser default/unmanaged' 'Registry' @(
-        (New-Entry Machine $edge 'DefaultSearchProviderEnabled' 1 $script:RemoveValue),
-        (New-Entry Machine $edge 'DefaultSearchProviderName' 'DuckDuckGo' $script:RemoveValue String),
-        (New-Entry Machine $edge 'DefaultSearchProviderKeyword' 'duckduckgo.com' $script:RemoveValue String),
-        (New-Entry Machine $edge 'DefaultSearchProviderSearchURL' 'https://duckduckgo.com/?q={searchTerms}' $script:RemoveValue String),
-        (New-Entry Machine $edge 'DefaultSearchProviderSuggestURL' 'https://duckduckgo.com/ac/?q={searchTerms}&type=list' $script:RemoveValue String)
-    ) -Requirements @{ ManagedDevice=$true }))
+    # Edge treats DefaultSearchProvider* as a protected policy and blocks it on a
+    # device that is not domain joined, Entra joined, or Intune enrolled, which is
+    # every standalone analysis VM. ManagedSearchEngines is not protected and does
+    # apply. It replaces the whole engine list, so Bing is never created rather
+    # than removed. Written to the Recommended key so an analyst can still change
+    # engines afterwards. Only the default entry may carry is_default: adding
+    # "is_default": false to another entry makes Edge reject the whole policy
+    # silently. DefaultSearchProviderSearchURL suppresses ManagedSearchEngines, so
+    # the old values must be absent for the preferred state to hold.
+    $searchEngines = '[{"is_default":true,"keyword":"google.com","name":"Google","search_url":"https://www.google.com/search?q={searchTerms}"},{"keyword":"duckduckgo.com","name":"DuckDuckGo","search_url":"https://duckduckgo.com/?q={searchTerms}","suggest_url":"https://duckduckgo.com/ac/?q={searchTerms}&type=list"}]'
+    [void]$settings.Add((New-Setting 'edge-search-engines' 'Microsoft Edge' 'Search engines' 'Offer Google and DuckDuckGo only, with Google as the default. Bing is never added. Restart Edge to finish applying it.' 'Google and DuckDuckGo, no Bing' 'Browser default (includes Bing)' 'Registry' @(
+        (New-Entry Machine "$edge\Recommended" 'ManagedSearchEngines' $searchEngines $script:RemoveValue String),
+        (New-Entry Machine $edge 'DefaultSearchProviderEnabled' $script:RemoveValue $script:RemoveValue),
+        (New-Entry Machine $edge 'DefaultSearchProviderName' $script:RemoveValue $script:RemoveValue String),
+        (New-Entry Machine $edge 'DefaultSearchProviderKeyword' $script:RemoveValue $script:RemoveValue String),
+        (New-Entry Machine $edge 'DefaultSearchProviderSearchURL' $script:RemoveValue $script:RemoveValue String),
+        (New-Entry Machine $edge 'DefaultSearchProviderSuggestURL' $script:RemoveValue $script:RemoveValue String)
+    )))
 
     [void]$settings.Add((New-Setting 'terminal-cwd' 'Windows Terminal' 'Windows PowerShell starting directory' 'Use the parent process directory or the user profile.' 'Parent process directory' 'User profile directory' 'Terminal'))
     [void]$settings.Add((New-Setting 'start-bing' 'Start menu' 'Bing/web search' 'Disable or restore default web suggestions in Start/Search.' 'Disabled' 'Enabled/default' 'Registry' @(
@@ -1388,29 +1399,44 @@ if ($SelfTest) {
         Remove-Item -LiteralPath $keepTestDirectory -Recurse -Force -ErrorAction SilentlyContinue
     }
     if ((Get-Command Remove-WidgetsPackages).Definition -match "Get-Process[^`n]*\*Widget\*") { throw 'Widgets process termination must not use a wildcard name match.' }
-    # Edge blocks its search-provider policy on an unmanaged device. Dingo must
-    # still write it, must not block the plan, and must say plainly that Edge
-    # will ignore it.
-    $searchSetting = $script:Settings | Where-Object Id -eq 'edge-duckduckgo' | Select-Object -First 1
-    if (-not $searchSetting -or -not $searchSetting.Requirements.ContainsKey('ManagedDevice')) {
-        throw 'The Edge search-provider setting must declare that it needs a managed device.'
+    # The Edge search setting must use ManagedSearchEngines, which is not a
+    # protected policy, and must clear the protected DefaultSearchProvider*
+    # values because they suppress it.
+    $searchSetting = $script:Settings | Where-Object Id -eq 'edge-search-engines' | Select-Object -First 1
+    if (-not $searchSetting) { throw 'The Edge search-engines setting is missing.' }
+    $managedEntry = $searchSetting.Entries | Where-Object Name -eq 'ManagedSearchEngines' | Select-Object -First 1
+    if (-not $managedEntry -or $managedEntry.Path -notmatch '\\Recommended$') {
+        throw 'ManagedSearchEngines must be written to the Recommended key so an analyst can still change engines.'
     }
+    $engineList = $managedEntry.Preferred | ConvertFrom-Json -ErrorAction Stop
+    $engineNames = @($engineList | ForEach-Object { [string]$_.name })
+    if ($engineNames -notcontains 'Google' -or $engineNames -notcontains 'DuckDuckGo') { throw 'The engine list must offer Google and DuckDuckGo.' }
+    if ($engineNames -contains 'Bing') { throw 'Bing must not appear in the engine list.' }
+    # Edge rejects the whole policy if a non-default entry carries is_default.
+    $defaultEntries = @($engineList | Where-Object { $_.PSObject.Properties['is_default'] })
+    if ($defaultEntries.Count -ne 1 -or -not $defaultEntries[0].is_default -or $defaultEntries[0].name -ne 'Google') {
+        throw 'Exactly one engine may carry is_default, it must be true, and it must be Google.'
+    }
+    foreach ($suppressor in @('DefaultSearchProviderEnabled','DefaultSearchProviderSearchURL')) {
+        $entry = $searchSetting.Entries | Where-Object Name -eq $suppressor | Select-Object -First 1
+        if (-not $entry -or $entry.Preferred -ne $script:RemoveValue) {
+            throw "'$suppressor' must be removed by the preferred state; it suppresses ManagedSearchEngines."
+        }
+    }
+    # The advisory machinery stays available for future settings even though no
+    # shipped setting needs it now, so prove it still works with a stand-in.
     $savedManagedState = $script:DeviceIsManaged
     try {
+        $advisoryMock = $searchSetting.PSObject.Copy()
+        $advisoryMock.Requirements = @{ ManagedDevice=$true }
         $script:DeviceIsManaged = $false
-        $unmanagedAdvisory = Get-SettingAdvisory $searchSetting
-        if ($unmanagedAdvisory -notmatch 'ignores it') { throw 'An unmanaged device must produce a search-provider caveat.' }
-        # The caveat must never stop the setting being applied, or a single
-        # unmanaged VM would block the whole preferred plan.
-        $advisoryPreflight = Test-SettingPreflight $searchSetting
-        if (-not $advisoryPreflight.Available) { throw "The caveat must not fail preflight: $($advisoryPreflight.Message)" }
-        $unmanagedState = Get-SettingState $searchSetting
-        if ($unmanagedState.Details -notmatch 'ignores it') { throw 'The read state must carry the caveat.' }
+        if ((Get-SettingAdvisory $advisoryMock) -notmatch 'ignores it') { throw 'An unmanaged device must produce a caveat.' }
+        if (-not (Test-SettingPreflight $advisoryMock).Available) { throw 'A caveat must never fail preflight.' }
         $script:DeviceIsManaged = $true
-        if (Get-SettingAdvisory $searchSetting) { throw 'A managed device must produce no search-provider caveat.' }
+        if (Get-SettingAdvisory $advisoryMock) { throw 'A managed device must produce no caveat.' }
         $script:DeviceIsManaged = $false
-        foreach ($otherSetting in @($script:Settings | Where-Object { $_.Id -ne 'edge-duckduckgo' })) {
-            if (Get-SettingAdvisory $otherSetting) { throw "Setting '$($otherSetting.Id)' must not carry a managed-device caveat." }
+        foreach ($shipped in $script:Settings) {
+            if (Get-SettingAdvisory $shipped) { throw "Setting '$($shipped.Id)' carries an unexpected caveat." }
         }
     } finally {
         $script:DeviceIsManaged = $savedManagedState

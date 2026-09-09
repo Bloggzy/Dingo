@@ -79,7 +79,8 @@ Start-Dingo.cmd -Help
 ## Important limitations
 
 - Microsoft now ships Copilot in several forms. The Windows setting applies the legacy Windows Copilot policy and hides integrated UI, but does not uninstall the newer standalone app. Microsoft recommends AppLocker or managed uninstall policy for centrally blocking that app.
-- **The Edge default search provider does not work on a standalone VM.** Edge blocks the `DefaultSearchProvider*` policies unless Windows is joined to an Active Directory domain, joined to Entra ID, or enrolled in Intune. On an unmanaged machine `edge://policy` reports the policy as `Error, Ignored: This policy is blocked, its value will be ignored`. Dingo detects this, still writes and verifies the value so it takes effect on a managed image, and labels the card **Applied with caveat** in amber rather than a green success. To set the search engine on a standalone VM, use `edge://settings/searchEngines` by hand, ideally once in the template image. Confirmed against Edge 152 on Windows 11 25H2.
+- **Edge search engines are set with `ManagedSearchEngines`, not `DefaultSearchProvider*`.** Edge treats `DefaultSearchProvider*` as a protected policy and blocks it on any device that is not domain joined, Entra joined, or Intune enrolled, reporting `Error, Ignored` at `edge://policy`. `ManagedSearchEngines` is not protected and does apply. It replaces the whole engine list, so Bing is never created rather than removed. Dingo writes it to the `Recommended` key so an analyst can still change engines afterwards, and clears the five `DefaultSearchProvider*` values because `DefaultSearchProviderSearchURL` suppresses `ManagedSearchEngines`. Only the default entry may carry `is_default`: adding `"is_default": false` to another entry makes Edge reject the whole policy with no error anywhere. Restart Edge to finish applying it. Verified on Edge 152, Windows 11 25H2, unmanaged.
+- On a profile where someone already chose a search engine by hand, that choice is kept. The policy still removes Bing from the list. A freshly imaged VM has no such choice, so it takes effect there.
 - Dingo's other Edge settings, `edge-first-run`, `edge-passwords`, and `edge-copilot`, were confirmed applied on the same unmanaged instance. Only the search provider is blocked. Visit `edge://policy` after restarting Edge to check any policy yourself, or use its **Export to JSON** button.
 - Removing the entire Recommended section is edition/build dependent. The tool disables recent and suggested content and applies the section-hiding policy where available.
 - Microsoft does not ship a standalone full display pack for English (Australia). Windows exposes **English (Australia)** as a selectable interface language once the British English (`en-GB`) base resources are installed. Dingo installs that underlying display pack when needed, then selects `en-AU` for the Windows interface, input, spelling, regional formats, and system locale. Windows applies and reports the requested UI language after sign-out or restart.
@@ -97,7 +98,7 @@ Start-Dingo.cmd -Help
 - Explorer This PC, hidden files, extensions, protected files, navigation expansion, and long paths
 - OneDrive sync and Windows Copilot policies
 - Forensic-continuity control for manual Windows Update installation/restarts and suppressed update notifications
-- Edge first-run/import controls, password manager, Copilot surfaces, and DuckDuckGo search
+- Edge first-run/import controls, password manager, Copilot surfaces, and a Google/DuckDuckGo search engine list with no Bing
 - Windows PowerShell parent-process directory in Windows Terminal
 - Start-menu Bing/web search and recommendations
 
