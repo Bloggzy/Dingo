@@ -1,0 +1,6 @@
+# Dingo run-time output
+Logs/
+
+# Windows Terminal backups written by Dingo
+*.backup-*
+*.replace-backup-*
