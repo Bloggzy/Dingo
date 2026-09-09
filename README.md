@@ -58,7 +58,7 @@ Start-Dingo.cmd -Help
 - Current-state reads distinguish preferred, alternate, partial, unavailable, and error states. A read error is never treated as a missing setting, and **Check only settings that need changing** leaves unreadable settings unchecked.
 - Application results track the user, protected-user, computer-wide, and final-verification components separately, so a mixed setting can be reported as partially applied instead of as an undifferentiated failure.
 - The GUI stays in the signed-in desktop account, so per-user settings affect the correct Windows profile even when separate administrator credentials are needed. Protected per-user policy values are written by the elevated helper directly to that desktop user's SID, not to the administrator's profile.
-- Twenty-two settings offer plainly labelled reversible choices. The five one-way targets—UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal—can be left alone by unticking their cards.
+- Twenty-two settings offer plainly labelled reversible choices. The five one-way targets are UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal. Each can be left alone by unticking its card.
 - **Read settings again** rereads every configured value without making changes.
 - Preflight is all-or-nothing: an unsupported plan is stopped before any changes. Once application begins, an individual setting failure does not stop later selected settings from running.
 - Logs are written to the `Logs` folder beside the script, so a copy deployed to `C:\DFIR\Tools\Dingo` logs to `C:\DFIR\Tools\Dingo\Logs`. The GUI can open that folder. Dingo keeps the 20 most recent logs and deletes older ones on the next launch.
@@ -82,7 +82,8 @@ Start-Dingo.cmd -Help
 - Microsoft now ships Copilot in several forms. The Windows setting applies the legacy Windows Copilot policy and hides integrated UI, but does not uninstall the newer standalone app. Microsoft recommends AppLocker or managed uninstall policy for centrally blocking that app.
 - **Edge search engines are set with `ManagedSearchEngines`, not `DefaultSearchProvider*`.** Edge treats `DefaultSearchProvider*` as a protected policy and blocks it on any device that is not domain joined, Entra joined, or Intune enrolled, reporting `Error, Ignored` at `edge://policy`. `ManagedSearchEngines` is not protected and does apply. It replaces the whole engine list, so Bing is never created rather than removed. Dingo writes it to the `Recommended` key so an analyst can still change engines afterwards, and clears the five `DefaultSearchProvider*` values because `DefaultSearchProviderSearchURL` suppresses `ManagedSearchEngines`. Only the default entry may carry `is_default`: adding `"is_default": false` to another entry makes Edge reject the whole policy with no error anywhere. Restart Edge to finish applying it. Verified on Edge 152, Windows 11 25H2, unmanaged.
 - On a profile where someone already chose a search engine by hand, that choice is kept. The policy still removes Bing from the list. A freshly imaged VM has no such choice, so it takes effect there.
-- Dingo's other Edge settings, `edge-first-run`, `edge-passwords`, and `edge-copilot`, were confirmed applied on the same unmanaged instance. Only the search provider is blocked. Visit `edge://policy` after restarting Edge to check any policy yourself, or use its **Export to JSON** button.
+- Every other Edge policy Dingo writes was confirmed applied on an unmanaged instance, with none reported as ignored: `edge-first-run` (6 values), `edge-passwords` (4), `edge-copilot` (5), and `edge-debloat` (16 visible on the policy page, plus one under `EdgeUpdate`). `DefaultSearchProvider*` was the only blocked family, and Dingo no longer uses it.
+- To check any Edge policy yourself, restart Edge, visit `edge://policy`, click **Reload policies**, then **Export to JSON**. Each policy in that file carries an `ignored` flag and an `error` string, which is far quicker than guessing from behaviour.
 - Removing the entire Recommended section is edition/build dependent. The tool disables recent and suggested content and applies the section-hiding policy where available.
 - Microsoft does not ship a standalone full display pack for English (Australia). Windows exposes **English (Australia)** as a selectable interface language once the British English (`en-GB`) base resources are installed. Dingo installs that underlying display pack when needed, then selects `en-AU` for the Windows interface, input, spelling, regional formats, and system locale. Windows applies and reports the requested UI language after sign-out or restart.
 - While a language pack is downloading, Dingo keeps its window responsive, shows the elapsed time in the status area, and records an installation heartbeat in the log every 30 seconds. Other controls remain disabled until the administrator step finishes so that settings cannot be applied twice concurrently.
@@ -94,15 +95,74 @@ Start-Dingo.cmd -Help
 
 ## Settings included
 
-- UTC, Australian region and Australian English, plus yyyy-MM-dd and 24-hour time formats
-- Taskbar Search, Task View, current-account Widgets package removal, detectable Copilot shortcut removal, Resume, never-combine, and right-click End task
-- Explorer This PC, hidden files, extensions, protected files, navigation expansion, and long paths
-- OneDrive sync and Windows Copilot policies
-- Forensic-continuity control for manual Windows Update installation/restarts and suppressed update notifications
-- Edge first-run/import controls, password manager, Copilot surfaces, a Google/DuckDuckGo search engine list with no Bing, and a clutter/new-tab-page cleanup
-- Windows PowerShell parent-process directory in Windows Terminal
-- Start-menu Bing/web search and recommendations
+Twenty-seven settings. The ID in the first column is the stable name used by `-Include` and `-Exclude`. **Scope** is whose settings change, and **Admin** is whether Windows asks for administrator approval. Run `Start-Dingo.cmd -ListSettings` for the same list from the tool itself.
 
-## Research basis
+### Region and language
 
-The implementation uses Microsoft policy/settings documentation and selected ideas from Chris Titus Tech's WinUtil. WinUtil is a reference only; this project does not bundle or execute WinUtil.
+| ID | Setting | Scope | Admin | Preferred |
+| --- | --- | --- | --- | --- |
+| `timezone-utc` | Time zone | System | yes | UTC |
+| `region-australia` | Region and formats | User | no | Australia (en-AU) |
+| `language-au` | Australian English | Both | yes | en-AU interface and locale |
+| `iso-time` | Date and time format | User | no | yyyy-MM-dd, 24-hour |
+
+### Taskbar
+
+| ID | Setting | Scope | Admin | Preferred |
+| --- | --- | --- | --- | --- |
+| `taskbar-search` | Search box | User | no | Hidden |
+| `task-view` | Task View button | User | no | Hidden |
+| `widgets` | Windows Widgets | User | no | Removed for this account |
+| `resume` | Cross-device Resume | Both | yes | Disabled |
+| `never-combine` | Combine taskbar buttons | User | no | Never combine |
+| `end-task` | End task on right-click | User | no | Enabled |
+
+### File Explorer
+
+| ID | Setting | Scope | Admin | Preferred |
+| --- | --- | --- | --- | --- |
+| `explorer-this-pc` | Default landing page | User | no | This PC |
+| `hidden-files` | Hidden files and folders | User | no | Shown |
+| `file-extensions` | File-name extensions | User | no | Shown |
+| `protected-files` | Protected operating-system files | User | no | Shown (caution) |
+| `expand-nav` | Expand navigation pane | User | no | Enabled |
+| `long-paths` | Win32 long paths | System | yes | Enabled |
+
+### Windows features and updates
+
+| ID | Setting | Scope | Admin | Preferred |
+| --- | --- | --- | --- | --- |
+| `onedrive` | OneDrive file sync | System | yes | Disabled by policy |
+| `windows-copilot` | Windows Copilot and taskbar icon | Both | yes | Disabled |
+| `windows-update-continuity` | Forensic continuity: manual updates and restarts | System | yes | Protected, manual maintenance |
+
+### Microsoft Edge
+
+| ID | Setting | Scope | Admin | Preferred |
+| --- | --- | --- | --- | --- |
+| `edge-first-run` | First-run and import extras | System | yes | Suppressed |
+| `edge-passwords` | Edge password manager | System | yes | Disabled |
+| `edge-copilot` | Copilot in Edge | System | yes | Disabled |
+| `edge-search-engines` | Search engines | System | yes | Google and DuckDuckGo, no Bing |
+| `edge-debloat` | Clutter, promotions, and new tab page | System | yes | Removed |
+
+### Windows Terminal and Start menu
+
+| ID | Setting | Scope | Admin | Preferred |
+| --- | --- | --- | --- | --- |
+| `terminal-cwd` | Windows PowerShell starting directory | User | no | Parent process directory |
+| `start-bing` | Bing/web search | User | yes | Disabled |
+| `start-recommendations` | Recommendations | Both | yes | Disabled |
+
+## Credits
+
+**[Chris Titus Tech's WinUtil](https://github.com/ChrisTitusTech/winutil)** has been an excellent resource for this project, and deserves the credit. Its `EdgeDebloat` tweak is a well-researched, working list of Edge policies that genuinely apply on an ordinary standalone machine, which is exactly the hard part. Most of Dingo's `edge-debloat` setting comes from that list.
+
+Just as usefully, WinUtil showed what to avoid. It sets no search-engine policy at all, and that absence was the clue that Microsoft treats the default search provider as a protected policy which Windows silently refuses to honour on a machine that is not domain joined, Entra joined, or Intune enrolled. That saved a lot of guesswork and led Dingo to `ManagedSearchEngines` instead.
+
+WinUtil is a reference only. Dingo does not bundle, download, or execute any part of it, and the two projects are unrelated. If you want a broader Windows utility that goes well past preferences, use WinUtil directly.
+
+Other sources:
+
+- Microsoft's [Edge policy reference](https://learn.microsoft.com/en-us/deployedge/microsoft-edge-policies) and Windows settings documentation, for every policy name, type, and permitted value.
+- Eric Lawrence's [Managing Edge via Policy](https://textslashplain.com/2020/08/24/managing-edge-via-policy/), which explains why some Edge policies are marked "protected" and ignored on unmanaged devices.
