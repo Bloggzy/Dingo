@@ -41,7 +41,7 @@ $script:LanguageChangePending = $false
 $script:InstanceMutex = $null
 $script:PendingApply = $null
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.4.0'
+$script:DingoVersion = '0.5.0'
 $automaticArguments = @(Get-Variable -Name args -ValueOnly -ErrorAction SilentlyContinue)
 $script:UnexpectedArguments = @(@($UnexpectedArguments) + $automaticArguments | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
 
@@ -104,6 +104,7 @@ function Initialize-Log {
     $script:LogFile = Join-Path $base ("{0}_{1}.log" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff'),$PID)
     Write-Log 'INFO' "Dingo started as $([Security.Principal.WindowsIdentity]::GetCurrent().Name); PowerShell $($PSVersionTable.PSVersion)"
     Remove-StaleWorkerFiles
+    Remove-StaleLogFiles
 }
 
 function Write-Log([string]$Level, [string]$Message) {
@@ -146,6 +147,34 @@ function Remove-StaleWorkerFiles([int]$MinimumAgeHours = 24) {
             Write-Log 'WARN' "Could not remove stale administrator protocol file '$($file.FullName)': $($_.Exception.Message)"
         }
     }
+}
+
+function Remove-SupersededFiles {
+    param([string]$Directory, [string]$Filter, [int]$Keep)
+    # Keep the newest $Keep matching files and delete the rest. Dingo writes a log
+    # per run and a Terminal backup per change, so both sets grow without a limit.
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return }
+    $candidates = @(Get-ChildItem -LiteralPath $Directory -Filter $Filter -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)
+    if ($candidates.Count -le $Keep) { return }
+    foreach ($file in $candidates[$Keep..($candidates.Count - 1)]) {
+        try {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+            Write-Log 'DEBUG' "Removed superseded file '$($file.FullName)'."
+        } catch {
+            Write-Log 'WARN' "Could not remove superseded file '$($file.FullName)': $($_.Exception.Message)"
+        }
+    }
+}
+
+function Remove-StaleLogFiles([int]$Keep = 20) {
+    if (-not $script:LogFile) { return }
+    Remove-SupersededFiles ([IO.Path]::GetDirectoryName($script:LogFile)) '*.log' $Keep
+}
+
+function Remove-StaleTerminalBackups([string]$SettingsPath, [int]$Keep = 10) {
+    $directory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($SettingsPath))
+    Remove-SupersededFiles $directory ("{0}.backup-*" -f [IO.Path]::GetFileName($SettingsPath)) $Keep
 }
 
 function ConvertFrom-JsonList([string]$Json) {
@@ -468,8 +497,62 @@ function Get-PowerShellProfiles($SettingsObject) {
     })
 }
 
+function ConvertTo-StrictJson([string]$Text) {
+    # Windows Terminal writes JSONC: // and /* */ comments plus trailing commas.
+    # Windows PowerShell 5.1 ConvertFrom-Json rejects all three, so remove them
+    # before parsing. Scan character by character and skip anything inside a
+    # string literal, otherwise the // in a URL such as https://aka.ms would be
+    # mistaken for the start of a comment.
+    $builder = New-Object Text.StringBuilder
+    $length = $Text.Length
+    $inString = $false
+    $index = 0
+    while ($index -lt $length) {
+        $character = $Text[$index]
+        if ($inString) {
+            [void]$builder.Append($character)
+            if ($character -eq '\') {
+                if ($index + 1 -lt $length) { [void]$builder.Append($Text[$index + 1]) }
+                $index += 2
+                continue
+            }
+            if ($character -eq '"') { $inString = $false }
+            $index++
+            continue
+        }
+        if ($character -eq '"') {
+            $inString = $true
+            [void]$builder.Append($character)
+            $index++
+            continue
+        }
+        if ($character -eq '/' -and $index + 1 -lt $length) {
+            $next = $Text[$index + 1]
+            if ($next -eq '/') {
+                while ($index -lt $length -and $Text[$index] -notin @("`r","`n")) { $index++ }
+                continue
+            }
+            if ($next -eq '*') {
+                $index += 2
+                while ($index + 1 -lt $length -and -not ($Text[$index] -eq '*' -and $Text[$index + 1] -eq '/')) { $index++ }
+                $index += 2
+                # Keep the JSON tokens either side of the comment apart.
+                [void]$builder.Append(' ')
+                continue
+            }
+        }
+        [void]$builder.Append($character)
+        $index++
+    }
+    # A comma before a closing brace or bracket is legal in JSONC but not in JSON.
+    return ([regex]::Replace($builder.ToString(), ',(?=\s*[}\]])', ''))
+}
+
 function Read-TerminalJson([string]$Path) {
-    try { return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -ErrorAction Stop) }
+    $raw = Get-Content -LiteralPath $Path -Raw
+    try { return ($raw | ConvertFrom-Json -ErrorAction Stop) }
+    catch { Write-Log 'DEBUG' "Strict JSON parse of '$Path' failed; retrying without JSONC comments and trailing commas." }
+    try { return (ConvertTo-StrictJson $raw | ConvertFrom-Json -ErrorAction Stop) }
     catch { throw "Could not safely parse '$Path'. $($_.Exception.Message)" }
 }
 
@@ -499,6 +582,11 @@ function Set-TerminalState([string]$DesiredState) {
         $settingsObject = Read-TerminalJson $path
         $profiles = @(Get-PowerShellProfiles $settingsObject)
         if (-not $profiles) { throw "Windows PowerShell profile not found in '$path'." }
+        # Rewriting the file serializes plain JSON. Any comment the operator added
+        # survives only in the backup, so record that before the file is replaced.
+        if ((Get-Content -LiteralPath $path -Raw) -match '(?m)^\s*(//|/\*)') {
+            Write-Log 'WARN' "'$path' contains comments. They are preserved in the backup but not in the rewritten file."
+        }
         $wanted = if ($DesiredState -eq 'Parent process directory') { $null } else { '%USERPROFILE%' }
         foreach ($profile in $profiles) {
             if ($profile.PSObject.Properties['startingDirectory']) { $profile.startingDirectory = $wanted }
@@ -509,6 +597,7 @@ function Set-TerminalState([string]$DesiredState) {
         $backup = "$path.backup-$(Get-Date -Format 'yyyyMMdd-HHmmss-fff')-$([Guid]::NewGuid().ToString('N').Substring(0,8))"
         Write-Utf8FileAtomically $path $json $backup
         Write-Log 'DEBUG' "Updated '$path'; backup '$backup'"
+        Remove-StaleTerminalBackups $path
     }
     if ((Get-TerminalState) -ne $DesiredState) { throw 'Windows Terminal verification failed.' }
 }
@@ -537,7 +626,9 @@ function Get-WidgetsPackageState {
 }
 
 function Remove-WidgetsPackages {
-    Get-Process -Name '*Widget*' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Stop only Microsoft's own Widgets host processes. A wildcard such as
+    # '*Widget*' would also match unrelated third-party tools on an analyst VM.
+    Get-Process -Name 'Widgets','WidgetService','WidgetBoard' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     foreach ($package in @(Get-CurrentUserWidgetsPackages)) {
         Write-Log 'DEBUG' "Removing Widgets package $($package.PackageFullName)"
         Remove-AppxPackage -Package $package.PackageFullName -ErrorAction Stop
@@ -1208,6 +1299,39 @@ if ($SelfTest) {
     } finally {
         Remove-Item -LiteralPath $protocolPath,$atomicPath,$atomicBackup -Force -ErrorAction SilentlyContinue
     }
+    # Windows Terminal ships JSONC. Windows PowerShell 5.1 rejects comments and
+    # trailing commas, so prove the tolerant reader handles them without damaging
+    # the // inside a URL or an escaped quote inside a string.
+    $jsonCases = @(
+        @{ Name='line comment'; Text=("{`n // note`n `"a`": 1 }"); Check={ param($o) $o.a -eq 1 } },
+        @{ Name='block comment'; Text='{ /* note */ "a": 1 }'; Check={ param($o) $o.a -eq 1 } },
+        @{ Name='trailing comma in object'; Text='{ "a": 1, }'; Check={ param($o) $o.a -eq 1 } },
+        @{ Name='trailing comma in array'; Text='{ "a": [1,2,] }'; Check={ param($o) $o.a.Count -eq 2 } },
+        @{ Name='url is not a comment'; Text='{ "a": "https://aka.ms/x" }'; Check={ param($o) $o.a -eq 'https://aka.ms/x' } },
+        @{ Name='escaped quote is not a delimiter'; Text='{ "a": "say \"//\" here", "b": 2 }'; Check={ param($o) $o.b -eq 2 -and $o.a -eq 'say "//" here' } },
+        @{ Name='comment marker inside a string survives'; Text='{ "a": "/* keep */" }'; Check={ param($o) $o.a -eq '/* keep */' } }
+    )
+    foreach ($jsonCase in $jsonCases) {
+        $decoded = try { ConvertTo-StrictJson $jsonCase.Text | ConvertFrom-Json -ErrorAction Stop } catch { throw "JSONC case '$($jsonCase.Name)' did not parse: $($_.Exception.Message)" }
+        if (-not (& $jsonCase.Check $decoded)) { throw "JSONC case '$($jsonCase.Name)' parsed to the wrong value." }
+    }
+    $keepTestDirectory = Join-Path $env:TEMP ("Dingo-keep-test-{0}" -f [Guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $keepTestDirectory -Force | Out-Null
+        foreach ($ordinal in 1..5) {
+            $keepTestFile = Join-Path $keepTestDirectory "sample$ordinal.log"
+            [IO.File]::WriteAllText($keepTestFile, 'x', (New-Object Text.UTF8Encoding($false)))
+            [IO.File]::SetLastWriteTime($keepTestFile, (Get-Date).AddMinutes(-$ordinal))
+        }
+        Remove-SupersededFiles $keepTestDirectory '*.log' 2
+        $kept = @(Get-ChildItem -LiteralPath $keepTestDirectory -Filter '*.log' -File | Select-Object -ExpandProperty Name | Sort-Object)
+        if ($kept.Count -ne 2 -or $kept[0] -ne 'sample1.log' -or $kept[1] -ne 'sample2.log') {
+            throw "File retention kept the wrong set: $($kept -join ', ')"
+        }
+    } finally {
+        Remove-Item -LiteralPath $keepTestDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ((Get-Command Remove-WidgetsPackages).Definition -match "Get-Process[^`n]*\*Widget\*") { throw 'Widgets process termination must not use a wildcard name match.' }
     $toggleCount = @($script:Settings | Where-Object CanChoose).Count
     if ($toggleCount -lt 20) { throw "Expected at least 20 reversible settings, found $toggleCount." }
     "Self-test passed: 26 settings; $toggleCount reversible."

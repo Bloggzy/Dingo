@@ -61,7 +61,7 @@ Start-Dingo.cmd -Help
 - Twenty-one settings offer plainly labelled reversible choices. The five one-way targets—UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal—can be left alone by unticking their cards.
 - **Read settings again** rereads every configured value without making changes.
 - Preflight is all-or-nothing: an unsupported plan is stopped before any changes. Once application begins, an individual setting failure does not stop later selected settings from running.
-- Logs are written to the Logs folder beside the script (C:\DFIR\Tools\Dingo\Logs when run from the development directory) and can be opened from the GUI.
+- Logs are written to the `Logs` folder beside the script, so a copy deployed to `C:\DFIR\Tools\Dingo` logs to `C:\DFIR\Tools\Dingo\Logs`. The GUI can open that folder. Dingo keeps the 20 most recent logs and deletes older ones on the next launch.
 - Dingo permits only one normal GUI or quick-apply run per Windows account, preventing concurrent settings and result-file races. Read-only help, version, catalog, and internal self-test commands do not take the instance lock.
 - GUI and quick-apply modes use the same setting executor, administrator broker, verification, structured results, and logs.
 - Before applying a plan, Dingo checks every selected setting's handler, required Windows commands, readable current state, and declared edition/build requirements. If any preflight check fails, the plan is stopped before changes or administrator approval begin.
@@ -69,9 +69,10 @@ Start-Dingo.cmd -Help
 - The window stays open while an administrator operation is active so Dingo can collect its results, verify changes, and remove temporary protocol files. Abandoned protocol files older than 24 hours are removed on a later launch.
 - The tool is idempotent: rerunning it writes and verifies the same desired values.
 - OneDrive is disabled with policy. It is not uninstalled, and user files are not deleted.
-- Windows Widgets is removed only from the signed-in account. Dingo stops that account's Widgets processes, uninstalls `Microsoft.WidgetsPlatformRuntime` and `MicrosoftWindows.Client.WebExperience`, and verifies the result using that same account's live AppX package state. Other profiles are left unchanged, and Dingo does not provide a reinstall action.
+- Windows Widgets is removed only from the signed-in account. Dingo stops that account's `Widgets`, `WidgetService`, and `WidgetBoard` processes by exact name so unrelated tools on an analyst VM are not terminated, uninstalls `Microsoft.WidgetsPlatformRuntime` and `MicrosoftWindows.Client.WebExperience`, and verifies the result using that same account's live AppX package state. Other profiles are left unchanged, and Dingo does not provide a reinstall action.
 - The Windows Copilot setting also removes Copilot shortcuts that Windows exposes in the signed-in user's standard taskbar pin folder; it does not uninstall Copilot apps.
-- Windows Terminal's settings.json is serialized and validated before it atomically replaces the live file. Every change creates a uniquely named backup.
+- Windows Terminal's settings.json is serialized and validated before it atomically replaces the live file. Every change creates a uniquely named backup, and Dingo keeps the 10 most recent backups per settings file.
+- Windows Terminal ships its settings as JSONC, which permits `//` and `/* */` comments and trailing commas. Windows PowerShell 5.1 cannot parse those, so Dingo removes them before reading. Text inside string values, such as a `https://` URL, is left alone. Rewriting the file writes plain JSON: any comment you added survives in the backup but not in the new file.
 - Showing protected operating-system files is intentionally marked with a caution.
 - On Windows 11 Pro, Enterprise, or Education, the optional **Forensic continuity: manual updates and restarts** policy prevents Windows Update from automatically downloading or installing updates, disables update deadline enforcement, blocks update-driven restarts while a user is signed in, and suppresses all Windows Update notifications. This trades automatic patching for uninterrupted evidence processing: operators must check, install, and restart during a controlled maintenance window.
 
