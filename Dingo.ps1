@@ -60,6 +60,32 @@ $script:ShortcutMarker = 'Created by Dingo. Safe to delete.'
 $automaticArguments = @(Get-Variable -Name args -ValueOnly -ErrorAction SilentlyContinue)
 $script:UnexpectedArguments = @(@($UnexpectedArguments) + $automaticArguments | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
 
+function Set-DingoConsoleVisible([bool]$Visible) {
+    # The GUI has nothing to say to a console, so the launcher's console window
+    # is hidden once the window opens, and shown again if anything fails. A
+    # hidden console must never be the only place an error message appears.
+    try {
+        if (-not ('Dingo.NativeConsole' -as [type])) {
+            $signature = '[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();' +
+                         '[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);'
+            Add-Type -Namespace 'Dingo' -Name 'NativeConsole' -MemberDefinition $signature -ErrorAction Stop
+        }
+        $consoleWindow = [Dingo.NativeConsole]::GetConsoleWindow()
+        if ($consoleWindow -eq [IntPtr]::Zero) { return }
+        # 0 is SW_HIDE and 5 is SW_SHOW.
+        [void][Dingo.NativeConsole]::ShowWindow($consoleWindow, $(if ($Visible) { 5 } else { 0 }))
+    } catch {
+        # Hiding a window is a convenience. Never let it stop Dingo starting.
+    }
+}
+
+# Only Start-Dingo.cmd sets this, and only when no arguments were supplied, so a
+# command line run keeps its console and its output. Done here, before the slow
+# work, so the console is on screen for as short a time as possible.
+if ($env:DINGO_HIDE_CONSOLE -eq '1' -and -not $PSBoundParameters.Count -and -not $script:UnexpectedArguments.Count) {
+    Set-DingoConsoleVisible $false
+}
+
 function Get-PowerShellHostPath {
     $hostPath = (Get-Process -Id $PID -ErrorAction Stop).Path
     if (-not $hostPath -or -not (Test-Path -LiteralPath $hostPath -PathType Leaf)) {
@@ -96,12 +122,21 @@ if (-not ($SelfTest -or $StateSelfTest -or $UiSelfTest -or $ApplyPreferred -or $
     if (-not (Enter-DingoSingleInstance)) {
         Add-Type -AssemblyName PresentationFramework
         [System.Windows.MessageBox]::Show('Dingo is already running for this Windows account.', 'Dingo is already running', 'OK', 'Information') | Out-Null
+        # This leaves with a non-zero code, so the launcher will pause. Put the
+        # console back first, or that prompt waits on a window nobody can see.
+        Set-DingoConsoleVisible $true
         exit 3
     }
     try {
         $hostArguments = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}" -WpfHost' -f $PSCommandPath
         $hostProcess = Start-Process -FilePath (Get-PowerShellHostPath) -ArgumentList $hostArguments -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+        # Bring the console back for a failure, so the launcher's pause prompt and
+        # any error text are on a window the person can actually see.
+        if ($hostProcess.ExitCode -ne 0) { Set-DingoConsoleVisible $true }
         exit $hostProcess.ExitCode
+    } catch {
+        Set-DingoConsoleVisible $true
+        throw
     } finally {
         Exit-DingoSingleInstance
     }
@@ -2411,6 +2446,26 @@ if ($SelfTest) {
         $script:ShimDirectory = $savedShimDirectory
         Remove-Item -LiteralPath $shimTestDirectory -Recurse -Force -ErrorAction SilentlyContinue
     }
+    # Hiding the console is only ever right for the GUI. Prove the launcher asks
+    # for it on a bare run, and that Dingo obeys nothing else.
+    $launcherPath = Join-Path $PSScriptRoot 'Start-Dingo.cmd'
+    if (Test-Path -LiteralPath $launcherPath -PathType Leaf) {
+        $launcherText = Get-Content -LiteralPath $launcherPath -Raw
+        if ($launcherText -notmatch 'if\s+"%~1"=="" set "DINGO_HIDE_CONSOLE=1"') {
+            throw 'The launcher must ask for a hidden console only when no arguments were supplied.'
+        }
+    }
+    $hideCall = $selfTestAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses[0].Item1.Extent.Text -match '\$env:DINGO_HIDE_CONSOLE'
+    }, $true)
+    if (@($hideCall).Count -ne 1) { throw 'The console must be hidden only behind the launcher environment check.' }
+    if (@($hideCall)[0].Clauses[0].Item2.Extent.Text -notmatch 'Set-DingoConsoleVisible\s+\$false') {
+        throw 'The launcher environment check must hide the console, and nothing else.'
+    }
+    Set-DingoConsoleVisible $true
+
     # Shortcuts: written correctly, recognised again, and never deleting one that
     # an installer or a person put in the same folder.
     foreach ($shortcutId in @('tools-start-menu','tools-desktop')) {

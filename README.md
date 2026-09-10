@@ -14,6 +14,8 @@ A self-contained, state-aware PowerShell/WPF utility for applying a repeatable s
 
 No installation or PowerShell modules are required. Windows PowerShell 5.1 is included with Windows 11.
 
+A console window appears for about a second while PowerShell starts, then hides itself once the Dingo window is open. It comes back if Dingo exits with an error, so the message and the pause prompt are always readable. A command-line run keeps its console, because that is where its output goes.
+
 ## Quick apply without the GUI
 
 Use the same launcher with `-ApplyPreferred` to apply all 36 preferred settings without opening the selection window:
