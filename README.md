@@ -16,7 +16,7 @@ No installation or PowerShell modules are required. Windows PowerShell 5.1 is in
 
 ## Quick apply without the GUI
 
-Use the same launcher with `-ApplyPreferred` to apply all 32 preferred settings without opening the selection window:
+Use the same launcher with `-ApplyPreferred` to apply all 33 preferred settings without opening the selection window:
 
 ```bat
 Start-Dingo.cmd -ApplyPreferred
@@ -58,7 +58,7 @@ Start-Dingo.cmd -Help
 - Current-state reads distinguish preferred, alternate, partial, unavailable, and error states. A read error is never treated as a missing setting, and **Check only settings that need changing** leaves unreadable settings unchecked.
 - Application results track the user, protected-user, computer-wide, and final-verification components separately, so a mixed setting can be reported as partially applied instead of as an undifferentiated failure.
 - The GUI stays in the signed-in desktop account, so per-user settings affect the correct Windows profile even when separate administrator credentials are needed. Protected per-user policy values are written by the elevated helper directly to that desktop user's SID, not to the administrator's profile.
-- Twenty-two settings offer plainly labelled reversible choices. The five one-way targets are UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal. Each can be left alone by unticking its card.
+- Twenty-three settings offer plainly labelled reversible choices. The five one-way targets are UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal. The five tool cards are also one way: Dingo installs a tool but never removes it. Each can be left alone by unticking its card.
 - **Read settings again** rereads every configured value without making changes.
 - Preflight is all-or-nothing: an unsupported plan is stopped before any changes. Once application begins, an individual setting failure does not stop later selected settings from running.
 - Logs are written to the `Logs` folder beside the script, so a copy deployed to `C:\DFIR\Tools\Dingo` logs to `C:\DFIR\Tools\Dingo\Logs`. The GUI can open that folder. Dingo keeps the 20 most recent logs and deletes older ones on the next launch.
@@ -100,12 +100,14 @@ Start-Dingo.cmd -Help
 - Dingo detects Eric Zimmerman's tools by looking for **Timeline Explorer** and **Registry Explorer**, not for a command-line tool. A partial copy holding only the command-line tools is common, and detecting on those would wrongly report a complete install.
 - The `script` install kind downloads a PowerShell script and runs it with administrator rights. That is how the author distributes these tools, and it is the same thing you would do by hand. Dingo refuses any address that is not `https://`, and logs the URL and the SHA256 of the file it actually ran.
 - Re-running the Eric Zimmerman install updates the tools in place, because the author's script only fetches what has changed. A tool card stays tickable after it reports installed, so ticking it again is how you update.
-- Eric Zimmerman's tools land in `C:\DFIR\Tools\EZTools\net9`, in a mixed layout: some tools are a loose `.exe`, others get their own folder. They are not on the PATH yet.
+- Eric Zimmerman's tools land in `C:\DFIR\Tools\EZTools\net9`, in a mixed layout: some tools are a loose `.exe`, others get their own folder. Tick **Run tools from anywhere** to reach them from any folder.
+- Dingo reads the computer PATH without expanding it and writes it back as an expandable value. Real machines hold entries such as `%USERPROFILE%\go\bin`, and reading PATH the easy way expands those, which would permanently bake one account's folders into the computer PATH. The self-test proves this on a stand-in value before anything is written.
+- A PATH change reaches new windows only. Restart any open terminal, and sign out and back in for programs started from Explorer.
 - Tool file associations and Desktop or Start Menu shortcuts are not built yet.
 
 ## Settings included
 
-Thirty-two settings, of which five are tools. The ID in the first column is the stable name used by `-Include` and `-Exclude`. **Scope** is whose settings change, and **Admin** is whether Windows asks for administrator approval. Run `Start-Dingo.cmd -ListSettings` for the same list from the tool itself.
+Thirty-three settings. Five install tools, and one puts those tools on the PATH. The ID in the first column is the stable name used by `-Include` and `-Exclude`. **Scope** is whose settings change, and **Admin** is whether Windows asks for administrator approval. Run `Start-Dingo.cmd -ListSettings` for the same list from the tool itself.
 
 ### Region and language
 
@@ -175,10 +177,21 @@ Tool cards live on their own **Tools** tab. Dingo checks whether each tool is al
 | `tool-ripgrep` | ripgrep | User | no | Installed |
 | `tool-sqlitebrowser` | DB Browser for SQLite | System | yes | Installed |
 | `tool-eztools` | Eric Zimmerman's tools | System | yes | Installed |
+| `tools-on-path` | Run tools from anywhere | System | yes | On the PATH |
 
 A tool installs machine-wide where its winget package supports it, which needs administrator approval. ripgrep ships as a portable package, so it installs into the signed-in account only and needs no approval. winget adds ripgrep to the user PATH by itself.
 
 Eric Zimmerman's tools are not in winget. Dingo runs the author's own `Get-ZimmermanTools.ps1` instead, fetched over https from `EricZimmerman/Get-ZimmermanTools` on GitHub, and installs into `C:\DFIR\Tools\EZTools`. The SHA256 of the downloaded script is written to the log before it runs, so you can audit what was executed. That download is several hundred megabytes and is given 45 minutes.
+
+**Run tools from anywhere** is not a tool. It writes one small `.cmd` launcher for each installed command-line program into `C:\DFIR\Tools\bin`, then adds that single folder to the computer PATH. You can then type `EvtxECmd -d "path"` from any folder.
+
+Eric Zimmerman's tools need this because `C:\DFIR\Tools\EZTools\net9` has a mixed layout: some tools are a loose `.exe`, others sit in their own folder. Putting all of those on the PATH would mean about 30 entries. One launcher folder means one entry.
+
+The folder is added to the **end** of the PATH, so a tool can never shadow a Windows command such as `find` or `where`.
+
+This card is reversible. Turning it off removes the PATH entry and deletes the launchers. Dingo only ever deletes `.cmd` files that carry its own marker line, so anything you put in that folder by hand is left alone. Already-open windows keep the old PATH until they are restarted.
+
+This card is applied last, after the tools its launchers point at, so installing a tool and putting it on the PATH can be done in a single run.
 
 Detection does not depend on winget. Dingo reads the Windows uninstall list under both HKLM and HKCU, checks the usual install folders, and looks on the PATH. A tool installed by hand, or by Chocolatey, is still found.
 
@@ -216,6 +229,9 @@ Put a `Tools.json` file next to `Dingo.ps1`. A new `id` adds a tool. An `id` tha
 | `install.scope` | no | `machine` (default) or `user`. This decides whether the card needs administrator approval |
 | `install.source` | no | winget only. Defaults to `winget` |
 | `detect` | yes | One or more rules. The first rule that matches wins |
+| `shims.from` | no | Folder to scan for command-line programs. Adding this block puts the tool's programs on the PATH |
+| `shims.pattern` | no | Defaults to `*.exe` |
+| `shims.recurse` | no | Defaults to `true` |
 
 Detect rule kinds:
 
