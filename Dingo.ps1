@@ -41,8 +41,9 @@ $script:LanguageChangePending = $false
 $script:InstanceMutex = $null
 $script:PendingApply = $null
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.5.3'
+$script:DingoVersion = '0.5.4'
 $script:DeviceIsManaged = $null
+$script:ToolCatalogWarning = ''
 $automaticArguments = @(Get-Variable -Name args -ValueOnly -ErrorAction SilentlyContinue)
 $script:UnexpectedArguments = @(@($UnexpectedArguments) + $automaticArguments | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
 
@@ -318,7 +319,9 @@ function New-Setting {
         [array]$Entries = @(),
         [bool]$RestartExplorer = $false,
         [bool]$RestartRequired = $false,
-        [hashtable]$Requirements = @{}
+        [hashtable]$Requirements = @{},
+        [string]$Tab = '',
+        [string]$DefaultStateText = ''
     )
     $options = New-Object System.Collections.ArrayList
     [void]$options.Add($PreferredState)
@@ -333,15 +336,264 @@ function New-Setting {
     $hasMachine = $scopes -contains 'Machine'
     $needsElevation = $hasMachine -or [bool](@($Entries | Where-Object Scope -eq 'ElevatedUser').Count)
     $displayScope = if ($hasUser -and $hasMachine) { 'Both' } elseif ($hasMachine) { 'System' } else { 'User' }
-    $defaultState = if ([string]::IsNullOrWhiteSpace($AlternateState)) { 'Whatever the Windows image currently uses' } else { $AlternateState }
+    $defaultState = if (-not [string]::IsNullOrWhiteSpace($DefaultStateText)) {
+        $DefaultStateText
+    } elseif ([string]::IsNullOrWhiteSpace($AlternateState)) {
+        'Whatever the Windows image currently uses'
+    } else {
+        $AlternateState
+    }
+    # Cards are grouped by who a setting affects unless it declares its own tab.
+    $tabName = if ([string]::IsNullOrWhiteSpace($Tab)) { $displayScope } else { $Tab }
     [PSCustomObject]@{
         Selected=$false; Id=$Id; Category=$Category; Name=$Name; Description=$Description
         PreferredState=$PreferredState; AlternateState=$AlternateState; DesiredState=$PreferredState
-        DefaultState=$defaultState; DisplayScope=$displayScope
+        DefaultState=$defaultState; DisplayScope=$displayScope; Tab=$tabName
         StateOptions=$options; CanChoose=($options.Count -gt 1); CurrentState=(New-StateResult 'Unknown' 'Reading...')
         Status='Ready'; Details=''; LastApplyResult=$null; Kind=$Kind; Entries=$Entries; RequiresAdmin=$needsElevation
         RestartExplorer=$RestartExplorer; RestartRequired=$RestartRequired; Requirements=$requirementCopy
     }
+}
+
+function Get-JsonField($Object, [string]$Name, $Default = $null) {
+    # Set-StrictMode 2.0 throws on an absent property, and hand-written catalog
+    # entries are allowed to omit optional fields, so read them defensively.
+    if ($null -eq $Object) { return $Default }
+    $property = $Object.PSObject.Properties[$Name]
+    if (-not $property -or $null -eq $property.Value) { return $Default }
+    return $property.Value
+}
+
+function ConvertTo-ToolDefinition($Raw) {
+    $id = [string](Get-JsonField $Raw 'id' '')
+    if ($id -notmatch '^tool-[a-z0-9][a-z0-9-]*$') { throw "Tool id '$id' must look like 'tool-example'." }
+    $name = [string](Get-JsonField $Raw 'name' '')
+    if ([string]::IsNullOrWhiteSpace($name)) { throw "Tool '$id' has no name." }
+
+    $install = Get-JsonField $Raw 'install' $null
+    $installKind = [string](Get-JsonField $install 'kind' 'winget')
+    if ($installKind -notin @('winget')) { throw "Tool '$id' uses install kind '$installKind', which this version of Dingo cannot run." }
+    $package = [string](Get-JsonField $install 'package' '')
+    if ([string]::IsNullOrWhiteSpace($package)) { throw "Tool '$id' has no winget package id." }
+    $scope = [string](Get-JsonField $install 'scope' 'machine')
+    if ($scope -notin @('machine','user')) { throw "Tool '$id' has scope '$scope'; use 'machine' or 'user'." }
+
+    $rules = New-Object System.Collections.ArrayList
+    foreach ($rawRule in @(Get-JsonField $Raw 'detect' @())) {
+        $ruleKind = [string](Get-JsonField $rawRule 'kind' '')
+        if ($ruleKind -notin @('uninstall-key','file','command')) { throw "Tool '$id' has an unknown detect rule '$ruleKind'." }
+        [void]$rules.Add([PSCustomObject]@{
+            Kind = $ruleKind
+            Match = [string](Get-JsonField $rawRule 'match' '')
+            Path = [string](Get-JsonField $rawRule 'path' '')
+            Command = [string](Get-JsonField $rawRule 'command' '')
+        })
+    }
+    if (-not $rules.Count) { throw "Tool '$id' has no detect rules, so Dingo could never tell whether it is installed." }
+
+    [PSCustomObject]@{
+        Id = $id
+        Name = $name
+        Category = [string](Get-JsonField $Raw 'category' 'Tools')
+        Description = [string](Get-JsonField $Raw 'description' "Install $name.")
+        InstallKind = $installKind
+        Package = $package
+        Source = [string](Get-JsonField $install 'source' 'winget')
+        Scope = $scope
+        Detect = @($rules)
+    }
+}
+
+function Get-BuiltInToolCatalog {
+    @(
+        [PSCustomObject]@{
+            id='tool-7zip'; name='7-Zip'; category='Archives'
+            description='Opens and creates zip, 7z, tar, gz, and many other archive formats.'
+            install=[PSCustomObject]@{ kind='winget'; package='7zip.7zip'; scope='machine' }
+            detect=@(
+                [PSCustomObject]@{ kind='uninstall-key'; match='7-Zip*' },
+                [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\7-Zip\7zFM.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-notepadplusplus'; name='Notepad++'; category='Text and data'
+            description='Text editor for logs, scripts, and configuration files.'
+            install=[PSCustomObject]@{ kind='winget'; package='Notepad++.Notepad++'; scope='machine' }
+            detect=@(
+                [PSCustomObject]@{ kind='uninstall-key'; match='Notepad++*' },
+                [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\Notepad++\notepad++.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-ripgrep'; name='ripgrep'; category='Text and data'
+            description='Fast recursive search across files from the command line. winget adds it to your PATH by itself.'
+            install=[PSCustomObject]@{ kind='winget'; package='BurntSushi.ripgrep.MSVC'; scope='user' }
+            detect=@(
+                [PSCustomObject]@{ kind='uninstall-key'; match='RipGrep*' },
+                [PSCustomObject]@{ kind='command'; command='rg.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-sqlitebrowser'; name='DB Browser for SQLite'; category='Text and data'
+            description='Reads and queries SQLite databases, such as browser and application history.'
+            install=[PSCustomObject]@{ kind='winget'; package='DBBrowserForSQLite.DBBrowserForSQLite'; scope='machine' }
+            detect=@(
+                [PSCustomObject]@{ kind='uninstall-key'; match='DB Browser for SQLite*' },
+                [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\DB Browser for SQLite\DB Browser for SQLite.exe' }
+            )
+        }
+    )
+}
+
+function Get-ToolCatalogPath { Join-Path $PSScriptRoot 'Tools.json' }
+
+function Get-ToolCatalog {
+    $problems = New-Object System.Collections.ArrayList
+    $map = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach ($raw in (Get-BuiltInToolCatalog)) {
+        $tool = ConvertTo-ToolDefinition $raw
+        $map[$tool.Id] = $tool
+    }
+    # Tools.json is optional. It adds tools by new id and replaces built-in ones
+    # by matching id, so the catalog can grow without editing this script.
+    $overridePath = Get-ToolCatalogPath
+    if (Test-Path -LiteralPath $overridePath -PathType Leaf) {
+        try {
+            $decoded = Read-JsonFileTolerantly $overridePath
+            $entries = @(Get-JsonField $decoded 'tools' $decoded)
+            foreach ($raw in $entries) {
+                try {
+                    $tool = ConvertTo-ToolDefinition $raw
+                    $map[$tool.Id] = $tool
+                    Write-Log 'INFO' "Tools.json supplied tool '$($tool.Id)'."
+                } catch {
+                    [void]$problems.Add($_.Exception.Message)
+                }
+            }
+        } catch {
+            [void]$problems.Add("Tools.json could not be read: $($_.Exception.Message)")
+        }
+    }
+    foreach ($problem in $problems) { Write-Log 'WARN' "Tool catalog: $problem" }
+    $script:ToolCatalogWarning = if ($problems.Count) { "Dingo ignored part of Tools.json. $($problems -join ' ')" } else { '' }
+    return @($map.Values)
+}
+
+function Get-WingetPath {
+    $command = Get-Command 'winget.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+    # The winget alias lives in the signed-in user's WindowsApps folder, so an
+    # elevated worker may not see it. Fall back to the installed package.
+    $pattern = Join-Path ${env:ProgramFiles} 'WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe'
+    $candidate = @(Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1)
+    if ($candidate.Count) { return $candidate[0].FullName }
+    return ''
+}
+
+function Get-UninstallEntry([string]$Match) {
+    $roots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
+            $values = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+            $displayName = [string](Get-JsonField $values 'DisplayName' '')
+            if ($displayName -and $displayName -like $Match) {
+                return [PSCustomObject]@{
+                    Name = $displayName
+                    Version = [string](Get-JsonField $values 'DisplayVersion' '')
+                    Location = [string](Get-JsonField $values 'InstallLocation' '')
+                }
+            }
+        }
+    }
+    return $null
+}
+
+function Find-InstalledTool($Tool) {
+    foreach ($rule in @($Tool.Detect)) {
+        if ($rule.Kind -eq 'uninstall-key') {
+            $entry = Get-UninstallEntry $rule.Match
+            if ($entry) { return [PSCustomObject]@{ Version=$entry.Version; Evidence="Windows lists it as '$($entry.Name)'." } }
+        } elseif ($rule.Kind -eq 'file') {
+            $path = [Environment]::ExpandEnvironmentVariables($rule.Path)
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                $version = ''
+                try { $version = [string](Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo.ProductVersion } catch { $version = '' }
+                return [PSCustomObject]@{ Version=$version; Evidence="Found $path." }
+            }
+        } elseif ($rule.Kind -eq 'command') {
+            $command = Get-Command $rule.Command -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($command) { return [PSCustomObject]@{ Version=''; Evidence="Found $($command.Source) on the PATH." } }
+        }
+    }
+    return $null
+}
+
+function Install-WingetPackage($Tool, [int]$TimeoutSeconds = 900) {
+    $winget = Get-WingetPath
+    if (-not $winget) { throw 'winget is not available on this computer, so Dingo cannot install anything.' }
+    $arguments = @(
+        'install','--id',$Tool.Package,'--exact','--source',$Tool.Source,'--scope',$Tool.Scope,
+        '--accept-package-agreements','--accept-source-agreements','--disable-interactivity','--silent'
+    )
+    Write-Log 'INFO' "Installing $($Tool.Name): winget $($arguments -join ' ')"
+    # Start-Process -PassThru does not keep the process handle, so its ExitCode
+    # stays empty and a successful install would look like a failure. Owning the
+    # handle here gives both a reliable exit code and a working timeout.
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $winget
+    $startInfo.Arguments = (@($arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' ')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = $null
+    try {
+        $process = [Diagnostics.Process]::Start($startInfo)
+        # Read both pipes while the process runs, or a full pipe buffer deadlocks it.
+        $standardOutput = $process.StandardOutput.ReadToEndAsync()
+        $standardError = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try { $process.Kill() } catch { Write-Log 'WARN' "Could not stop the winget process for $($Tool.Package)." }
+            throw "winget did not finish installing $($Tool.Name) within $([math]::Round($TimeoutSeconds / 60)) minutes."
+        }
+        $exitCode = $process.ExitCode
+        $output = (([string]$standardOutput.Result + ' ' + [string]$standardError.Result) -replace '\s+',' ').Trim()
+        Write-Log 'DEBUG' "winget exit code $exitCode for $($Tool.Package): $output"
+        # 0x8A150014: the package is already present and there is nothing newer.
+        # Dingo asked for the tool to be installed, and it is, so that is a success.
+        if ($exitCode -eq -1978335189) {
+            Write-Log 'INFO' "$($Tool.Name) was already installed and is up to date."
+            return
+        }
+        if ($exitCode -ne 0) {
+            $tail = if ($output.Length -gt 300) { $output.Substring($output.Length - 300) } else { $output }
+            throw "winget exited with code $exitCode for $($Tool.Package). $tail"
+        }
+    } finally {
+        if ($process) { $process.Dispose() }
+    }
+}
+
+function Get-PackageKindState($Setting) {
+    $tool = @($Setting.Entries)[0]
+    $found = Find-InstalledTool $tool
+    if (-not $found) {
+        return (New-StateResult 'Partial' 'Not installed' "Dingo checked the Windows uninstall list and the usual folders for $($tool.Name).")
+    }
+    $text = if ($found.Version) { "Installed ($($found.Version))" } else { 'Installed' }
+    return (New-StateResult 'Preferred' $text $found.Evidence)
+}
+
+function Set-PackageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
+    $tool = @($Setting.Entries)[0]
+    if ($DesiredState -ne $Setting.PreferredState) { throw "Dingo installs $($tool.Name) but never removes it." }
+    if ($tool.InstallKind -ne 'winget') { throw "Install kind '$($tool.InstallKind)' is not supported in this version of Dingo." }
+    Install-WingetPackage $tool
 }
 
 function Get-Settings {
@@ -498,6 +750,13 @@ function Get-Settings {
         (New-Entry User 'Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' 'SystemPaneSuggestionsEnabled' 0 $script:RemoveValue),
         (New-Entry Machine 'SOFTWARE\Policies\Microsoft\Windows\Explorer' 'HideRecommendedSection' 1 $script:RemoveValue)
     ) $true))
+
+    # Tools come from a catalog rather than from literals here, so Tools.json can
+    # add more of them later without a code change.
+    foreach ($tool in (Get-ToolCatalog)) {
+        [void]$settings.Add((New-Setting $tool.Id $tool.Category $tool.Name $tool.Description 'Installed' $null 'Package' @($tool) $false $false `
+            @{ WingetRequired = ($tool.InstallKind -eq 'winget') } 'Tools' 'Not installed'))
+    }
     return ,$settings
 }
 
@@ -628,13 +887,15 @@ function ConvertTo-StrictJson([string]$Text) {
     return ([regex]::Replace($builder.ToString(), ',(?=\s*[}\]])', ''))
 }
 
-function Read-TerminalJson([string]$Path) {
+function Read-JsonFileTolerantly([string]$Path) {
     $raw = Get-Content -LiteralPath $Path -Raw
     try { return ($raw | ConvertFrom-Json -ErrorAction Stop) }
     catch { Write-Log 'DEBUG' "Strict JSON parse of '$Path' failed; retrying without JSONC comments and trailing commas." }
     try { return (ConvertTo-StrictJson $raw | ConvertFrom-Json -ErrorAction Stop) }
     catch { throw "Could not safely parse '$Path'. $($_.Exception.Message)" }
 }
+
+function Read-TerminalJson([string]$Path) { Read-JsonFileTolerantly $Path }
 
 function Get-TerminalState {
     $files = @(Get-TerminalFiles)
@@ -1149,6 +1410,11 @@ Discovery:
   Start-Dingo.cmd -Version
   Start-Dingo.cmd -Help
 
+Tools:
+  Analyst tools appear on the Tools tab and use IDs that start with 'tool-'.
+  Dingo installs them with winget and never uninstalls them.
+  Add your own by placing a Tools.json file next to Dingo.ps1. See the README.
+
 Exit codes: 0 success, 1 partial/failed application, 2 invalid command/environment, 3 already running.
 '@
 }
@@ -1194,6 +1460,13 @@ function Initialize-SettingHandlers {
         User=@('Get-WinUserLanguageList','New-WinUserLanguageList','Set-WinUserLanguageList','Get-WinUILanguageOverride','Set-WinUILanguageOverride')
         Machine=@('Get-WinSystemLocale','Set-WinSystemLocale','Get-SystemPreferredUILanguage','Set-SystemPreferredUILanguage','Get-InstalledLanguage','Install-Language')
     }
+    # A machine-scope package needs the elevated worker; a per-user package must
+    # stay in the signed-in account so it lands in the right profile.
+    Register-SettingHandler 'Package' {
+        param($entries)
+        $tool = @($entries)[0]
+        @(if ($tool -and $tool.Scope -eq 'user') { 'User' } else { 'Machine' })
+    } 'Get-PackageKindState' 'Set-PackageKindPart'
     Register-SettingHandler 'Terminal' { param($entries) @('User') } 'Get-TerminalKindState' 'Set-TerminalKindPart'
     Register-SettingHandler 'WidgetsPackage' { param($entries) @('User') } 'Get-WidgetsKindState' 'Set-WidgetsKindPart' @{ User=@('Get-AppxPackage','Remove-AppxPackage') }
 }
@@ -1210,6 +1483,11 @@ function Test-SettingPreflight($Setting) {
         if ($Setting.Requirements.ContainsKey('RequiredCommands')) {
             foreach ($command in @($Setting.Requirements['RequiredCommands'])) {
                 if ($command -and -not (Get-Command $command -ErrorAction SilentlyContinue)) { [void]$problems.Add("requires unavailable command '$command'") }
+            }
+        }
+        if ($Setting.Requirements.ContainsKey('WingetRequired') -and [bool]$Setting.Requirements['WingetRequired']) {
+            if ($Setting.CurrentState.Status -ne 'Preferred' -and -not (Get-WingetPath)) {
+                [void]$problems.Add('winget is not available, so this tool cannot be installed')
             }
         }
         if ($Setting.Requirements.ContainsKey('Editions')) {
@@ -1242,6 +1520,8 @@ function Test-PlanPreflight([array]$Selected) {
 
 Initialize-SettingHandlers
 $script:Settings = Get-Settings
+# The GUI shows this on the Tools tab. Command-line runs have no tab, so say it here.
+if ($script:ToolCatalogWarning -and -not $WpfHost) { [Console]::Error.WriteLine($script:ToolCatalogWarning) }
 
 $unexpectedValues = @($script:UnexpectedArguments)
 if ($unexpectedValues.Count) {
@@ -1306,7 +1586,9 @@ if ($FinalizeInternationalSettings) {
 }
 
 if ($SelfTest) {
-    if ($script:Settings.Count -ne 27) { throw "Expected 27 settings, found $($script:Settings.Count)." }
+    # Tools.json may add tools, so the total is the fixed settings plus the catalog.
+    $expectedSettingCount = 27 + @(Get-ToolCatalog).Count
+    if ($script:Settings.Count -ne $expectedSettingCount) { throw "Expected $expectedSettingCount settings, found $($script:Settings.Count)." }
     foreach ($workerHelper in @('Test-DisplayLanguagePackInstalled','Install-DisplayLanguagePack','Write-Utf8FileAtomically','New-ApplyResult','New-OperationComponent')) {
         if (-not (Get-Command $workerHelper -CommandType Function -ErrorAction SilentlyContinue)) { throw "Elevated-worker helper is unavailable: $workerHelper" }
     }
@@ -1322,7 +1604,7 @@ if ($SelfTest) {
     if ($launcherAst.Extent.Text -notmatch '-ElevationBroker' -or $launcherAst.Extent.Text -match '-Verb\s+RunAs') { throw 'The WPF launcher must delegate UAC to the non-WPF elevation broker.' }
     $duplicates = $script:Settings | Group-Object Id | Where-Object Count -gt 1
     if ($duplicates) { throw "Duplicate IDs: $($duplicates.Name -join ', ')" }
-    if ($script:SettingHandlers.Count -ne 6) { throw "Expected 6 setting handlers, found $($script:SettingHandlers.Count)." }
+    if ($script:SettingHandlers.Count -ne 7) { throw "Expected 7 setting handlers, found $($script:SettingHandlers.Count)." }
     foreach ($setting in $script:Settings) { [void](Get-SettingHandler $setting.Kind) }
     foreach ($dispatcherName in @('Get-SettingState','Set-SettingPart')) {
         $dispatcherAst = $selfTestAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $dispatcherName },$true)
@@ -1493,9 +1775,53 @@ if ($SelfTest) {
     } finally {
         $script:DeviceIsManaged = $savedManagedState
     }
+    # Tool cards are one-way on purpose: Dingo installs, and never uninstalls.
+    $builtInTools = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
+    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser')) {
+        if (@($builtInTools | Where-Object Id -eq $expectedId).Count -ne 1) { throw "The built-in tool catalog is missing '$expectedId'." }
+    }
+    $toolSettings = @($script:Settings | Where-Object Kind -eq 'Package')
+    if ($toolSettings.Count -ne @(Get-ToolCatalog).Count) { throw "Every catalog tool must become a setting; found $($toolSettings.Count)." }
+    foreach ($toolSetting in $toolSettings) {
+        if ($toolSetting.Tab -ne 'Tools') { throw "Tool '$($toolSetting.Id)' must sit on the Tools tab." }
+        if ($toolSetting.CanChoose) { throw "Tool '$($toolSetting.Id)' must not offer an uninstall option." }
+        if ($toolSetting.DefaultState -ne 'Not installed') { throw "Tool '$($toolSetting.Id)' must report 'Not installed' as the untouched state." }
+        if (@($toolSetting.Entries).Count -ne 1) { throw "Tool '$($toolSetting.Id)' must carry exactly one tool definition." }
+    }
+    # Scope decides elevation, so prove both directions with stand-in settings.
+    $scopeProbe = @{
+        user = (New-Setting 'tool-scope-user' 'Tools' 'User scope' 'probe' 'Installed' $null 'Package' @(($builtInTools | Where-Object Scope -eq 'user' | Select-Object -First 1)) $false $false @{} 'Tools' 'Not installed')
+        machine = (New-Setting 'tool-scope-machine' 'Tools' 'Machine scope' 'probe' 'Installed' $null 'Package' @(($builtInTools | Where-Object Scope -eq 'machine' | Select-Object -First 1)) $false $false @{} 'Tools' 'Not installed')
+    }
+    if ($scopeProbe.user.RequiresAdmin -or -not (Test-SettingHasScope $scopeProbe.user 'User')) {
+        throw 'A per-user package must stay in the signed-in account and must not request administrator approval.'
+    }
+    if (-not $scopeProbe.machine.RequiresAdmin -or -not (Test-SettingHasScope $scopeProbe.machine 'Machine')) {
+        throw 'A machine-wide package must request administrator approval.'
+    }
+    # Dingo must refuse to run a tool definition it cannot understand.
+    foreach ($badTool in @(
+        [PSCustomObject]@{ id='7zip'; name='x'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name=''; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a'; kind='chocolatey' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a'; scope='everyone' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a' }; detect=@() },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='guess' }) }
+    )) {
+        $rejected = $false
+        try { [void](ConvertTo-ToolDefinition $badTool) } catch { $rejected = $true }
+        if (-not $rejected) { throw "An invalid tool definition was accepted: $($badTool.id)." }
+    }
+    # An optional field left out must not throw under Set-StrictMode 2.0.
+    $minimalTool = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-minimal'; name='Minimal'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='command'; command='cmd.exe' }) })
+    if ($minimalTool.Scope -ne 'machine' -or $minimalTool.Source -ne 'winget' -or $minimalTool.Category -ne 'Tools') { throw 'Tool defaults are wrong.' }
+    if (-not (Find-InstalledTool $minimalTool)) { throw 'Tool detection did not find cmd.exe on the PATH.' }
+    $missingTool = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-absent'; name='Absent'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='file'; path='%ProgramFiles%\Dingo-Definitely-Absent\x.exe' }) })
+    if (Find-InstalledTool $missingTool) { throw 'Tool detection reported a missing tool as installed.' }
     $toggleCount = @($script:Settings | Where-Object CanChoose).Count
     if ($toggleCount -lt 20) { throw "Expected at least 20 reversible settings, found $toggleCount." }
-    "Self-test passed: 27 settings; $toggleCount reversible."
+    "Self-test passed: $($script:Settings.Count) settings; $toggleCount reversible; $($toolSettings.Count) tools."
     exit 0
 }
 
@@ -1698,6 +2024,17 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
           </ScrollViewer>
         </Grid>
       </TabItem>
+      <TabItem Header="Tools">
+        <Grid>
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <Border Background="#E8F6EE" Padding="12" Margin="8">
+            <TextBlock Name="ToolsScopeText" Text="Analyst tools. Dingo checks whether each one is already installed, and installs the missing ones with winget. Dingo never removes a tool." TextWrapping="Wrap"/>
+          </Border>
+          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel Name="ToolSettingsPanel" Margin="8,0,8,8"/>
+          </ScrollViewer>
+        </Grid>
+      </TabItem>
     </TabControl>
     <ProgressBar Name="ProgressBar" Grid.Row="3" Height="8" Margin="0,10,0,8" Minimum="0" Maximum="100"/>
     <DockPanel Grid.Row="4">
@@ -1714,12 +2051,17 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
-foreach ($name in @('ScopeTabs','UserScopeText','BothScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','ProgressBar','SummaryText','AdminSummaryText','OpenLogButton','ApplyButton')) {
+foreach ($name in @('ScopeTabs','UserScopeText','BothScopeText','ToolsScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','ProgressBar','SummaryText','AdminSummaryText','OpenLogButton','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
 $desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $UserScopeText.Text = "These settings affect only $desktopIdentity. A gold 'Admin approval required' label identifies a protected per-account policy that needs elevation."
 $BothScopeText.Text = "These choices affect $desktopIdentity and the whole computer. Administrator approval is used only for the computer-wide part."
+$ToolsScopeText.Text = "Analyst tools. Dingo checks whether each one is already installed, and installs the missing ones with winget. Dingo never removes a tool. Add more tools by putting a Tools.json file next to Dingo.ps1."
+if ($script:ToolCatalogWarning) {
+    $ToolsScopeText.Text = "$($script:ToolCatalogWarning) The built-in tool list is being used instead."
+    $ToolsScopeText.Foreground = '#8A2B21'
+}
 $script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$UncheckButton,$RefreshButton)
 
 function Set-ActionButtonsEnabled([bool]$Enabled) {
@@ -1882,10 +2224,12 @@ function New-SettingCard($Item) {
 
 foreach ($item in $script:Settings) {
     $card = New-SettingCard $item
-    switch ($item.DisplayScope) {
+    switch ($item.Tab) {
         'User' { [void]$UserSettingsPanel.Children.Add($card) }
         'System' { [void]$SystemSettingsPanel.Children.Add($card) }
         'Both' { [void]$BothSettingsPanel.Children.Add($card) }
+        'Tools' { [void]$ToolSettingsPanel.Children.Add($card) }
+        default { throw "Setting '$($item.Id)' asks for unknown tab '$($item.Tab)'." }
     }
 }
 
@@ -1894,7 +2238,7 @@ if ($UiSelfTest) {
     $adminSettings = @($script:Settings | Where-Object RequiresAdmin)
     if ($adminSettings | Where-Object { -not $_.AdminBadgeControl }) { throw 'Every setting that requires administrator approval must show an admin badge.' }
     if (-not $AdminSummaryText) { throw 'The selected administrator-change summary is unavailable.' }
-    "UI self-test passed: $($script:Settings.Count) setting cards across 3 scope tabs."
+    "UI self-test passed: $($script:Settings.Count) setting cards across 4 tabs."
     $window.Close()
     exit 0
 }

@@ -4,3 +4,6 @@ Logs/
 # Windows Terminal backups written by Dingo
 *.backup-*
 *.replace-backup-*
+
+# Your own tool catalog. Tools.example.json is the template that is tracked.
+Tools.json
