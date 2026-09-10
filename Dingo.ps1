@@ -145,9 +145,25 @@ function Get-SettingAdvisory($Setting) {
     # A caveat that Dingo cannot fix by writing the setting. Dingo still applies
     # the value, because it takes effect if the VM is later joined to a domain
     # or enrolled, but the operator is told plainly that it does nothing today.
-    if (-not $Setting.Requirements.ContainsKey('ManagedDevice')) { return '' }
-    if (Test-DeviceIsManaged) { return '' }
-    return 'Edge blocks this policy because this device is not joined to a domain or Entra ID and is not enrolled in Intune. Dingo writes and verifies the value, but Edge ignores it. Set the search engine by hand at edge://settings/searchEngines, or apply this on a managed image.'
+    if ($Setting.Requirements.ContainsKey('ManagedDevice')) {
+        if (-not (Test-DeviceIsManaged)) {
+            return 'Edge blocks this policy because this device is not joined to a domain or Entra ID and is not enrolled in Intune. Dingo writes and verifies the value, but Edge ignores it. Set the search engine by hand at edge://settings/searchEngines, or apply this on a managed image.'
+        }
+    }
+    # A tool can install perfectly and still not start, because something it
+    # depends on is absent. Say so rather than reporting an unqualified success.
+    if ($Setting.Requirements.ContainsKey('RequiredTools')) {
+        $missing = New-Object System.Collections.ArrayList
+        foreach ($requiredId in @($Setting.Requirements['RequiredTools'])) {
+            $required = @(Get-ToolCatalog | Where-Object Id -eq $requiredId)[0]
+            if (-not $required) { [void]$missing.Add($requiredId); continue }
+            if (-not (Find-InstalledTool $required)) { [void]$missing.Add($required.Name) }
+        }
+        if ($missing.Count) {
+            return "This tool needs $($missing -join ' and '), which is not installed. Tick that card as well, or the tool will not start."
+        }
+    }
+    return ''
 }
 
 function Initialize-Log {
@@ -435,6 +451,7 @@ function ConvertTo-ToolDefinition($Raw) {
         Dest = $dest
         Arguments = @(Get-JsonField $install 'arguments' @())
         Shims = $shims
+        Requires = @(Get-JsonField $Raw 'requires' @())
         TimeoutSeconds = ($timeoutMinutes * 60)
         Detect = @($rules)
     }
@@ -490,6 +507,7 @@ function Get-BuiltInToolCatalog {
                 timeoutMinutes=45
             }
             shims=[PSCustomObject]@{ from='C:/DFIR/Tools/EZTools/net9'; pattern='*.exe'; recurse=$true }
+            requires=@('tool-dotnet-desktop-9')
             # Detect on the two GUI tools, not on a command-line one. A partial
             # copy of the command-line tools is common, and it would otherwise
             # be reported as a complete install. Either GUI tool proves a full run.
@@ -1041,7 +1059,7 @@ function Get-Settings {
     # add more of them later without a code change.
     foreach ($tool in (Get-ToolCatalog)) {
         [void]$settings.Add((New-Setting $tool.Id $tool.Category $tool.Name $tool.Description 'Installed' $null 'Package' @($tool) $false $false `
-            @{ WingetRequired = ($tool.InstallKind -eq 'winget') } 'Tools' 'Not installed'))
+            @{ WingetRequired = ($tool.InstallKind -eq 'winget'); RequiredTools = @($tool.Requires) } 'Tools' 'Not installed'))
     }
     # Added last on purpose. The elevated worker runs the plan in this order, so
     # the launchers are written after the tools they point at are installed.
@@ -2071,9 +2089,21 @@ if ($SelfTest) {
         $script:DeviceIsManaged = $true
         if (Get-SettingAdvisory $advisoryMock) { throw 'A managed device must produce no caveat.' }
         $script:DeviceIsManaged = $false
-        foreach ($shipped in $script:Settings) {
+        # A tool caveat depends on what this machine has installed, so those are
+        # checked separately below rather than asserted to be absent.
+        foreach ($shipped in @($script:Settings | Where-Object { -not $_.Requirements.ContainsKey('RequiredTools') -or -not @($_.Requirements['RequiredTools']).Count })) {
             if (Get-SettingAdvisory $shipped) { throw "Setting '$($shipped.Id)' carries an unexpected caveat." }
         }
+        # A tool that needs another tool must say so when that one is absent, and
+        # must stay silent when it is present. Neither may fail preflight.
+        $dependentMock = ($script:Settings | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1).PSObject.Copy()
+        $dependentMock.Requirements = @{ RequiredTools = @('tool-definitely-not-in-the-catalog') }
+        if ((Get-SettingAdvisory $dependentMock) -notmatch 'will not start') { throw 'A tool with a missing dependency must produce a caveat.' }
+        if (-not (Test-SettingPreflight $dependentMock).Available) { throw 'A dependency caveat must never fail preflight.' }
+        $dependentMock.Requirements = @{ RequiredTools = @() }
+        if (Get-SettingAdvisory $dependentMock) { throw 'A tool with no dependencies must produce no caveat.' }
+        $ezRequires = @(($script:Settings | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1).Requirements['RequiredTools'])
+        if ($ezRequires -notcontains 'tool-dotnet-desktop-9') { throw "Eric Zimmerman's tools must declare the .NET runtime they need." }
     } finally {
         $script:DeviceIsManaged = $savedManagedState
     }

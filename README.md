@@ -97,6 +97,7 @@ Start-Dingo.cmd -Help
 - Dingo installs tools. It never uninstalls or downgrades one. A tool already present is reported as installed and left alone, whatever version it is.
 - If winget reports that a package is already present with nothing newer available, Dingo treats that as a success, because the tool is installed either way. Detection normally prevents this from happening at all.
 - `-ApplyPreferred` now installs missing tools as well as changing settings, because "installed" is the preferred state for a tool card. Use `-Exclude` with the `tool-` IDs, or `-Include`, if you want settings only.
+- A tool can declare that it needs another tool, with a `requires` list. When the other tool is absent, the card shows an amber caveat saying the tool will not start, and the same text appears as `Advisory` in `-WhatIf -OutputFormat Json`. A caveat never blocks the plan, because that would stop unrelated settings from being applied.
 - Eric Zimmerman's tools are built on .NET 9, and a fresh Windows 11 install does not include it. Without it every tool fails to start with `You must install .NET to run this application`. Dingo therefore offers **.NET 9 Desktop Runtime** as its own card, listed before the tools that need it so a single run installs them in the right order. This was found by testing in Windows Sandbox, which is as bare as a freshly imaged VM.
 - Dingo detects Eric Zimmerman's tools by looking for **Timeline Explorer** and **Registry Explorer**, not for a command-line tool. A partial copy holding only the command-line tools is common, and detecting on those would wrongly report a complete install.
 - The `script` install kind downloads a PowerShell script and runs it with administrator rights. That is how the author distributes these tools, and it is the same thing you would do by hand. Dingo refuses any address that is not `https://`, and logs the URL and the SHA256 of the file it actually ran.
@@ -231,6 +232,7 @@ Put a `Tools.json` file next to `Dingo.ps1`. A new `id` adds a tool. An `id` tha
 | `install.scope` | no | `machine` (default) or `user`. This decides whether the card needs administrator approval |
 | `install.source` | no | winget only. Defaults to `winget` |
 | `detect` | yes | One or more rules. The first rule that matches wins |
+| `requires` | no | List of other tool IDs this one needs. The card warns when one is missing |
 | `shims.from` | no | Folder to scan for command-line programs. Adding this block puts the tool's programs on the PATH |
 | `shims.pattern` | no | Defaults to `*.exe` |
 | `shims.recurse` | no | Defaults to `true` |
