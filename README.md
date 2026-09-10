@@ -7,7 +7,7 @@ A self-contained, state-aware PowerShell/WPF utility for applying a repeatable s
 1. Copy the entire Dingo folder to the VM.
 2. Double-click Start-Dingo.cmd.
    Do not use **Run as administrator**. Dingo keeps its main window in your signed-in account and asks for administrator credentials later, only when needed.
-3. Choose the **My account**, **Whole computer**, or **My account + whole computer** tab.
+3. Choose the **My account**, **Whole computer**, **My account + whole computer**, or **Tools** tab.
 4. Each card explains the normal Windows choice, the current choice, and the available choices in plain language.
 5. Tick the cards to change, or use **Choose all my preferred settings**.
 6. Choose **Apply checked changes**. Windows requests administrator approval when the selection includes a whole-computer setting or a protected account policy marked **Admin approval required**.
@@ -16,7 +16,7 @@ No installation or PowerShell modules are required. Windows PowerShell 5.1 is in
 
 ## Quick apply without the GUI
 
-Use the same launcher with `-ApplyPreferred` to apply all 27 preferred settings without opening the selection window:
+Use the same launcher with `-ApplyPreferred` to apply all 31 preferred settings without opening the selection window:
 
 ```bat
 Start-Dingo.cmd -ApplyPreferred
@@ -65,7 +65,7 @@ Start-Dingo.cmd -Help
 - Dingo permits only one normal GUI or quick-apply run per Windows account, preventing concurrent settings and result-file races. Read-only help, version, catalog, and internal self-test commands do not take the instance lock.
 - GUI and quick-apply modes use the same setting executor, administrator broker, verification, structured results, and logs.
 - Before applying a plan, Dingo checks every selected setting's handler, required Windows commands, readable current state, and declared edition/build requirements. If any preflight check fails, the plan is stopped before changes or administrator approval begin.
-- Setting types are registered in an internal handler catalog that owns their scope, state reader, apply function, and prerequisites. This keeps the single-file distribution while providing an extension point for future file-association and application-management handlers.
+- Setting types are registered in an internal handler catalog that owns their scope, state reader, apply function, and prerequisites. This keeps the single-file distribution while providing an extension point for future file-association and shortcut handlers. Tool installs use a `Package` handler on this same registry.
 - The window stays open while an administrator operation is active so Dingo can collect its results, verify changes, and remove temporary protocol files. Abandoned protocol files older than 24 hours are removed on a later launch.
 - The tool is idempotent: rerunning it writes and verifies the same desired values.
 - OneDrive is disabled with policy. It is not uninstalled, and user files are not deleted.
@@ -92,10 +92,16 @@ Start-Dingo.cmd -Help
 - Long-path, OneDrive, and Copilot changes can require a restart.
 - The forensic-continuity policy cannot cancel an update restart that was already pending when it was applied. Choose **Another time**, apply the policy, and perform the pending restart manually when evidence processing is safely stopped. Domain, Intune/MDM, or other management policy can reapply conflicting update settings; verify Dingo still reports the protected state before starting a long-running acquisition or processing job.
 - Windows Terminal must have been launched at least once so its settings file exists.
+- Tool installs use winget, which needs a working network connection and the Microsoft `winget` source. If winget itself is missing, preflight stops the plan and says so, rather than failing halfway through an install.
+- A winget install is given 15 minutes before Dingo gives up on it and stops the process. winget's own output is written to the log on both success and failure.
+- Dingo installs tools. It never uninstalls or downgrades one. A tool already present is reported as installed and left alone, whatever version it is.
+- If winget reports that a package is already present with nothing newer available, Dingo treats that as a success, because the tool is installed either way. Detection normally prevents this from happening at all.
+- `-ApplyPreferred` now installs missing tools as well as changing settings, because "installed" is the preferred state for a tool card. Use `-Exclude` with the `tool-` IDs, or `-Include`, if you want settings only.
+- Tool file associations and Desktop or Start Menu shortcuts are not built yet.
 
 ## Settings included
 
-Twenty-seven settings. The ID in the first column is the stable name used by `-Include` and `-Exclude`. **Scope** is whose settings change, and **Admin** is whether Windows asks for administrator approval. Run `Start-Dingo.cmd -ListSettings` for the same list from the tool itself.
+Thirty-one settings, of which four are tools. The ID in the first column is the stable name used by `-Include` and `-Exclude`. **Scope** is whose settings change, and **Admin** is whether Windows asks for administrator approval. Run `Start-Dingo.cmd -ListSettings` for the same list from the tool itself.
 
 ### Region and language
 
@@ -153,6 +159,64 @@ Twenty-seven settings. The ID in the first column is the stable name used by `-I
 | `terminal-cwd` | Windows PowerShell starting directory | User | no | Parent process directory |
 | `start-bing` | Bing/web search | User | yes | Disabled |
 | `start-recommendations` | Recommendations | Both | yes | Disabled |
+
+### Tools
+
+Tool cards live on their own **Tools** tab. Dingo checks whether each tool is already installed, and installs the missing ones with winget. Dingo never uninstalls a tool, so these cards are one-way and have no second option.
+
+| ID | Tool | Scope | Admin | Preferred |
+| --- | --- | --- | --- | --- |
+| `tool-7zip` | 7-Zip | System | yes | Installed |
+| `tool-notepadplusplus` | Notepad++ | System | yes | Installed |
+| `tool-ripgrep` | ripgrep | User | no | Installed |
+| `tool-sqlitebrowser` | DB Browser for SQLite | System | yes | Installed |
+
+A tool installs machine-wide where its winget package supports it, which needs administrator approval. ripgrep ships as a portable package, so it installs into the signed-in account only and needs no approval. winget adds ripgrep to the user PATH by itself.
+
+Detection does not depend on winget. Dingo reads the Windows uninstall list under both HKLM and HKCU, checks the usual install folders, and looks on the PATH. A tool installed by hand, or by Chocolatey, is still found.
+
+## Adding your own tools
+
+Put a `Tools.json` file next to `Dingo.ps1`. A new `id` adds a tool. An `id` that matches a built-in one replaces it. Comments and trailing commas are allowed.
+
+```json
+{
+  "tools": [
+    {
+      "id": "tool-hxd",
+      "name": "HxD",
+      "category": "Text and data",
+      "description": "Hex editor.",
+      "install": { "kind": "winget", "package": "MHNexus.HxD", "scope": "machine" },
+      "detect": [ { "kind": "uninstall-key", "match": "HxD*" } ]
+    }
+  ]
+}
+```
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `id` | yes | Must look like `tool-example`: lower case, digits, and hyphens |
+| `name` | yes | Shown on the card |
+| `category` | no | Defaults to `Tools` |
+| `description` | no | Defaults to "Install \<name\>" |
+| `install.kind` | no | Only `winget` in this version. Defaults to `winget` |
+| `install.package` | yes | The exact winget package id |
+| `install.scope` | no | `machine` (default) or `user`. This decides whether the card needs administrator approval |
+| `install.source` | no | Defaults to `winget` |
+| `detect` | yes | One or more rules. The first rule that matches wins |
+
+Detect rule kinds:
+
+| Kind | Field | Meaning |
+| --- | --- | --- |
+| `uninstall-key` | `match` | Wildcard match on the Windows uninstall display name, for example `7-Zip*` |
+| `file` | `path` | A file that must exist. `%ProgramFiles%` and other environment names are expanded. A backslash starts an escape in JSON, so write the path with forward slashes, or double every backslash |
+| `command` | `command` | An executable that must be on the PATH, for example `rg.exe` |
+
+A tool entry Dingo cannot understand is skipped, and the reason is written to the log and shown at the top of the Tools tab. A `Tools.json` that will not parse at all is ignored, and the built-in list is used instead. Dingo still starts either way.
+
+`Tools.json` names commands that Dingo will run. Treat it with the same care as `Dingo.ps1` itself.
 
 ## Credits
 

@@ -1,0 +1,27 @@
+{
+  // Copy this file to Tools.json to use it. Comments and trailing commas are allowed.
+  // A new "id" adds a tool. An "id" that matches a built-in one replaces it.
+  "tools": [
+    {
+      "id": "tool-hxd",
+      "name": "HxD",
+      "category": "Text and data",
+      "description": "Hex editor for binary files.",
+      "install": { "kind": "winget", "package": "MHNexus.HxD", "scope": "machine" },
+      "detect": [
+        { "kind": "uninstall-key", "match": "HxD*" },
+        { "kind": "file", "path": "%ProgramFiles%/HxD/HxD.exe" }
+      ]
+    },
+    {
+      "id": "tool-everything",
+      "name": "Everything",
+      "category": "Text and data",
+      "description": "Instant file-name search across every NTFS volume.",
+      "install": { "kind": "winget", "package": "voidtools.Everything", "scope": "machine" },
+      "detect": [
+        { "kind": "uninstall-key", "match": "Everything*" }
+      ]
+    }
+  ]
+}
