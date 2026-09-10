@@ -56,13 +56,17 @@ Start-Dingo.cmd -Help
 
 `-h` and `-?` are short aliases for `-Help`.
 
+Current version: **0.6.5**. Phase 4 VM testing corrected wildcard detection in 0.6.3, association write ordering in 0.6.4, and cleanup of Explorer's per-user Open With cache in 0.6.5. Phase 1 is **0.6.0**, Phase 2 is **0.6.1**; patch versions roll over after `.9`.
+
 ## Behaviour and safety
 
-- Every item is applied independently and verified before it is marked successful.
+- Every item is applied independently and checked against its declared verification basis. Registry checks establish stored values and types, not effective Windows or application behavior. Tool detection does not prove execution.
 - Current-state reads distinguish preferred, alternate, partial, unavailable, and error states. A read error is never treated as a missing setting, and **Check only settings that need changing** leaves unreadable settings unchecked.
-- Application results track the user, protected-user, computer-wide, and final-verification components separately, so a mixed setting can be reported as partially applied instead of as an undifferentiated failure.
+- Results track each registry entry and file extension, including before/after snapshots, requested state, outcome, and scope. Registry writes stop after the first failed entry in that scope and mark remaining entries skipped. Successful earlier changes remain visible as partially applied; there is no automatic rollback. JSON results include the final state and verification basis.
 - The GUI stays in the signed-in desktop account, so per-user settings affect the correct Windows profile even when separate administrator credentials are needed. Protected per-user policy values are written by the elevated helper directly to that desktop user's SID, not to the administrator's profile.
-- Twenty-eight settings offer plainly labelled reversible choices. The five one-way targets are UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal. The six tool cards are also one way: Dingo installs a tool but never removes it. Each can be left alone by unticking its card.
+- Twenty-eight settings offer plainly labelled reversible choices. The five one-way targets are UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal. The six tool cards offer **Installed** and **Update installed tool**; neither removes a tool. Each can be left alone by unticking its card.
+- Applying a selection freezes a separate copy of the plan before preflight. Card choices and the Explorer restart checkbox stay disabled until the operation finishes; the administrator and account steps use the captured choices.
+- Shortcut and launcher creation refuses to overwrite a same-name file that Dingo did not create. Existing conflicts are checked in preflight and checked again before writing, including targets discovered after a tool installs. Rename or move the conflicting file before retrying.
 - **Read settings again** rereads every configured value without making changes.
 - Preflight is all-or-nothing: an unsupported plan is stopped before any changes. Once application begins, an individual setting failure does not stop later selected settings from running.
 - Logs are written to the `Logs` folder beside the script, so a copy deployed to `C:\DFIR\Tools\Dingo` logs to `C:\DFIR\Tools\Dingo\Logs`. The GUI can open that folder. Dingo keeps the 20 most recent logs and deletes older ones on the next launch.
@@ -79,7 +83,7 @@ Start-Dingo.cmd -Help
 - Windows Terminal ships its settings as JSONC, which permits `//` and `/* */` comments and trailing commas. Windows PowerShell 5.1 cannot parse those, so Dingo removes them before reading. Text inside string values, such as a `https://` URL, is left alone. Rewriting the file writes plain JSON: any comment you added survives in the backup but not in the new file.
 - The Edge clutter setting removes the new tab page news feed and weather (`NewTabPageContentEnabled`), background images (`NewTabPageAllowedBackgroundTypes` = 3, DisableAll), and quick links (`NewTabPageQuickLinksEnabled`), plus Collections, shopping, Rewards, wallet donations, Insider and default-browser promotions, the web widget, feedback, alternate error pages, asset delivery, and telemetry. It sends Do Not Track and blocks Copilot's Discover Chat extension (`ofefcgjbeghpigppfmkologfjadafddi`). Every value is removable, so the card reverses cleanly. Restart Edge to finish applying it. The three new-tab-page values are the ones that matter most and are not covered by Chris Titus Tech's WinUtil Edge debloat.
 - Showing protected operating-system files is intentionally marked with a caution.
-- On Windows 11 Pro, Enterprise, or Education, the optional **Forensic continuity: manual updates and restarts** policy prevents Windows Update from automatically downloading or installing updates, disables update deadline enforcement, blocks update-driven restarts while a user is signed in, and suppresses all Windows Update notifications. This trades automatic patching for uninterrupted evidence processing: operators must check, install, and restart during a controlled maintenance window.
+- On Windows 11 Pro, Enterprise, or Education, **Forensic continuity: manual update configuration** writes the selected update policies and suppresses all update notifications, including restart warnings. Dingo verifies registry configuration only; it does not establish effective policy or guarantee automatic-restart prevention. Operators must manage patching and maintenance.
 
 ## Important limitations
 
@@ -94,18 +98,18 @@ Start-Dingo.cmd -Help
 - Dingo isolates its WPF interface from elevation operations by delegating administrator approval to a separate non-WPF broker process. It avoids fragile `Shell.Application` enumeration during state scans; Copilot policies and ordinary taskbar shortcuts are handled directly, while an opaque packaged-app pin may need to be unpinned manually.
 - When a language-profile change is pending, Dingo registers a one-time sign-in finalizer for its ISO date/time preference. This reapplies the custom formats after Windows finishes initialising the new language, preventing Windows from replacing them with the locale defaults.
 - Long-path, OneDrive, and Copilot changes can require a restart.
-- The forensic-continuity policy cannot cancel an update restart that was already pending when it was applied. Choose **Another time**, apply the policy, and perform the pending restart manually when evidence processing is safely stopped. Domain, Intune/MDM, or other management policy can reapply conflicting update settings; verify Dingo still reports the protected state before starting a long-running acquisition or processing job.
+- The update configuration does not cancel pending or user-scheduled restarts. Management policy can override it. A configured card is not evidence that a processing window is safe from restarts; review effective update policy and pending restart state separately.
 - Windows Terminal must have been launched at least once so its settings file exists.
 - Tool installs use winget, which needs a working network connection and the Microsoft `winget` source. If winget itself is missing, preflight stops the plan and says so, rather than failing halfway through an install.
 - A winget install is given 15 minutes before Dingo gives up on it and stops the process. winget's own output is written to the log on both success and failure.
-- Dingo installs tools. It never uninstalls or downgrades one. A tool already present is reported as installed and left alone, whatever version it is.
+- **Installed**, including `-ApplyPreferred`, leaves a detected installation unchanged, whatever its version. Detection is repeated in the executing account immediately before installation; winget also receives `--no-upgrade` for this action. **Update installed tool** explicitly invokes the installer for a detected installation. Dingo provides no uninstall action.
 - If winget reports that a package is already present with nothing newer available, Dingo treats that as a success, because the tool is installed either way. Detection normally prevents this from happening at all.
 - `-ApplyPreferred` now installs missing tools as well as changing settings, because "installed" is the preferred state for a tool card. Use `-Exclude` with the `tool-` IDs, or `-Include`, if you want settings only.
 - A tool can declare that it needs another tool, with a `requires` list. When the other tool is absent, the card shows an amber caveat saying the tool will not start, and the same text appears as `Advisory` in `-WhatIf -OutputFormat Json`. A caveat never blocks the plan, because that would stop unrelated settings from being applied.
 - Eric Zimmerman's tools are built on .NET 9, and a fresh Windows 11 install does not include it. Without it every tool fails to start with `You must install .NET to run this application`. Dingo therefore offers **.NET 9 Desktop Runtime** as its own card, listed before the tools that need it so a single run installs them in the right order. This was found by testing in Windows Sandbox, which is as bare as a freshly imaged VM.
 - Dingo detects Eric Zimmerman's tools by looking for **Timeline Explorer** and **Registry Explorer**, not for a command-line tool. A partial copy holding only the command-line tools is common, and detecting on those would wrongly report a complete install.
 - The `script` install kind downloads a PowerShell script and runs it with administrator rights. That is how the author distributes these tools, and it is the same thing you would do by hand. Dingo refuses any address that is not `https://`, and logs the URL and the SHA256 of the file it actually ran.
-- Re-running the Eric Zimmerman install updates the tools in place, because the author's script only fetches what has changed. A tool card stays tickable after it reports installed, so ticking it again is how you update.
+- To update Eric Zimmerman's tools, choose **Update installed tool** on its card, then apply the checked change. This runs the author's script again to fetch changed tools. Choosing **Installed** again leaves a detected installation alone. Use the same explicit update choice for winget tools; if a tool is missing, choose **Installed** first.
 - Eric Zimmerman's tools land in `C:\DFIR\Tools\EZTools\net9`, in a mixed layout: some tools are a loose `.exe`, others get their own folder. Tick **Run tools from anywhere** to reach them from any folder.
 - Dingo reads the computer PATH without expanding it and writes it back as an expandable value. Real machines hold entries such as `%USERPROFILE%\go\bin`, and reading PATH the easy way expands those, which would permanently bake one account's folders into the computer PATH. The self-test proves this on a stand-in value before anything is written.
 - A PATH change reaches new windows only. Restart any open terminal, and sign out and back in for programs started from Explorer.
@@ -152,7 +156,7 @@ Thirty-nine settings. Six install tools. Two make shortcuts, one puts the tools 
 | --- | --- | --- | --- | --- |
 | `onedrive` | OneDrive file sync | System | yes | Disabled by policy |
 | `windows-copilot` | Windows Copilot and taskbar icon | Both | yes | Disabled |
-| `windows-update-continuity` | Forensic continuity: manual updates and restarts | System | yes | Protected, manual maintenance |
+| `windows-update-continuity` | Forensic continuity: manual update configuration | System | yes | Configured; manual maintenance |
 
 ### Microsoft Edge
 
@@ -174,11 +178,13 @@ Thirty-nine settings. Six install tools. Two make shortcuts, one puts the tools 
 
 ### Tools
 
-Tool cards live on the **Install tools** tab. Dingo checks whether each tool is already installed, and installs the missing ones with winget. Dingo never uninstalls a tool, so these cards are one-way and have no second option.
+Tool cards live on the **Install tools** tab. **Installed** is the preferred action: keep a detected installation or install a missing one. **Update installed tool** is an explicit maintenance action and requires the tool to be detected already. `-ApplyPreferred` and **Choose all my preferred settings** always use **Installed**, never the update action. Neither choice uninstalls a tool.
 
 The **Tool shortcuts** tab holds the three cards that make an installed tool easy to reach: Start menu shortcuts, Desktop shortcuts, and command-line access. The **File associations** tab decides which program opens which file type.
 
-A reported version comes from the tool itself. A .NET build stamps its git commit onto that version, so Timeline Explorer reports `2026.5.0+74bece05a5...`. Dingo shows only the part before the plus.
+EZTools detection requires a minimum inventory of Timeline Explorer, Registry Explorer, EvtxECmd, and RECmd under their net9 subfolders, plus the declared .NET prerequisite. Missing inventory or prerequisites produces a partial state. This does not prove every upstream download succeeded or any program runs. Completing an incomplete installation reruns the upstream installer, which can also replace existing files.
+
+A reported version comes from file or uninstall metadata. A .NET build stamps its git commit onto that version, so Timeline Explorer reports `2026.5.0+74bece05a5...`. Dingo shows only the part before the plus.
 
 Cards on the **Install tools** tab:
 
@@ -201,7 +207,7 @@ Cards on the **Tool shortcuts** tab:
 
 A tool installs machine-wide where its winget package supports it, which needs administrator approval. ripgrep ships as a portable package, so it installs into the signed-in account only and needs no approval. winget adds ripgrep to the user PATH by itself.
 
-Eric Zimmerman's tools are not in winget. Dingo runs the author's own `Get-ZimmermanTools.ps1` instead, fetched over https from `EricZimmerman/Get-ZimmermanTools` on GitHub, and installs into `C:\DFIR\Tools\EZTools`. The SHA256 of the downloaded script is written to the log before it runs, so you can audit what was executed. That download is several hundred megabytes and is given 45 minutes.
+Eric Zimmerman's tools are not in winget. Dingo runs the author's own `Get-ZimmermanTools.ps1` instead, fetched over https from `EricZimmerman/Get-ZimmermanTools` on GitHub, and installs into `C:\DFIR\Tools\EZTools`. The bootstrap script is pinned to revision `d808d1dfe6446faf884576a8a1c11b6875197a19` and expected SHA256 `B9122527E7049D2AB3F9A58BC972189AAC62FAD9A83FDA59EA6B70C7360D7834`. Dingo refuses a hash mismatch before execution. The URL, actual/expected hash, and Authenticode status are journaled. This pins the bootstrap script only: its downstream tool downloads remain controlled by upstream. That download is several hundred megabytes and is given 45 minutes.
 
 **Run tools from anywhere** is not a tool. It writes one small `.cmd` launcher for each installed command-line program into `C:\DFIR\Tools\bin`, then adds that single folder to the computer PATH. You can then type `EvtxECmd -d "path"` from any folder.
 
@@ -240,17 +246,17 @@ The **File associations** tab decides which program opens which file type. These
 
 One card can send different file types to different programs. On an analysis VM a `.dat` file is almost always a registry hive, `NTUSER.DAT` or `UsrClass.dat`, so that type goes to Registry Explorer while `.csv` and `.tsv` go to Timeline Explorer.
 
-These cards run after the tool cards, so installing a tool and setting its file types happens in one run. A type whose program is not installed is left alone, and the card says so.
+These cards run after the tool cards, so installing a tool and setting its file types happens in one run. A type whose program is missing records a failure; successful changes to other extensions remain visible as partial application.
 
 **What Windows allows, and what it does not.** A file type that nothing has claimed can be set freely. A file type that already carries a `UserChoice` cannot be taken by anything: the key is locked and Windows validates an undocumented hash in it. The one documented way around that, the *Set a default associations configuration file* policy, works only on a domain-joined computer, and was measured doing nothing on a Windows 11 Pro workgroup VM across two restarts. Dingo therefore does not try.
 
 So `.txt` and `.log` are deliberately absent from the Notepad++ card. The Windows Notepad app owns them on a fresh install and will not give them up.
 
-For any type it cannot take, Dingo adds the tool to the **Open with** list instead, and the card names the types it could not take and why. A blocked type is never reported as a failure.
+For any type it cannot take, Dingo adds the tool to the **Open with** list instead, and the card names the types it could not take and why. A blocked type counts as configured only when its Open with registration and command are valid and the target exists. The card explicitly distinguishes defaults from Open with fallback; it does not launch the program to verify Windows behavior.
 
 **How it works.** Dingo registers its own handler name for each program, such as `Dingo.notepad++`, holding the program path and its icon. The extension is then pointed at that name. Because every name Dingo creates starts with `Dingo.`, ownership is never in doubt.
 
-**Turning a card off** puts back whatever the file type pointed at before, which Dingo saved under `HKCU\Software\Dingo\FileAssociations` when it made the change. If the type had no handler at all, the key Dingo created is removed. A file type pointing at somebody else's handler is never touched.
+**Turning a card off** puts back whatever the file type pointed at before, which Dingo saved under `HKCU\Software\Dingo\FileAssociations` when it made the change. If the type had no handler at all, the key Dingo created is removed. Dingo also removes its handler name if Explorer copied it into the account's `FileExts` Open With history after use. A file type pointing at somebody else's handler is never redirected. If Windows UserChoice points to a Dingo handler, reversal fails with instructions to choose another default in Windows Settings and preserves the working registration. Shared Dingo handler commands are retained because other extensions or UserChoice entries may still reference them.
 
 Detection does not depend on winget. Dingo reads the Windows uninstall list under both HKLM and HKCU, checks the usual install folders, and looks on the PATH. A tool installed by hand, or by Chocolatey, is still found.
 
@@ -282,13 +288,15 @@ Put a `Tools.json` file next to `Dingo.ps1`. A new `id` adds a tool. An `id` tha
 | `install.kind` | no | `winget` (default) or `script` |
 | `install.package` | winget only | The exact winget package id |
 | `install.url` | script only | `https://` address of the install script. Plain `http` is refused |
+| `install.sha256` | no | Expected 64-character SHA256 for a script; mismatch blocks execution. Omission keeps custom catalogs compatible but only records provenance, with a warning. Authenticode status is recorded, not enforced |
 | `install.dest` | script only | Folder the script installs into. Dingo creates it if needed |
 | `install.arguments` | no | Extra arguments for the script. `-Dest` is always passed for you |
 | `install.timeoutMinutes` | no | 1 to 240. Defaults to 15 for winget and 45 for a script |
 | `install.scope` | no | `machine` (default) or `user`. This decides whether the card needs administrator approval |
 | `install.source` | no | winget only. Defaults to `winget` |
-| `detect` | yes | One or more rules. The first rule that matches wins |
-| `requires` | no | List of other tool IDs this one needs. The card warns when one is missing |
+| `detect` | yes | One or more rules with nonempty targets |
+| `detectMode` | no | `any` (default) accepts the first matching rule; `all` requires every rule |
+| `requires` | no | List of other tool IDs this one needs. Missing prerequisites produce a partial state |
 | `shims.from` | no | Folder to scan for command-line programs. Adding this block puts the tool's programs on the PATH |
 | `shims.pattern` | no | Defaults to `*.exe` |
 | `shims.recurse` | no | Defaults to `true` |
@@ -312,6 +320,37 @@ Detect rule kinds:
 A tool entry Dingo cannot understand is skipped, and the reason is written to the log and shown at the top of the Install tools tab. A `Tools.json` that will not parse at all is ignored, and the built-in list is used instead. Dingo still starts either way.
 
 `Tools.json` names commands that Dingo will run. Treat it with the same care as `Dingo.ps1` itself.
+
+## Execution and interrupted runs
+
+Installer arguments preserve empty values, embedded quotes, and trailing backslashes. Both output streams are drained concurrently, retaining the last 64 KiB of characters from each. A Windows Job Object tracks the assigned installer and descendants, including children that outlive their parent. Timeout closes the job and reports possible partial installation. This is not a security sandbox: external installer services and any process that escapes before assignment may remain active. Job assignment failure stops the run instead of continuing without tracking. Real winget, UAC, and installer-service behavior still needs disposable-VM validation.
+
+Script downloads have a 120-second network timeout and refuse redirects. Use a direct HTTPS URL for custom scripts. Pin updates require reviewing the new revision and calculating a new expected hash; merely recording an observed hash does not establish trust.
+
+Before each setting scope runs, Dingo flushes a `Started` record to a per-process `*.journal.jsonl` file beside its log. A `Completed` record preserves the scope results. Journals remain after temporary worker results and old `.log` files are removed. They can contain paths and before/after configuration data; archive or remove them manually according to your retention needs.
+
+Inspect interrupted scope records without applying anything:
+
+```bat
+Start-Dingo.cmd -RecoveryReport
+Start-Dingo.cmd -RecoveryReport -OutputFormat Json
+```
+
+A missing completion record means **unknown**, not rolled back or safe to retry. A scope may still be running. Read current settings again, inspect installer processes and the journal, then explicitly select any retry. Damaged journal records are reported. The report does not replay operations, restore backups automatically, or establish final Windows behavior; a completed scope can still have failed components or await final setting verification.
+
+## Regression checks
+
+For real Windows validation, use the [Phase 4 VM test pack](Tests/Phase4/README.md). Begin with a snapshot and the read-only baseline collector; the checklist targets an existing Windows 11 Pro VM with one administrator-capable account and UAC consent.
+
+Run the isolated checks with Windows PowerShell 5.1:
+
+```powershell
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Tests\Phase1.Tests.ps1
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Tests\Phase2.Tests.ps1
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Tests\Phase3.Tests.ps1
+```
+
+These checks import function definitions without starting Dingo. They exercise JSONC preservation, captured plans, WPF card locking, file collisions, and install/update dispatch. Installer and machine-setting operations are mocked. Temporary files and shortcuts are created in a unique directory beneath `Tests` and removed afterwards; no registry values are written. Phase 2 adds inventory/prerequisite detection, association fallback and reversal, per-entry failures, elevated-result serialization, registry types, and verification wording. Phase 3 compiles a harmless local process fixture to test real argument delivery, concurrent output, and descendant timeouts, plus mocked downloads and journal recovery. These checks do not establish live installer, UAC, default-app, or effective policy behavior; those need a disposable Windows VM integration pass.
 
 ## Credits
 
