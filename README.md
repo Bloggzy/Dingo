@@ -24,7 +24,7 @@ Start-Dingo.cmd -ApplyPreferred
 
 The examples use the launcher so errors remain visible when it is double-clicked. From an existing PowerShell console, you can use `./Dingo.ps1` in place of `Start-Dingo.cmd`.
 
-Dingo still runs as the signed-in user and displays a Windows administrator prompt when the plan contains protected or whole-computer settings. Do not run the launcher or script from an elevated console. Preview the plan without changing anything with:
+Dingo still runs as the signed-in user and displays a Windows administrator prompt when the plan contains protected or whole-computer settings. Do not apply changes from an elevated console. Preview the plan without changing anything with:
 
 ```bat
 Start-Dingo.cmd -WhatIf
