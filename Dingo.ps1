@@ -41,7 +41,7 @@ $script:LanguageChangePending = $false
 $script:InstanceMutex = $null
 $script:PendingApply = $null
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.5.8'
+$script:DingoVersion = '0.5.9'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -57,6 +57,12 @@ $script:DesktopShortcutDirectory = Join-Path $env:PUBLIC 'Desktop'
 # Written into the shortcut comment. Only shortcuts carrying this are ever
 # deleted, so one placed by hand or by an installer is left alone.
 $script:ShortcutMarker = 'Created by Dingo. Safe to delete.'
+# Dingo registers its own handler names so ownership is never in doubt. Only an
+# extension pointing at a name starting with this is ever given back.
+$script:AssociationProgIdPrefix = 'Dingo.'
+# Whatever an extension pointed at before Dingo changed it is kept here, so
+# turning the card off restores the old value rather than guessing.
+$script:AssociationBackupSubKey = 'Software\Dingo\FileAssociations'
 $automaticArguments = @(Get-Variable -Name args -ValueOnly -ErrorAction SilentlyContinue)
 $script:UnexpectedArguments = @(@($UnexpectedArguments) + $automaticArguments | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
 
@@ -499,6 +505,26 @@ function ConvertTo-ToolDefinition($Raw) {
         })
     }
 
+    # A tool may want to open some file types. Windows only allows this for an
+    # extension nothing has claimed yet, which is checked when the card is read.
+    $associations = New-Object System.Collections.ArrayList
+    foreach ($rawAssociation in @(Get-JsonField $Raw 'associations' @())) {
+        $extension = [string](Get-JsonField $rawAssociation 'extension' '')
+        $associationTarget = [string](Get-JsonField $rawAssociation 'target' '')
+        if ($extension -notmatch '^\.[A-Za-z0-9][A-Za-z0-9_-]{0,15}$') {
+            throw "Tool '$id' has a file association for '$extension', which is not a usable extension."
+        }
+        if ([string]::IsNullOrWhiteSpace($associationTarget)) { throw "Tool '$id' has a file association for '$extension' with no target." }
+        [void]$associations.Add([PSCustomObject]@{
+            # Every entry carries a scope, because New-Setting reads it to decide
+            # whether a card needs administrator approval. File types never do.
+            Scope = 'User'
+            Extension = $extension.ToLowerInvariant()
+            Target = $associationTarget
+            Description = [string](Get-JsonField $rawAssociation 'description' "$name file")
+        })
+    }
+
     [PSCustomObject]@{
         Id = $id
         Name = $name
@@ -513,6 +539,7 @@ function ConvertTo-ToolDefinition($Raw) {
         Arguments = @(Get-JsonField $install 'arguments' @())
         Shims = $shims
         Shortcuts = @($shortcuts)
+        Associations = @($associations)
         Requires = @(Get-JsonField $Raw 'requires' @())
         TimeoutSeconds = ($timeoutMinutes * 60)
         Detect = @($rules)
@@ -534,6 +561,16 @@ function Get-BuiltInToolCatalog {
             id='tool-notepadplusplus'; name='Notepad++'; category='Text and data'
             description='Text editor for logs, scripts, and configuration files.'
             install=[PSCustomObject]@{ kind='winget'; package='Notepad++.Notepad++'; scope='machine' }
+            # .txt and .log are deliberately absent. The Windows Notepad app owns
+            # them through a protected user choice that nothing can take.
+            associations=@(
+                [PSCustomObject]@{ extension='.json'; target='%ProgramFiles%/Notepad++/notepad++.exe'; description='JSON file' },
+                [PSCustomObject]@{ extension='.md'; target='%ProgramFiles%/Notepad++/notepad++.exe'; description='Markdown file' },
+                [PSCustomObject]@{ extension='.yml'; target='%ProgramFiles%/Notepad++/notepad++.exe'; description='YAML file' },
+                [PSCustomObject]@{ extension='.yaml'; target='%ProgramFiles%/Notepad++/notepad++.exe'; description='YAML file' },
+                [PSCustomObject]@{ extension='.ini'; target='%ProgramFiles%/Notepad++/notepad++.exe'; description='Configuration file' },
+                [PSCustomObject]@{ extension='.conf'; target='%ProgramFiles%/Notepad++/notepad++.exe'; description='Configuration file' }
+            )
             detect=@(
                 [PSCustomObject]@{ kind='uninstall-key'; match='Notepad++*' },
                 [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\Notepad++\notepad++.exe' }
@@ -569,6 +606,11 @@ function Get-BuiltInToolCatalog {
                 timeoutMinutes=45
             }
             shims=[PSCustomObject]@{ from='C:/DFIR/Tools/EZTools/net9'; pattern='*.exe'; recurse=$true }
+            # Timeline Explorer is the reason most analysts open a csv at all.
+            associations=@(
+                [PSCustomObject]@{ extension='.csv'; target='C:/DFIR/Tools/EZTools/net9/TimelineExplorer/TimelineExplorer.exe'; description='Comma separated values' },
+                [PSCustomObject]@{ extension='.tsv'; target='C:/DFIR/Tools/EZTools/net9/TimelineExplorer/TimelineExplorer.exe'; description='Tab separated values' }
+            )
             # Get-ZimmermanTools makes no shortcuts at all, so the window tools are
             # invisible in the Start menu. A target that is not on disk is skipped.
             shortcuts=@(
@@ -593,6 +635,11 @@ function Get-BuiltInToolCatalog {
             id='tool-sqlitebrowser'; name='DB Browser for SQLite'; category='Text and data'
             description='Reads and queries SQLite databases, such as browser and application history.'
             install=[PSCustomObject]@{ kind='winget'; package='DBBrowserForSQLite.DBBrowserForSQLite'; scope='machine' }
+            associations=@(
+                [PSCustomObject]@{ extension='.db'; target='%ProgramFiles%/DB Browser for SQLite/DB Browser for SQLite.exe'; description='SQLite database' },
+                [PSCustomObject]@{ extension='.sqlite'; target='%ProgramFiles%/DB Browser for SQLite/DB Browser for SQLite.exe'; description='SQLite database' },
+                [PSCustomObject]@{ extension='.sqlite3'; target='%ProgramFiles%/DB Browser for SQLite/DB Browser for SQLite.exe'; description='SQLite database' }
+            )
             detect=@(
                 [PSCustomObject]@{ kind='uninstall-key'; match='DB Browser for SQLite*' },
                 [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\DB Browser for SQLite\DB Browser for SQLite.exe' }
@@ -1091,6 +1138,221 @@ function Set-ShortcutKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     }
 }
 
+function Join-WordList([string[]]$Words) {
+    $items = @($Words)
+    if ($items.Count -le 1) { return ($items -join '') }
+    if ($items.Count -eq 2) { return ($items -join ' and ') }
+    return (($items[0..($items.Count - 2)] -join ', ') + ' and ' + $items[-1])
+}
+
+function Get-AssociationProgId($Association) {
+    # One handler name per program, so two tools can never collide, and so a
+    # name starting with Dingo. always means Dingo put it there.
+    $stem = [IO.Path]::GetFileNameWithoutExtension([Environment]::ExpandEnvironmentVariables($Association.Target))
+    return $script:AssociationProgIdPrefix + ($stem -replace '[^A-Za-z0-9]', '')
+}
+
+function Get-AssociationTarget($Association) {
+    return [Environment]::ExpandEnvironmentVariables($Association.Target)
+}
+
+function Get-ExtensionUserChoice([string]$Extension) {
+    $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$Extension\UserChoice"
+    if (-not (Test-Path -LiteralPath $key)) { return '' }
+    $values = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+    if ($values -and $values.PSObject.Properties['ProgId']) { return [string]$values.ProgId }
+    return ''
+}
+
+function Get-ExtensionHandlerName([string]$Extension) {
+    $key = "HKCU:\Software\Classes\$Extension"
+    if (-not (Test-Path -LiteralPath $key)) { return '' }
+    $values = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+    if ($values -and $values.PSObject.Properties['(default)']) { return [string]$values.'(default)' }
+    return ''
+}
+
+function Get-AssociationStatus($Association) {
+    # Windows protects an extension that already carries a user choice with an
+    # undocumented hash. Nothing can take one of those, so it is reported as
+    # blocked rather than attempted and failed.
+    $target = Get-AssociationTarget $Association
+    $progId = Get-AssociationProgId $Association
+    $current = Get-ExtensionHandlerName $Association.Extension
+    $userChoice = Get-ExtensionUserChoice $Association.Extension
+    $state = if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { 'ToolMissing' }
+             elseif ($userChoice -and $userChoice -ne $progId) { 'Blocked' }
+             elseif ($current -eq $progId) { 'Ours' }
+             else { 'Available' }
+    return [PSCustomObject]@{
+        Extension = $Association.Extension
+        ProgId = $progId
+        Target = $target
+        Current = $current
+        State = $state
+    }
+}
+
+function Send-AssociationChange {
+    # Tells Explorer to reread file types, so an open window updates its icons
+    # without a sign-out.
+    try {
+        if (-not ('Dingo.NativeShell' -as [type])) {
+            $signature = '[DllImport("shell32.dll")] public static extern void SHChangeNotify(int eventId, uint flags, System.IntPtr item1, System.IntPtr item2);'
+            Add-Type -Namespace 'Dingo' -Name 'NativeShell' -MemberDefinition $signature -ErrorAction Stop
+        }
+        # SHCNE_ASSOCCHANGED with SHCNF_IDLIST.
+        [Dingo.NativeShell]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+    } catch {
+        Write-Log 'DEBUG' "Could not notify Explorer of the file type change: $($_.Exception.Message)"
+    }
+}
+
+function Register-AssociationProgId($Association) {
+    $progId = Get-AssociationProgId $Association
+    $target = Get-AssociationTarget $Association
+    $key = "HKCU:\Software\Classes\$progId"
+    New-Item -Path "$key\shell\open\command" -Force -ErrorAction Stop | Out-Null
+    New-Item -Path "$key\DefaultIcon" -Force -ErrorAction Stop | Out-Null
+    Set-ItemProperty -Path $key -Name '(default)' -Value $Association.Description -ErrorAction Stop
+    Set-ItemProperty -Path "$key\DefaultIcon" -Name '(default)' -Value ('"{0}",0' -f $target) -ErrorAction Stop
+    Set-ItemProperty -Path "$key\shell\open\command" -Name '(default)' -Value ('"{0}" "%1"' -f $target) -ErrorAction Stop
+}
+
+function Save-AssociationBackup([string]$Extension, [string]$PreviousHandler) {
+    $key = "HKCU:\$script:AssociationBackupSubKey"
+    if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
+    $existing = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+    # Keep the first value seen. A second apply must not record Dingo's own
+    # handler name as the thing to restore.
+    if ($existing -and $existing.PSObject.Properties[$Extension]) { return }
+    New-ItemProperty -Path $key -Name $Extension -Value $PreviousHandler -PropertyType String -Force | Out-Null
+}
+
+function Get-AssociationBackup([string]$Extension) {
+    $key = "HKCU:\$script:AssociationBackupSubKey"
+    if (-not (Test-Path -LiteralPath $key)) { return '' }
+    $values = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+    if ($values -and $values.PSObject.Properties[$Extension]) { return [string]$values.$Extension }
+    return ''
+}
+
+function Remove-AssociationBackup([string]$Extension) {
+    $key = "HKCU:\$script:AssociationBackupSubKey"
+    if (-not (Test-Path -LiteralPath $key)) { return }
+    Remove-ItemProperty -LiteralPath $key -Name $Extension -Force -ErrorAction SilentlyContinue
+}
+
+function Add-AssociationOpenWithEntry($Association) {
+    # Works even where the default cannot be changed, so a blocked extension
+    # still gains a one-click way to open the tool.
+    $key = "HKCU:\Software\Classes\$($Association.Extension)\OpenWithProgids"
+    New-Item -Path $key -Force -ErrorAction Stop | Out-Null
+    New-ItemProperty -Path $key -Name (Get-AssociationProgId $Association) -Value ([byte[]]@()) -PropertyType Binary -Force -ErrorAction Stop | Out-Null
+}
+
+function Remove-AssociationOpenWithEntry($Association) {
+    $key = "HKCU:\Software\Classes\$($Association.Extension)\OpenWithProgids"
+    if (-not (Test-Path -LiteralPath $key)) { return }
+    Remove-ItemProperty -LiteralPath $key -Name (Get-AssociationProgId $Association) -Force -ErrorAction SilentlyContinue
+    if (-not @((Get-Item -LiteralPath $key).GetValueNames() | Where-Object { $_ }).Count) {
+        Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-ExtensionHandlerName([string]$Extension) {
+    # The registry provider will not delete an unnamed default value by name, so
+    # open the key for writing and delete it through the registry API instead.
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\Classes\$Extension", $true)
+    if (-not $key) { return }
+    try { $key.DeleteValue('', $false) } finally { $key.Close() }
+}
+
+function Remove-EmptyExtensionKey([string]$Extension) {
+    $key = "HKCU:\Software\Classes\$Extension"
+    if (-not (Test-Path -LiteralPath $key)) { return }
+    $item = Get-Item -LiteralPath $key
+    # Leave anything somebody else put under this extension alone. The handler
+    # name lives in the unnamed default value, which GetValueNames reports as an
+    # empty string, so it has to be read directly or a restored value is lost.
+    if ($null -ne $item.GetValue('', $null)) { return }
+    if (@($item.GetValueNames() | Where-Object { $_ }).Count -or $item.SubKeyCount) { return }
+    Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue
+}
+
+function Get-AssociationKindState($Setting) {
+    $items = @($Setting.Entries | ForEach-Object { Get-AssociationStatus $_ })
+    $ready = @($items | Where-Object { $_.State -ne 'ToolMissing' })
+    if (-not $ready.Count) {
+        return (New-StateResult 'Partial' 'Tool not installed' 'Dingo can set these file types once the tool itself is installed.')
+    }
+    $blocked = @($items | Where-Object State -eq 'Blocked')
+    $changeable = @($items | Where-Object { $_.State -in @('Ours', 'Available') })
+    $ours = @($items | Where-Object State -eq 'Ours')
+    $notes = New-Object System.Collections.ArrayList
+    if ($blocked.Count) {
+        $them = if ($blocked.Count -eq 1) { 'it' } else { 'them' }
+        [void]$notes.Add(("Windows will not let anything take {0}, because another app already owns {1}. Dingo adds this tool to the Open with list for {1} instead." -f
+            (Join-WordList @($blocked | ForEach-Object { $_.Extension })), $them))
+    }
+    if ($changeable.Count -and $ours.Count -eq $changeable.Count) {
+        [void]$notes.Insert(0, ("{0} {1} with this tool." -f (Join-WordList @($ours | ForEach-Object { $_.Extension })), $(if ($ours.Count -eq 1) { 'opens' } else { 'open' })))
+        return (New-StateResult 'Preferred' $Setting.PreferredState ($notes -join ' '))
+    }
+    if (-not $ours.Count) {
+        [void]$notes.Insert(0, ("{0} {1} whatever Windows uses now." -f (Join-WordList @($changeable | ForEach-Object { $_.Extension })), $(if ($changeable.Count -eq 1) { 'keeps' } else { 'keep' })))
+        return (New-StateResult 'Alternate' $Setting.AlternateState ($notes -join ' '))
+    }
+    [void]$notes.Insert(0, ("{0} of {1} file types open with this tool." -f $ours.Count, $changeable.Count))
+    return (New-StateResult 'Partial' 'Partly set' ($notes -join ' '))
+}
+
+function Set-AssociationKindPart($Setting, [string]$DesiredState, [string]$Scope) {
+    $associations = @($Setting.Entries)
+    if ($DesiredState -eq $Setting.PreferredState) {
+        $ready = @($associations | Where-Object { (Get-AssociationStatus $_).State -ne 'ToolMissing' })
+        if (-not $ready.Count) { throw 'The program these file types would open is not installed yet.' }
+        foreach ($association in $ready) {
+            $status = Get-AssociationStatus $association
+            Register-AssociationProgId $association
+            Add-AssociationOpenWithEntry $association
+            # A blocked extension cannot be taken at all. The Open with entry
+            # above is everything Windows allows, so stop there.
+            if ($status.State -eq 'Blocked') {
+                Write-Log 'INFO' "$($association.Extension) is owned by '$($status.Current)'; added an Open with entry only."
+                continue
+            }
+            if ($status.Current -ne $status.ProgId) { Save-AssociationBackup $association.Extension $status.Current }
+            New-Item -Path "HKCU:\Software\Classes\$($association.Extension)" -Force -ErrorAction Stop | Out-Null
+            Set-ItemProperty -Path "HKCU:\Software\Classes\$($association.Extension)" -Name '(default)' -Value $status.ProgId -ErrorAction Stop
+            if ((Get-ExtensionHandlerName $association.Extension) -ne $status.ProgId) {
+                throw "Verification failed: $($association.Extension) still opens with something else."
+            }
+            Write-Log 'INFO' "$($association.Extension) now opens with $($status.Target)."
+        }
+    } else {
+        foreach ($association in $associations) {
+            $progId = Get-AssociationProgId $association
+            if ((Get-ExtensionHandlerName $association.Extension) -eq $progId) {
+                $previous = Get-AssociationBackup $association.Extension
+                if ($previous) {
+                    Set-ItemProperty -Path "HKCU:\Software\Classes\$($association.Extension)" -Name '(default)' -Value $previous -ErrorAction Stop
+                } else {
+                    Remove-ExtensionHandlerName $association.Extension
+                }
+                if ((Get-ExtensionHandlerName $association.Extension) -eq $progId) {
+                    throw "Verification failed: $($association.Extension) still points at Dingo's handler."
+                }
+            }
+            Remove-AssociationBackup $association.Extension
+            Remove-AssociationOpenWithEntry $association
+            Remove-EmptyExtensionKey $association.Extension
+            Remove-Item -LiteralPath "HKCU:\Software\Classes\$progId" -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Send-AssociationChange
+}
+
 function Get-PackageKindState($Setting) {
     $tool = @($Setting.Entries)[0]
     $found = Find-InstalledTool $tool
@@ -1283,6 +1545,16 @@ function Get-Settings {
     [void]$settings.Add((New-Setting 'tools-on-path' 'Tools' 'Run tools from anywhere' `
         "Puts one small launcher for each installed command-line tool into $script:ShimDirectory, then adds that single folder to the computer PATH. You can then type EvtxECmd from any folder. The folder is added at the end of the PATH, so a tool can never shadow a Windows command." `
         'On the PATH' 'Not on the PATH' 'ToolPath' @() $false $false @{} 'Tool shortcuts'))
+    # File types come last. They point at a program, so the program has to be
+    # installed first, and the worker applies the plan in this order.
+    foreach ($tool in (Get-ToolCatalog)) {
+        if (-not @($tool.Associations).Count) { continue }
+        $extensions = @($tool.Associations | ForEach-Object { $_.Extension })
+        $settingId = 'assoc-' + ($tool.Id -replace '^tool-', '')
+        [void]$settings.Add((New-Setting $settingId $tool.Category "$($tool.Name) file types" `
+            ("Open $($extensions -join ', ') with $($tool.Name). This is a choice for your account only, so no administrator approval is needed. Windows refuses to hand over a file type another app already owns; Dingo says which ones on the card and adds an Open with entry for those instead.") `
+            'Opens with this tool' 'Whatever Windows uses' 'Association' @($tool.Associations) $false $false @{} 'File associations'))
+    }
     return ,$settings
 }
 
@@ -1995,6 +2267,8 @@ function Initialize-SettingHandlers {
     } 'Get-PackageKindState' 'Set-PackageKindPart'
     Register-SettingHandler 'ToolPath' { param($entries) @('Machine') } 'Get-ToolPathKindState' 'Set-ToolPathKindPart'
     Register-SettingHandler 'Shortcut' { param($entries) @('Machine') } 'Get-ShortcutKindState' 'Set-ShortcutKindPart'
+    # File types are a per-account choice, so this handler never needs elevation.
+    Register-SettingHandler 'Association' { param($entries) @('User') } 'Get-AssociationKindState' 'Set-AssociationKindPart'
     Register-SettingHandler 'Terminal' { param($entries) @('User') } 'Get-TerminalKindState' 'Set-TerminalKindPart'
     Register-SettingHandler 'WidgetsPackage' { param($entries) @('User') } 'Get-WidgetsKindState' 'Set-WidgetsKindPart' @{ User=@('Get-AppxPackage','Remove-AppxPackage') }
 }
@@ -2115,7 +2389,7 @@ if ($FinalizeInternationalSettings) {
 
 if ($SelfTest) {
     # Tools.json may add tools, so the total is the fixed settings plus the catalog.
-    $expectedSettingCount = 30 + @(Get-ToolCatalog).Count
+    $expectedSettingCount = 30 + @(Get-ToolCatalog).Count + @(Get-ToolCatalog | Where-Object { @($_.Associations).Count }).Count
     if ($script:Settings.Count -ne $expectedSettingCount) { throw "Expected $expectedSettingCount settings, found $($script:Settings.Count)." }
     foreach ($workerHelper in @('Test-DisplayLanguagePackInstalled','Install-DisplayLanguagePack','Write-Utf8FileAtomically','New-ApplyResult','New-OperationComponent')) {
         if (-not (Get-Command $workerHelper -CommandType Function -ErrorAction SilentlyContinue)) { throw "Elevated-worker helper is unavailable: $workerHelper" }
@@ -2132,7 +2406,7 @@ if ($SelfTest) {
     if ($launcherAst.Extent.Text -notmatch '-ElevationBroker' -or $launcherAst.Extent.Text -match '-Verb\s+RunAs') { throw 'The WPF launcher must delegate UAC to the non-WPF elevation broker.' }
     $duplicates = $script:Settings | Group-Object Id | Where-Object Count -gt 1
     if ($duplicates) { throw "Duplicate IDs: $($duplicates.Name -join ', ')" }
-    if ($script:SettingHandlers.Count -ne 9) { throw "Expected 9 setting handlers, found $($script:SettingHandlers.Count)." }
+    if ($script:SettingHandlers.Count -ne 10) { throw "Expected 10 setting handlers, found $($script:SettingHandlers.Count)." }
     foreach ($setting in $script:Settings) { [void](Get-SettingHandler $setting.Kind) }
     foreach ($dispatcherName in @('Get-SettingState','Set-SettingPart')) {
         $dispatcherAst = $selfTestAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $dispatcherName },$true)
@@ -2414,8 +2688,9 @@ if ($SelfTest) {
     if ($pathSetting.Tab -ne 'Tool shortcuts' -or -not $pathSetting.RequiresAdmin -or -not $pathSetting.CanChoose) {
         throw 'Command-line access must be a reversible Tool shortcuts card that requests administrator approval.'
     }
-    if ($script:Settings[-1].Id -ne 'tools-on-path') {
-        throw 'Command-line access must be applied last, after the tools its launchers point at.'
+    $settingOrder = @($script:Settings | ForEach-Object { $_.Id })
+    if ([array]::IndexOf($settingOrder, 'tools-on-path') -lt [array]::IndexOf($settingOrder, @($toolSettings)[-1].Id)) {
+        throw 'Command-line access must be applied after the tools its launchers point at.'
     }
     $samplePath = 'C:\Windows\system32;%USERPROFILE%\go\bin;C:\Program Files\Git\cmd'
     if (@(Split-PathValue "$samplePath;;  ;").Count -ne 3) { throw 'Empty PATH entries must be dropped.' }
@@ -2531,6 +2806,55 @@ if ($SelfTest) {
         if (-not (Test-Path -LiteralPath $foreignShortcut)) { throw 'The hand-made shortcut disappeared.' }
     } finally {
         Remove-Item -LiteralPath $shortcutTestDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    # File types: the cards exist, need no elevation, run after the tools they
+    # point at, and never claim a type Windows will not hand over.
+    $associationSettings = @($script:Settings | Where-Object Kind -eq 'Association')
+    if ($associationSettings.Count -lt 3) { throw "Expected at least three file type cards, found $($associationSettings.Count)." }
+    foreach ($associationSetting in $associationSettings) {
+        if ($associationSetting.Tab -ne 'File associations') { throw "'$($associationSetting.Id)' must sit on the File associations tab." }
+        if ($associationSetting.RequiresAdmin) { throw "'$($associationSetting.Id)' is a per-account choice and must not ask for administrator approval." }
+        if (-not $associationSetting.CanChoose) { throw "'$($associationSetting.Id)' must be reversible." }
+        $associationIndex = [array]::IndexOf($settingOrder, $associationSetting.Id)
+        if ($associationIndex -lt [array]::IndexOf($settingOrder, @($toolSettings)[-1].Id)) {
+            throw "'$($associationSetting.Id)' must be applied after the tools it points at."
+        }
+    }
+    $notepadAssociations = @(($builtInTools | Where-Object Id -eq 'tool-notepadplusplus' | Select-Object -First 1).Associations | ForEach-Object { $_.Extension })
+    foreach ($ownedExtension in @('.txt', '.log')) {
+        if ($notepadAssociations -contains $ownedExtension) {
+            throw "$ownedExtension is owned by the Windows Notepad app through a protected user choice; Dingo must not offer to take it."
+        }
+    }
+    if (-not $notepadAssociations.Count -or $notepadAssociations -notcontains '.json') { throw 'Notepad++ should offer to open .json.' }
+    $badExtensionRejected = $false
+    try {
+        [void](ConvertTo-ToolDefinition ([PSCustomObject]@{
+            id='tool-badassoc'; name='Bad'; install=[PSCustomObject]@{ kind='winget'; package='a.b' }
+            detect=@([PSCustomObject]@{ kind='command'; command='a.exe' })
+            associations=@([PSCustomObject]@{ extension='not-an-extension'; target='C:/Windows/notepad.exe' })
+        }))
+    } catch { $badExtensionRejected = $true }
+    if (-not $badExtensionRejected) { throw 'A file association without a leading dot must be refused.' }
+    $sampleAssociation = [PSCustomObject]@{ Scope='User'; Extension='.dingotest'; Target='C:\Windows\System32\notepad.exe'; Description='Test' }
+    if ((Get-AssociationProgId $sampleAssociation) -ne 'Dingo.notepad') { throw "Handler names must start with $script:AssociationProgIdPrefix and carry the program name." }
+    if ((Join-WordList @('.a')) -ne '.a' -or (Join-WordList @('.a','.b')) -ne '.a and .b' -or (Join-WordList @('.a','.b','.c')) -ne '.a, .b and .c') {
+        throw 'The extension list is not being written as readable English.'
+    }
+    # A key holding only an unnamed default value must never be treated as
+    # empty. Getting this wrong deleted the handler Dingo had just put back.
+    $emptyKeyTest = 'HKCU:\Software\Classes\.dingoselftest'
+    try {
+        New-Item -Path $emptyKeyTest -Force | Out-Null
+        Set-ItemProperty -Path $emptyKeyTest -Name '(default)' -Value 'Somebody.Else'
+        Remove-EmptyExtensionKey '.dingoselftest'
+        if (-not (Test-Path -LiteralPath $emptyKeyTest)) { throw 'A file type still holding a handler name was deleted.' }
+        Remove-ExtensionHandlerName '.dingoselftest'
+        if ((Get-ExtensionHandlerName '.dingoselftest')) { throw 'The handler name was not removed.' }
+        Remove-EmptyExtensionKey '.dingoselftest'
+        if (Test-Path -LiteralPath $emptyKeyTest) { throw 'An empty file type key was left behind.' }
+    } finally {
+        Remove-Item -LiteralPath $emptyKeyTest -Recurse -Force -ErrorAction SilentlyContinue
     }
     $toggleCount = @($script:Settings | Where-Object CanChoose).Count
     if ($toggleCount -lt 20) { throw "Expected at least 20 reversible settings, found $toggleCount." }
@@ -2768,6 +3092,17 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
           </ScrollViewer>
         </Grid>
       </TabItem>
+      <TabItem Header="File associations">
+        <Grid>
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <Border Background="#E8F6EE" Padding="12" Margin="8">
+            <TextBlock Name="AssociationScopeText" Text="Which program opens which file type. These are your account's choices, so no administrator approval is needed." TextWrapping="Wrap"/>
+          </Border>
+          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel Name="AssociationSettingsPanel" Margin="8,0,8,8"/>
+          </ScrollViewer>
+        </Grid>
+      </TabItem>
     </TabControl>
     <ProgressBar Name="ProgressBar" Grid.Row="3" Height="8" Margin="0,10,0,8" Minimum="0" Maximum="100"/>
     <DockPanel Grid.Row="4">
@@ -2784,7 +3119,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
-foreach ($name in @('ScopeTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','ProgressBar','SummaryText','AdminSummaryText','OpenLogButton','ApplyButton')) {
+foreach ($name in @('ScopeTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','ProgressBar','SummaryText','AdminSummaryText','OpenLogButton','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
 $desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -2963,6 +3298,7 @@ foreach ($item in $script:Settings) {
         'Both' { [void]$BothSettingsPanel.Children.Add($card) }
         'Install tools' { [void]$ToolSettingsPanel.Children.Add($card) }
         'Tool shortcuts' { [void]$ShortcutSettingsPanel.Children.Add($card) }
+        'File associations' { [void]$AssociationSettingsPanel.Children.Add($card) }
         default { throw "Setting '$($item.Id)' asks for unknown tab '$($item.Tab)'." }
     }
 }

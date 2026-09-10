@@ -16,6 +16,11 @@
       // A target that is not on disk is skipped, not treated as a failure.
       "shortcuts": [
         { "name": "HxD", "target": "%ProgramFiles%/HxD/HxD.exe" }
+      ],
+      // Optional. Windows only hands over a file type nothing has claimed yet.
+      // A type another app already owns is reported on the card, not failed.
+      "associations": [
+        { "extension": ".bin", "target": "%ProgramFiles%/HxD/HxD.exe", "description": "Binary file" }
       ]
     },
     {

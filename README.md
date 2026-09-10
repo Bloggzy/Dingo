@@ -7,7 +7,7 @@ A self-contained, state-aware PowerShell/WPF utility for applying a repeatable s
 1. Copy the entire Dingo folder to the VM.
 2. Double-click Start-Dingo.cmd.
    Do not use **Run as administrator**. Dingo keeps its main window in your signed-in account and asks for administrator credentials later, only when needed.
-3. Choose the **My account**, **Whole computer**, **My account + whole computer**, **Install tools**, or **Tool shortcuts** tab.
+3. Choose the **My account**, **Whole computer**, **My account + whole computer**, **Install tools**, **Tool shortcuts**, or **File associations** tab.
 4. Each card explains the normal Windows choice, the current choice, and the available choices in plain language.
 5. Tick the cards to change, or use **Choose all my preferred settings**.
 6. Choose **Apply checked changes**. Windows requests administrator approval when the selection includes a whole-computer setting or a protected account policy marked **Admin approval required**.
@@ -18,7 +18,7 @@ A console window appears for about a second while PowerShell starts, then hides 
 
 ## Quick apply without the GUI
 
-Use the same launcher with `-ApplyPreferred` to apply all 36 preferred settings without opening the selection window:
+Use the same launcher with `-ApplyPreferred` to apply all 39 preferred settings without opening the selection window:
 
 ```bat
 Start-Dingo.cmd -ApplyPreferred
@@ -62,14 +62,14 @@ Start-Dingo.cmd -Help
 - Current-state reads distinguish preferred, alternate, partial, unavailable, and error states. A read error is never treated as a missing setting, and **Check only settings that need changing** leaves unreadable settings unchecked.
 - Application results track the user, protected-user, computer-wide, and final-verification components separately, so a mixed setting can be reported as partially applied instead of as an undifferentiated failure.
 - The GUI stays in the signed-in desktop account, so per-user settings affect the correct Windows profile even when separate administrator credentials are needed. Protected per-user policy values are written by the elevated helper directly to that desktop user's SID, not to the administrator's profile.
-- Twenty-five settings offer plainly labelled reversible choices. The five one-way targets are UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal. The six tool cards are also one way: Dingo installs a tool but never removes it. Each can be left alone by unticking its card.
+- Twenty-eight settings offer plainly labelled reversible choices. The five one-way targets are UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal. The six tool cards are also one way: Dingo installs a tool but never removes it. Each can be left alone by unticking its card.
 - **Read settings again** rereads every configured value without making changes.
 - Preflight is all-or-nothing: an unsupported plan is stopped before any changes. Once application begins, an individual setting failure does not stop later selected settings from running.
 - Logs are written to the `Logs` folder beside the script, so a copy deployed to `C:\DFIR\Tools\Dingo` logs to `C:\DFIR\Tools\Dingo\Logs`. The GUI can open that folder. Dingo keeps the 20 most recent logs and deletes older ones on the next launch.
 - Dingo permits only one normal GUI or quick-apply run per Windows account, preventing concurrent settings and result-file races. Read-only help, version, catalog, and internal self-test commands do not take the instance lock.
 - GUI and quick-apply modes use the same setting executor, administrator broker, verification, structured results, and logs.
 - Before applying a plan, Dingo checks every selected setting's handler, required Windows commands, readable current state, and declared edition/build requirements. If any preflight check fails, the plan is stopped before changes or administrator approval begin.
-- Setting types are registered in an internal handler catalog that owns their scope, state reader, apply function, and prerequisites. This keeps the single-file distribution while providing an extension point for future handlers, such as file associations. Tool installs use a `Package` handler on this same registry, and shortcuts use a `Shortcut` handler.
+- Setting types are registered in an internal handler catalog that owns their scope, state reader, apply function, and prerequisites. This keeps the single-file distribution while providing an extension point for new kinds of setting. Tool installs use a `Package` handler on this same registry, shortcuts use a `Shortcut` handler, and file types use an `Association` handler.
 - The window stays open while an administrator operation is active so Dingo can collect its results, verify changes, and remove temporary protocol files. Abandoned protocol files older than 24 hours are removed on a later launch.
 - The tool is idempotent: rerunning it writes and verifies the same desired values.
 - OneDrive is disabled with policy. It is not uninstalled, and user files are not deleted.
@@ -109,11 +109,11 @@ Start-Dingo.cmd -Help
 - Eric Zimmerman's tools land in `C:\DFIR\Tools\EZTools\net9`, in a mixed layout: some tools are a loose `.exe`, others get their own folder. Tick **Run tools from anywhere** to reach them from any folder.
 - Dingo reads the computer PATH without expanding it and writes it back as an expandable value. Real machines hold entries such as `%USERPROFILE%\go\bin`, and reading PATH the easy way expands those, which would permanently bake one account's folders into the computer PATH. The self-test proves this on a stand-in value before anything is written.
 - A PATH change reaches new windows only. Restart any open terminal, and sign out and back in for programs started from Explorer.
-- Tool file associations are not built yet. Start menu and Desktop shortcuts are, on the **Tool shortcuts** tab.
+- File associations can only be set for a file type nothing has claimed yet. Windows protects a type that already carries a user choice, and no supported method can take one on a computer that is not joined to a domain. Dingo says which types it cannot take, on the card, and adds an Open with entry for those instead.
 
 ## Settings included
 
-Thirty-six settings. Six install tools. Two make shortcuts, and one puts the tools on the PATH. The ID in the first column is the stable name used by `-Include` and `-Exclude`. **Scope** is whose settings change, and **Admin** is whether Windows asks for administrator approval. Run `Start-Dingo.cmd -ListSettings` for the same list from the tool itself.
+Thirty-nine settings. Six install tools. Two make shortcuts, one puts the tools on the PATH, and three set file types. The ID in the first column is the stable name used by `-Include` and `-Exclude`. **Scope** is whose settings change, and **Admin** is whether Windows asks for administrator approval. Run `Start-Dingo.cmd -ListSettings` for the same list from the tool itself.
 
 ### Region and language
 
@@ -176,7 +176,7 @@ Thirty-six settings. Six install tools. Two make shortcuts, and one puts the too
 
 Tool cards live on the **Install tools** tab. Dingo checks whether each tool is already installed, and installs the missing ones with winget. Dingo never uninstalls a tool, so these cards are one-way and have no second option.
 
-The **Tool shortcuts** tab holds the three cards that make an installed tool easy to reach: Start menu shortcuts, Desktop shortcuts, and command-line access.
+The **Tool shortcuts** tab holds the three cards that make an installed tool easy to reach: Start menu shortcuts, Desktop shortcuts, and command-line access. The **File associations** tab decides which program opens which file type.
 
 A reported version comes from the tool itself. A .NET build stamps its git commit onto that version, so Timeline Explorer reports `2026.5.0+74bece05a5...`. Dingo shows only the part before the plus.
 
@@ -228,6 +228,28 @@ A shortcut whose program is not on disk is skipped, not reported as a failure. I
 
 Both cards are reversible. Turning one off removes only shortcuts that carry Dingo's marker in the shortcut comment, so a shortcut you made by hand, or one an installer made, is left alone. Turning off the Start menu card also removes the `DFIR Tools` folder, but only when it is empty. The shared Desktop folder belongs to Windows and is never removed.
 
+### File associations
+
+The **File associations** tab decides which program opens which file type. These are your account's choices, written under `HKCU`, so no administrator approval is needed.
+
+| ID | Card | Types it offers |
+| --- | --- | --- |
+| `assoc-notepadplusplus` | Notepad++ file types | `.json` `.md` `.yml` `.yaml` `.ini` `.conf` |
+| `assoc-eztools` | Eric Zimmerman's tools file types | `.csv` `.tsv` |
+| `assoc-sqlitebrowser` | DB Browser for SQLite file types | `.db` `.sqlite` `.sqlite3` |
+
+These cards run after the tool cards, so installing a tool and setting its file types happens in one run. A type whose program is not installed is left alone, and the card says so.
+
+**What Windows allows, and what it does not.** A file type that nothing has claimed can be set freely. A file type that already carries a `UserChoice` cannot be taken by anything: the key is locked and Windows validates an undocumented hash in it. The one documented way around that, the *Set a default associations configuration file* policy, works only on a domain-joined computer, and was measured doing nothing on a Windows 11 Pro workgroup VM across two restarts. Dingo therefore does not try.
+
+So `.txt` and `.log` are deliberately absent from the Notepad++ card. The Windows Notepad app owns them on a fresh install and will not give them up.
+
+For any type it cannot take, Dingo adds the tool to the **Open with** list instead, and the card names the types it could not take and why. A blocked type is never reported as a failure.
+
+**How it works.** Dingo registers its own handler name for each program, such as `Dingo.notepad++`, holding the program path and its icon. The extension is then pointed at that name. Because every name Dingo creates starts with `Dingo.`, ownership is never in doubt.
+
+**Turning a card off** puts back whatever the file type pointed at before, which Dingo saved under `HKCU\Software\Dingo\FileAssociations` when it made the change. If the type had no handler at all, the key Dingo created is removed. A file type pointing at somebody else's handler is never touched.
+
 Detection does not depend on winget. Dingo reads the Windows uninstall list under both HKLM and HKCU, checks the usual install folders, and looks on the PATH. A tool installed by hand, or by Chocolatey, is still found.
 
 ## Adding your own tools
@@ -272,6 +294,10 @@ Put a `Tools.json` file next to `Dingo.ps1`. A new `id` adds a tool. An `id` tha
 | `shortcuts[].name` | yes, inside the list | The shortcut name. It becomes a file name, so `\`, `/`, and `:` are refused |
 | `shortcuts[].target` | yes, inside the list | The program the shortcut opens. Skipped quietly when it is not on disk. Write it with forward slashes |
 | `shortcuts[].arguments` | no | Extra arguments passed to the program |
+| `associations` | no | List of file types this tool should open |
+| `associations[].extension` | yes, inside the list | Must start with a dot, for example `.json` |
+| `associations[].target` | yes, inside the list | The program that opens it. Write it with forward slashes |
+| `associations[].description` | no | The file type name Explorer shows, for example `JSON file` |
 
 Detect rule kinds:
 
