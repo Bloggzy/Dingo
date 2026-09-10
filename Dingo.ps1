@@ -824,9 +824,15 @@ function Set-ToolPathKindPart($Setting, [string]$DesiredState, [string]$Scope) {
             }
         }
         [void](Add-FolderToMachinePath $script:ShimDirectory)
+        if (-not (Test-PathContainsFolder (Get-MachinePathValue) $script:ShimDirectory)) {
+            throw "Verification failed: '$script:ShimDirectory' is not on the computer PATH."
+        }
         Write-Log 'INFO' "Wrote $($expected.Count) launcher(s) into $script:ShimDirectory."
     } else {
         [void](Remove-FolderFromMachinePath $script:ShimDirectory)
+        if (Test-PathContainsFolder (Get-MachinePathValue) $script:ShimDirectory) {
+            throw "Verification failed: '$script:ShimDirectory' is still on the computer PATH."
+        }
         foreach ($file in (Get-DingoShimFiles)) { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue }
         # Leave the folder if anything Dingo did not write is still in it.
         if ((Test-Path -LiteralPath $script:ShimDirectory -PathType Container) -and
@@ -1902,6 +1908,16 @@ if ($SelfTest) {
     $guiApplyAst = $selfTestAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Complete-ApplyChanges' },$true)
     $sharedApplyCall = if ($guiApplyAst) { $guiApplyAst.Find({ param($node) $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Invoke-SettingChange' },$true) } else { $null }
     if (-not $sharedApplyCall) { throw 'The GUI is not using the shared setting-application core.' }
+    # Every self-test must stay runnable where all processes are elevated, such as
+    # Windows Sandbox. Only the real GUI is refused there.
+    # Match on the condition, not the body. Searching the body would find this
+    # self-test block itself, because the message text appears here too.
+    $guardCondition = @($selfTestAst.FindAll({ param($node) $node -is [Management.Automation.Language.IfStatementAst] },$true) |
+        ForEach-Object { $_.Clauses[0].Item1.Extent.Text } |
+        Where-Object { $_ -match 'Test-IsAdministrator' -and $_ -match 'UiSelfTest' })
+    if ($guardCondition.Count -ne 1 -or $guardCondition[0] -notmatch '-not\s+\$UiSelfTest') {
+        throw 'The elevated-start guard must let the UI self-test through.'
+    }
     $launcherPath = Join-Path $PSScriptRoot 'Start-Dingo.cmd'
     if (-not (Test-Path -LiteralPath $launcherPath) -or (Get-Content -LiteralPath $launcherPath -Raw) -notmatch '%\*') { throw 'Start-Dingo.cmd does not forward command-line arguments.' }
     $updateSetting = $script:Settings | Where-Object Id -eq 'windows-update-continuity'
@@ -2283,7 +2299,10 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
     exit $exitCode
 }
 
-if (Test-IsAdministrator) {
+# The UI self-test builds the window, checks it, and closes it without changing
+# anything, so it must stay runnable where every process is elevated, such as
+# Windows Sandbox. The other self-tests already run before this guard.
+if ((Test-IsAdministrator) -and -not $UiSelfTest) {
     Add-Type -AssemblyName PresentationFramework
     $message = @(
         'Dingo was started as an administrator. Close this window and start it normally.',
