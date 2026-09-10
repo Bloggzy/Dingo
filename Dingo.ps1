@@ -41,7 +41,7 @@ $script:LanguageChangePending = $false
 $script:InstanceMutex = $null
 $script:PendingApply = $null
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.5.6'
+$script:DingoVersion = '0.5.7'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -50,6 +50,13 @@ $script:ShimDirectory = 'C:\DFIR\Tools\bin'
 # by hand in the same folder is left alone.
 $script:ShimMarker = 'REM Written by Dingo. Safe to delete.'
 $script:MachineEnvironmentSubKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+# Shortcuts go in the all-users locations, so they appear for every account on
+# the VM and the elevated worker can write them in one place.
+$script:StartMenuShortcutDirectory = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\DFIR Tools'
+$script:DesktopShortcutDirectory = Join-Path $env:PUBLIC 'Desktop'
+# Written into the shortcut comment. Only shortcuts carrying this are ever
+# deleted, so one placed by hand or by an installer is left alone.
+$script:ShortcutMarker = 'Created by Dingo. Safe to delete.'
 $automaticArguments = @(Get-Variable -Name args -ValueOnly -ErrorAction SilentlyContinue)
 $script:UnexpectedArguments = @(@($UnexpectedArguments) + $automaticArguments | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
 
@@ -438,6 +445,25 @@ function ConvertTo-ToolDefinition($Raw) {
         }
     }
 
+    # A tool may ask for Start menu and Desktop shortcuts. Some installers make
+    # none, so the program is on disk but nobody can find it.
+    $shortcuts = New-Object System.Collections.ArrayList
+    foreach ($rawShortcut in @(Get-JsonField $Raw 'shortcuts' @())) {
+        $shortcutName = [string](Get-JsonField $rawShortcut 'name' '')
+        $shortcutTarget = [string](Get-JsonField $rawShortcut 'target' '')
+        if ([string]::IsNullOrWhiteSpace($shortcutName)) { throw "Tool '$id' has a shortcut with no name." }
+        if ([string]::IsNullOrWhiteSpace($shortcutTarget)) { throw "Tool '$id' has a shortcut '$shortcutName' with no target." }
+        # The name becomes a file name, so refuse anything that could escape the folder.
+        if ($shortcutName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+            throw "Tool '$id' has a shortcut named '$shortcutName', which is not a usable file name."
+        }
+        [void]$shortcuts.Add([PSCustomObject]@{
+            Name = $shortcutName
+            Target = $shortcutTarget
+            Arguments = [string](Get-JsonField $rawShortcut 'arguments' '')
+        })
+    }
+
     [PSCustomObject]@{
         Id = $id
         Name = $name
@@ -451,6 +477,7 @@ function ConvertTo-ToolDefinition($Raw) {
         Dest = $dest
         Arguments = @(Get-JsonField $install 'arguments' @())
         Shims = $shims
+        Shortcuts = @($shortcuts)
         Requires = @(Get-JsonField $Raw 'requires' @())
         TimeoutSeconds = ($timeoutMinutes * 60)
         Detect = @($rules)
@@ -507,6 +534,17 @@ function Get-BuiltInToolCatalog {
                 timeoutMinutes=45
             }
             shims=[PSCustomObject]@{ from='C:/DFIR/Tools/EZTools/net9'; pattern='*.exe'; recurse=$true }
+            # Get-ZimmermanTools makes no shortcuts at all, so the window tools are
+            # invisible in the Start menu. A target that is not on disk is skipped.
+            shortcuts=@(
+                [PSCustomObject]@{ name='Timeline Explorer'; target='C:/DFIR/Tools/EZTools/net9/TimelineExplorer/TimelineExplorer.exe' },
+                [PSCustomObject]@{ name='Registry Explorer'; target='C:/DFIR/Tools/EZTools/net9/RegistryExplorer/RegistryExplorer.exe' },
+                [PSCustomObject]@{ name='MFT Explorer'; target='C:/DFIR/Tools/EZTools/net9/MFTExplorer/MFTExplorer.exe' },
+                [PSCustomObject]@{ name='ShellBags Explorer'; target='C:/DFIR/Tools/EZTools/net9/ShellBagsExplorer/ShellBagsExplorer.exe' },
+                [PSCustomObject]@{ name='Jump List Explorer'; target='C:/DFIR/Tools/EZTools/net9/JumpListExplorer/JumpListExplorer.exe' },
+                [PSCustomObject]@{ name='SDB Explorer'; target='C:/DFIR/Tools/EZTools/net9/SDBExplorer/SDBExplorer.exe' },
+                [PSCustomObject]@{ name='EZViewer'; target='C:/DFIR/Tools/EZTools/net9/EZViewer/EZViewer.exe' }
+            )
             requires=@('tool-dotnet-desktop-9')
             # Detect on the two GUI tools, not on a command-line one. A partial
             # copy of the command-line tools is common, and it would otherwise
@@ -882,6 +920,131 @@ function Set-ToolPathKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     Send-EnvironmentChange
 }
 
+function Get-ExpectedShortcuts {
+    $wanted = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach ($tool in (Get-ToolCatalog)) {
+        foreach ($shortcut in @($tool.Shortcuts)) {
+            $target = [Environment]::ExpandEnvironmentVariables($shortcut.Target)
+            # The tool may not be installed, or this program may not be part of it.
+            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { continue }
+            if ($wanted.Contains($shortcut.Name)) {
+                Write-Log 'WARN' "Two tools both ask for a '$($shortcut.Name)' shortcut; keeping $($wanted[$shortcut.Name].Target)."
+                continue
+            }
+            $wanted[$shortcut.Name] = [PSCustomObject]@{
+                # Normalise here, because a shortcut always reports its target
+                # with backslashes and the two must compare equal.
+                Target = (Get-Item -LiteralPath $target).FullName
+                Arguments = [string]$shortcut.Arguments
+            }
+        }
+    }
+    return $wanted
+}
+
+function Read-ShortcutFile([string]$Path) {
+    $shell = New-Object -ComObject WScript.Shell
+    try {
+        $link = $shell.CreateShortcut($Path)
+        return [PSCustomObject]@{
+            Target = [string]$link.TargetPath
+            Arguments = [string]$link.Arguments
+            Description = [string]$link.Description
+        }
+    } finally {
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+    }
+}
+
+function Get-DingoShortcutFiles([string]$Folder) {
+    if (-not (Test-Path -LiteralPath $Folder -PathType Container)) { return @() }
+    return @(Get-ChildItem -LiteralPath $Folder -Filter '*.lnk' -File -ErrorAction SilentlyContinue | Where-Object {
+        try { (Read-ShortcutFile $_.FullName).Description -eq $script:ShortcutMarker } catch { $false }
+    })
+}
+
+function Test-ShortcutIsCurrent([string]$Path, $Spec) {
+    try { $link = Read-ShortcutFile $Path } catch { return $false }
+    if ($link.Description -ne $script:ShortcutMarker) { return $false }
+    if ($link.Target -ne $Spec.Target) { return $false }
+    return ($link.Arguments -eq $Spec.Arguments)
+}
+
+function Write-ToolShortcut([string]$Folder, [string]$Name, $Spec) {
+    $shortcutPath = Join-Path $Folder ($Name + '.lnk')
+    $shell = New-Object -ComObject WScript.Shell
+    try {
+        $link = $shell.CreateShortcut($shortcutPath)
+        $link.TargetPath = $Spec.Target
+        $link.Arguments = $Spec.Arguments
+        # Several of these tools look for their own files beside themselves.
+        $link.WorkingDirectory = [IO.Path]::GetDirectoryName($Spec.Target)
+        $link.Description = $script:ShortcutMarker
+        $link.Save()
+    } finally {
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+    }
+    if (-not (Test-ShortcutIsCurrent $shortcutPath $Spec)) { throw "Verification failed for the '$Name' shortcut." }
+}
+
+function Get-ShortcutSettingFolder($Setting) {
+    $entry = @($Setting.Entries)[0]
+    if (-not $entry) { throw "Setting '$($Setting.Id)' has no shortcut folder." }
+    return [Environment]::ExpandEnvironmentVariables([string]$entry.Folder)
+}
+
+function Get-ShortcutKindState($Setting) {
+    $folder = Get-ShortcutSettingFolder $Setting
+    $expected = Get-ExpectedShortcuts
+    $total = $expected.Count
+    $current = 0
+    foreach ($name in @($expected.Keys)) {
+        $shortcutPath = Join-Path $folder ($name + '.lnk')
+        if ((Test-Path -LiteralPath $shortcutPath -PathType Leaf) -and (Test-ShortcutIsCurrent $shortcutPath $expected[$name])) { $current++ }
+    }
+    $owned = @(Get-DingoShortcutFiles $folder).Count
+    if ($total -gt 0 -and $current -eq $total -and $owned -eq $total) {
+        return (New-StateResult 'Preferred' $Setting.PreferredState "$total shortcut(s) in $folder.")
+    }
+    if ($current -eq 0 -and $owned -eq 0) {
+        $detail = if ($total) { "None of the $total available shortcuts are in $folder." }
+                  else { 'No installed tool asks for a shortcut yet.' }
+        return (New-StateResult 'Alternate' $Setting.AlternateState $detail)
+    }
+    return (New-StateResult 'Partial' 'Partly set up' "$current of $total shortcuts are present and current in $folder.")
+}
+
+function Set-ShortcutKindPart($Setting, [string]$DesiredState, [string]$Scope) {
+    $folder = Get-ShortcutSettingFolder $Setting
+    $expected = Get-ExpectedShortcuts
+    if ($DesiredState -eq $Setting.PreferredState) {
+        if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
+            New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop | Out-Null
+            Write-Log 'INFO' "Created $folder."
+        }
+        foreach ($name in @($expected.Keys)) { Write-ToolShortcut $folder $name $expected[$name] }
+        # Drop shortcuts Dingo wrote for programs that are no longer installed.
+        foreach ($file in (Get-DingoShortcutFiles $folder)) {
+            $name = [IO.Path]::GetFileNameWithoutExtension($file.Name)
+            if (-not $expected.Contains($name)) {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+                Write-Log 'INFO' "Removed the stale shortcut '$($file.Name)'."
+            }
+        }
+        Write-Log 'INFO' "Wrote $($expected.Count) shortcut(s) into $folder."
+    } else {
+        foreach ($file in (Get-DingoShortcutFiles $folder)) { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue }
+        if (@(Get-DingoShortcutFiles $folder).Count) { throw "Verification failed: Dingo shortcuts are still in $folder." }
+        # Only ever remove the folder Dingo made, and only when it is empty. The
+        # shared Desktop folder belongs to Windows and is never touched.
+        if ($folder -eq $script:StartMenuShortcutDirectory -and
+            (Test-Path -LiteralPath $folder -PathType Container) -and
+            -not @(Get-ChildItem -LiteralPath $folder -Force -ErrorAction SilentlyContinue).Count) {
+            Remove-Item -LiteralPath $folder -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Get-PackageKindState($Setting) {
     $tool = @($Setting.Entries)[0]
     $found = Find-InstalledTool $tool
@@ -1061,6 +1224,14 @@ function Get-Settings {
         [void]$settings.Add((New-Setting $tool.Id $tool.Category $tool.Name $tool.Description 'Installed' $null 'Package' @($tool) $false $false `
             @{ WingetRequired = ($tool.InstallKind -eq 'winget'); RequiredTools = @($tool.Requires) } 'Tools' 'Not installed'))
     }
+    # Shortcuts come after the tool cards, because a shortcut is only written for
+    # a program that is already on disk.
+    [void]$settings.Add((New-Setting 'tools-start-menu' 'Tools' 'Start menu shortcuts' `
+        "Puts a shortcut for each installed window tool into a DFIR Tools folder in the Start menu, for every account on this computer. Some installers make no shortcut at all, so the program is on disk but nobody can find it. Turning this off removes only the shortcuts Dingo made." `
+        'Created' 'Not created' 'Shortcut' @([PSCustomObject]@{ Scope='Machine'; Folder=$script:StartMenuShortcutDirectory }) $false $false @{} 'Tools'))
+    [void]$settings.Add((New-Setting 'tools-desktop' 'Tools' 'Desktop shortcuts' `
+        "Puts the same shortcuts on the shared Desktop, for every account on this computer. Turning this off removes only the shortcuts Dingo made." `
+        'Created' 'Not created' 'Shortcut' @([PSCustomObject]@{ Scope='Machine'; Folder=$script:DesktopShortcutDirectory }) $false $false @{} 'Tools'))
     # Added last on purpose. The elevated worker runs the plan in this order, so
     # the launchers are written after the tools they point at are installed.
     [void]$settings.Add((New-Setting 'tools-on-path' 'Tools' 'Run tools from anywhere' `
@@ -1777,6 +1948,7 @@ function Initialize-SettingHandlers {
         @(if ($tool -and $tool.Scope -eq 'user') { 'User' } else { 'Machine' })
     } 'Get-PackageKindState' 'Set-PackageKindPart'
     Register-SettingHandler 'ToolPath' { param($entries) @('Machine') } 'Get-ToolPathKindState' 'Set-ToolPathKindPart'
+    Register-SettingHandler 'Shortcut' { param($entries) @('Machine') } 'Get-ShortcutKindState' 'Set-ShortcutKindPart'
     Register-SettingHandler 'Terminal' { param($entries) @('User') } 'Get-TerminalKindState' 'Set-TerminalKindPart'
     Register-SettingHandler 'WidgetsPackage' { param($entries) @('User') } 'Get-WidgetsKindState' 'Set-WidgetsKindPart' @{ User=@('Get-AppxPackage','Remove-AppxPackage') }
 }
@@ -1897,7 +2069,7 @@ if ($FinalizeInternationalSettings) {
 
 if ($SelfTest) {
     # Tools.json may add tools, so the total is the fixed settings plus the catalog.
-    $expectedSettingCount = 28 + @(Get-ToolCatalog).Count
+    $expectedSettingCount = 30 + @(Get-ToolCatalog).Count
     if ($script:Settings.Count -ne $expectedSettingCount) { throw "Expected $expectedSettingCount settings, found $($script:Settings.Count)." }
     foreach ($workerHelper in @('Test-DisplayLanguagePackInstalled','Install-DisplayLanguagePack','Write-Utf8FileAtomically','New-ApplyResult','New-OperationComponent')) {
         if (-not (Get-Command $workerHelper -CommandType Function -ErrorAction SilentlyContinue)) { throw "Elevated-worker helper is unavailable: $workerHelper" }
@@ -1914,7 +2086,7 @@ if ($SelfTest) {
     if ($launcherAst.Extent.Text -notmatch '-ElevationBroker' -or $launcherAst.Extent.Text -match '-Verb\s+RunAs') { throw 'The WPF launcher must delegate UAC to the non-WPF elevation broker.' }
     $duplicates = $script:Settings | Group-Object Id | Where-Object Count -gt 1
     if ($duplicates) { throw "Duplicate IDs: $($duplicates.Name -join ', ')" }
-    if ($script:SettingHandlers.Count -ne 8) { throw "Expected 8 setting handlers, found $($script:SettingHandlers.Count)." }
+    if ($script:SettingHandlers.Count -ne 9) { throw "Expected 9 setting handlers, found $($script:SettingHandlers.Count)." }
     foreach ($setting in $script:Settings) { [void](Get-SettingHandler $setting.Kind) }
     foreach ($dispatcherName in @('Get-SettingState','Set-SettingPart')) {
         $dispatcherAst = $selfTestAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $dispatcherName },$true)
@@ -2238,6 +2410,61 @@ if ($SelfTest) {
     } finally {
         $script:ShimDirectory = $savedShimDirectory
         Remove-Item -LiteralPath $shimTestDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    # Shortcuts: written correctly, recognised again, and never deleting one that
+    # an installer or a person put in the same folder.
+    foreach ($shortcutId in @('tools-start-menu','tools-desktop')) {
+        $shortcutSetting = $script:Settings | Where-Object Id -eq $shortcutId | Select-Object -First 1
+        if (-not $shortcutSetting) { throw "The '$shortcutId' setting is missing." }
+        if ($shortcutSetting.Tab -ne 'Tools' -or -not $shortcutSetting.RequiresAdmin -or -not $shortcutSetting.CanChoose) {
+            throw "'$shortcutId' must be a reversible Tools card that requests administrator approval."
+        }
+        $shortcutIndex = [array]::IndexOf(@($script:Settings | ForEach-Object { $_.Id }), $shortcutId)
+        $lastToolIndex = [array]::IndexOf(@($script:Settings | ForEach-Object { $_.Id }), @($toolSettings)[-1].Id)
+        if ($shortcutIndex -lt $lastToolIndex) { throw "'$shortcutId' must be applied after the tools it points at." }
+    }
+    $ezShortcuts = @(($builtInTools | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1).Shortcuts)
+    if (@($ezShortcuts | Where-Object Name -eq 'Timeline Explorer').Count -ne 1) {
+        throw "Eric Zimmerman's tools must offer a Timeline Explorer shortcut, because its installer makes none."
+    }
+    $badShortcutRejected = $false
+    try {
+        [void](ConvertTo-ToolDefinition ([PSCustomObject]@{
+            id='tool-badshortcut'; name='Bad'; install=[PSCustomObject]@{ kind='winget'; package='a.b' }
+            detect=@([PSCustomObject]@{ kind='command'; command='a.exe' })
+            shortcuts=@([PSCustomObject]@{ name='..\..\evil'; target='C:/Windows/notepad.exe' })
+        }))
+    } catch { $badShortcutRejected = $true }
+    if (-not $badShortcutRejected) { throw 'A shortcut name that is not a usable file name must be refused.' }
+    $shortcutTestDirectory = Join-Path $env:TEMP ("Dingo-shortcut-test-{0}" -f [Guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $shortcutTestDirectory -Force | Out-Null
+        $notepadPath = Join-Path $env:SystemRoot 'notepad.exe'
+        $shortcutSpec = [PSCustomObject]@{ Target=$notepadPath; Arguments='' }
+        # A shortcut somebody else made, in the same folder.
+        $foreignShortcut = Join-Path $shortcutTestDirectory 'Theirs.lnk'
+        $foreignShell = New-Object -ComObject WScript.Shell
+        try {
+            $foreignLink = $foreignShell.CreateShortcut($foreignShortcut)
+            $foreignLink.TargetPath = $notepadPath
+            $foreignLink.Description = 'Made by hand'
+            $foreignLink.Save()
+        } finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($foreignShell) }
+        Write-ToolShortcut $shortcutTestDirectory 'Test Tool' $shortcutSpec
+        $writtenShortcut = Join-Path $shortcutTestDirectory 'Test Tool.lnk'
+        if (-not (Test-Path -LiteralPath $writtenShortcut -PathType Leaf)) { throw 'The shortcut file was not created.' }
+        if (-not (Test-ShortcutIsCurrent $writtenShortcut $shortcutSpec)) { throw 'A freshly written shortcut was not recognised.' }
+        if (Test-ShortcutIsCurrent $writtenShortcut ([PSCustomObject]@{ Target='C:\Somewhere\Else.exe'; Arguments='' })) {
+            throw 'A shortcut pointing elsewhere was treated as current.'
+        }
+        if (Test-ShortcutIsCurrent $foreignShortcut $shortcutSpec) { throw 'A hand-made shortcut must never be treated as a Dingo shortcut.' }
+        $ownedShortcuts = @(Get-DingoShortcutFiles $shortcutTestDirectory | Select-Object -ExpandProperty Name)
+        if ($ownedShortcuts.Count -ne 1 -or $ownedShortcuts[0] -ne 'Test Tool.lnk') {
+            throw "Dingo claimed the wrong shortcut files: $($ownedShortcuts -join ', ')"
+        }
+        if (-not (Test-Path -LiteralPath $foreignShortcut)) { throw 'The hand-made shortcut disappeared.' }
+    } finally {
+        Remove-Item -LiteralPath $shortcutTestDirectory -Recurse -Force -ErrorAction SilentlyContinue
     }
     $toggleCount = @($script:Settings | Where-Object CanChoose).Count
     if ($toggleCount -lt 20) { throw "Expected at least 20 reversible settings, found $toggleCount." }
