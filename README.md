@@ -16,7 +16,7 @@ No installation or PowerShell modules are required. Windows PowerShell 5.1 is in
 
 ## Quick apply without the GUI
 
-Use the same launcher with `-ApplyPreferred` to apply all 33 preferred settings without opening the selection window:
+Use the same launcher with `-ApplyPreferred` to apply all 34 preferred settings without opening the selection window:
 
 ```bat
 Start-Dingo.cmd -ApplyPreferred
@@ -58,7 +58,7 @@ Start-Dingo.cmd -Help
 - Current-state reads distinguish preferred, alternate, partial, unavailable, and error states. A read error is never treated as a missing setting, and **Check only settings that need changing** leaves unreadable settings unchecked.
 - Application results track the user, protected-user, computer-wide, and final-verification components separately, so a mixed setting can be reported as partially applied instead of as an undifferentiated failure.
 - The GUI stays in the signed-in desktop account, so per-user settings affect the correct Windows profile even when separate administrator credentials are needed. Protected per-user policy values are written by the elevated helper directly to that desktop user's SID, not to the administrator's profile.
-- Twenty-three settings offer plainly labelled reversible choices. The five one-way targets are UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal. The five tool cards are also one way: Dingo installs a tool but never removes it. Each can be left alone by unticking its card.
+- Twenty-three settings offer plainly labelled reversible choices. The five one-way targets are UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal. The six tool cards are also one way: Dingo installs a tool but never removes it. Each can be left alone by unticking its card.
 - **Read settings again** rereads every configured value without making changes.
 - Preflight is all-or-nothing: an unsupported plan is stopped before any changes. Once application begins, an individual setting failure does not stop later selected settings from running.
 - Logs are written to the `Logs` folder beside the script, so a copy deployed to `C:\DFIR\Tools\Dingo` logs to `C:\DFIR\Tools\Dingo\Logs`. The GUI can open that folder. Dingo keeps the 20 most recent logs and deletes older ones on the next launch.
@@ -97,6 +97,7 @@ Start-Dingo.cmd -Help
 - Dingo installs tools. It never uninstalls or downgrades one. A tool already present is reported as installed and left alone, whatever version it is.
 - If winget reports that a package is already present with nothing newer available, Dingo treats that as a success, because the tool is installed either way. Detection normally prevents this from happening at all.
 - `-ApplyPreferred` now installs missing tools as well as changing settings, because "installed" is the preferred state for a tool card. Use `-Exclude` with the `tool-` IDs, or `-Include`, if you want settings only.
+- Eric Zimmerman's tools are built on .NET 9, and a fresh Windows 11 install does not include it. Without it every tool fails to start with `You must install .NET to run this application`. Dingo therefore offers **.NET 9 Desktop Runtime** as its own card, listed before the tools that need it so a single run installs them in the right order. This was found by testing in Windows Sandbox, which is as bare as a freshly imaged VM.
 - Dingo detects Eric Zimmerman's tools by looking for **Timeline Explorer** and **Registry Explorer**, not for a command-line tool. A partial copy holding only the command-line tools is common, and detecting on those would wrongly report a complete install.
 - The `script` install kind downloads a PowerShell script and runs it with administrator rights. That is how the author distributes these tools, and it is the same thing you would do by hand. Dingo refuses any address that is not `https://`, and logs the URL and the SHA256 of the file it actually ran.
 - Re-running the Eric Zimmerman install updates the tools in place, because the author's script only fetches what has changed. A tool card stays tickable after it reports installed, so ticking it again is how you update.
@@ -107,7 +108,7 @@ Start-Dingo.cmd -Help
 
 ## Settings included
 
-Thirty-three settings. Five install tools, and one puts those tools on the PATH. The ID in the first column is the stable name used by `-Include` and `-Exclude`. **Scope** is whose settings change, and **Admin** is whether Windows asks for administrator approval. Run `Start-Dingo.cmd -ListSettings` for the same list from the tool itself.
+Thirty-four settings. Six install tools, and one puts those tools on the PATH. The ID in the first column is the stable name used by `-Include` and `-Exclude`. **Scope** is whose settings change, and **Admin** is whether Windows asks for administrator approval. Run `Start-Dingo.cmd -ListSettings` for the same list from the tool itself.
 
 ### Region and language
 
@@ -176,6 +177,7 @@ Tool cards live on their own **Tools** tab. Dingo checks whether each tool is al
 | `tool-notepadplusplus` | Notepad++ | System | yes | Installed |
 | `tool-ripgrep` | ripgrep | User | no | Installed |
 | `tool-sqlitebrowser` | DB Browser for SQLite | System | yes | Installed |
+| `tool-dotnet-desktop-9` | .NET 9 Desktop Runtime | System | yes | Installed |
 | `tool-eztools` | Eric Zimmerman's tools | System | yes | Installed |
 | `tools-on-path` | Run tools from anywhere | System | yes | On the PATH |
 
@@ -238,7 +240,7 @@ Detect rule kinds:
 | Kind | Field | Meaning |
 | --- | --- | --- |
 | `uninstall-key` | `match` | Wildcard match on the Windows uninstall display name, for example `7-Zip*` |
-| `file` | `path` | A file that must exist. `%ProgramFiles%` and other environment names are expanded. A backslash starts an escape in JSON, so write the path with forward slashes, or double every backslash |
+| `file` | `path` | A file that must exist, or a wildcard such as `.../Microsoft.WindowsDesktop.App/9.*` to match a versioned folder whose exact patch number is unknown. A matched folder reports its own name as the version. `%ProgramFiles%` and other environment names are expanded. A backslash starts an escape in JSON, so write the path with forward slashes, or double every backslash |
 | `command` | `command` | An executable that must be on the PATH, for example `rg.exe` |
 
 A tool entry Dingo cannot understand is skipped, and the reason is written to the log and shown at the top of the Tools tab. A `Tools.json` that will not parse at all is ignored, and the built-in list is used instead. Dingo still starts either way.

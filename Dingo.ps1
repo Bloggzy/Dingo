@@ -470,8 +470,18 @@ function Get-BuiltInToolCatalog {
             )
         },
         [PSCustomObject]@{
+            # Listed before the tools that need it, because the elevated worker
+            # applies the plan in catalog order.
+            id='tool-dotnet-desktop-9'; name='.NET 9 Desktop Runtime'; category='Forensics'
+            description="Eric Zimmerman's tools are built on .NET 9, which a fresh Windows 11 install does not include. Without this they fail to start with 'You must install .NET to run this application'."
+            install=[PSCustomObject]@{ kind='winget'; package='Microsoft.DotNet.DesktopRuntime.9'; scope='machine' }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='C:/Program Files/dotnet/shared/Microsoft.WindowsDesktop.App/9.*' }
+            )
+        },
+        [PSCustomObject]@{
             id='tool-eztools'; name="Eric Zimmerman's tools"; category='Forensics'
-            description='The full DFIR tool set, including Timeline Explorer, Registry Explorer, EvtxECmd, and RECmd. Installed with the author''s own Get-ZimmermanTools script.'
+            description='The full DFIR tool set, including Timeline Explorer, Registry Explorer, EvtxECmd, and RECmd. Installed with the author''s own Get-ZimmermanTools script. Needs the .NET 9 Desktop Runtime, which is the card above.'
             install=[PSCustomObject]@{
                 kind='script'; scope='machine'
                 url='https://raw.githubusercontent.com/EricZimmerman/Get-ZimmermanTools/master/Get-ZimmermanTools.ps1'
@@ -577,7 +587,18 @@ function Find-InstalledTool($Tool) {
             if ($entry) { return [PSCustomObject]@{ Version=$entry.Version; Evidence="Windows lists it as '$($entry.Name)'." } }
         } elseif ($rule.Kind -eq 'file') {
             $path = [Environment]::ExpandEnvironmentVariables($rule.Path)
-            if (Test-Path -LiteralPath $path -PathType Leaf) {
+            if ($path.Contains('*') -or $path.Contains('?')) {
+                # A wildcard lets a rule match a versioned folder, such as the
+                # .NET runtime, whose exact patch number is not known in advance.
+                $matches = @(Get-Item -Path $path -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+                if ($matches.Count) {
+                    $item = $matches[0]
+                    $version = if ($item.PSIsContainer) { $item.Name } else {
+                        try { [string]$item.VersionInfo.ProductVersion } catch { '' }
+                    }
+                    return [PSCustomObject]@{ Version=$version; Evidence="Found $($item.FullName)." }
+                }
+            } elseif (Test-Path -LiteralPath $path -PathType Leaf) {
                 $version = ''
                 try { $version = [string](Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo.ProductVersion } catch { $version = '' }
                 return [PSCustomObject]@{ Version=$version; Evidence="Found $path." }
@@ -2058,7 +2079,7 @@ if ($SelfTest) {
     }
     # Tool cards are one-way on purpose: Dingo installs, and never uninstalls.
     $builtInTools = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
-    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools')) {
+    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9')) {
         if (@($builtInTools | Where-Object Id -eq $expectedId).Count -ne 1) { throw "The built-in tool catalog is missing '$expectedId'." }
     }
     $toolSettings = @($script:Settings | Where-Object Kind -eq 'Package')
@@ -2116,8 +2137,22 @@ if ($SelfTest) {
     $ezSetting = $script:Settings | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1
     if (-not $ezSetting.RequiresAdmin) { throw 'The Eric Zimmerman tool set must request administrator approval.' }
     if ([bool]$ezSetting.Requirements['WingetRequired']) { throw 'A script install must not be blocked by a missing winget.' }
+    # Eric Zimmerman's tools will not start without the .NET 9 Desktop Runtime,
+    # and a fresh Windows 11 install does not have it. It must be offered, and it
+    # must be installed first, because the worker applies the plan in this order.
+    $runtimeIndex = [array]::IndexOf(@($builtInTools | ForEach-Object { $_.Id }), 'tool-dotnet-desktop-9')
+    $ezIndex = [array]::IndexOf(@($builtInTools | ForEach-Object { $_.Id }), 'tool-eztools')
+    if ($runtimeIndex -lt 0 -or $ezIndex -lt 0 -or $runtimeIndex -gt $ezIndex) {
+        throw 'The .NET runtime must be listed before the tools that need it.'
+    }
     $missingTool = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-absent'; name='Absent'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='file'; path='%ProgramFiles%\Dingo-Definitely-Absent\x.exe' }) })
     if (Find-InstalledTool $missingTool) { throw 'Tool detection reported a missing tool as installed.' }
+    # A wildcard rule must match a versioned folder and report its name as the version.
+    $wildcardTool = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-wildcard'; name='Wildcard'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='file'; path='C:/Windows/Dingo-Definitely-Absent-*' }) })
+    if (Find-InstalledTool $wildcardTool) { throw 'A wildcard rule matched a folder that does not exist.' }
+    $wildcardHit = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-wildcard2'; name='Wildcard'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='file'; path='C:/Windows/Microsoft.NET/Frame*' }) })
+    $wildcardFound = Find-InstalledTool $wildcardHit
+    if (-not $wildcardFound -or -not $wildcardFound.Version) { throw 'A wildcard rule did not match a folder that does exist.' }
     # PATH damage is the worst thing this tool could do, so prove the string
     # handling on a stand-in value before it is ever written to the registry.
     $pathSetting = $script:Settings | Where-Object Id -eq 'tools-on-path' | Select-Object -First 1
