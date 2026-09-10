@@ -39,6 +39,8 @@ Start-Dingo.cmd -WhatIf -Exclude language-au,windows-update-continuity
 
 Add `-NoRestartExplorer` to suppress the automatic File Explorer restart. Exit code `0` means the plan succeeded (or a dry run completed), `1` means at least one setting failed or was only partially applied, `2` means the command or environment was invalid, and `3` means Dingo was already running.
 
+`-ApplyPreferred` refuses to run from an elevated console, because Dingo must keep account settings pointed at your signed-in profile. `-WhatIf` is allowed there, because a dry run changes nothing; its JSON output carries `"Elevated": true` and the text output prints a note, so you know account settings were read from the elevated account. The three self-tests also run either way. This matters in Windows Sandbox, where every process is elevated.
+
 An unrecognised option or stray positional argument is rejected with exit code `2` and the full help text is displayed; Dingo will not fall through to launching the GUI. The launcher preserves Dingo's exit code after displaying its pause prompt.
 
 For automation, add `-OutputFormat Json` to `-WhatIf`, `-ApplyPreferred`, or `-ListSettings`. Discovery and help commands are:

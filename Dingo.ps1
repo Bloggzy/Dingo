@@ -1951,11 +1951,17 @@ if ($SelfTest) {
     # Windows Sandbox. Only the real GUI is refused there.
     # Match on the condition, not the body. Searching the body would find this
     # self-test block itself, because the message text appears here too.
-    $guardCondition = @($selfTestAst.FindAll({ param($node) $node -is [Management.Automation.Language.IfStatementAst] },$true) |
-        ForEach-Object { $_.Clauses[0].Item1.Extent.Text } |
-        Where-Object { $_ -match 'Test-IsAdministrator' -and $_ -match 'UiSelfTest' })
+    $allConditions = @($selfTestAst.FindAll({ param($node) $node -is [Management.Automation.Language.IfStatementAst] },$true) |
+        ForEach-Object { $_.Clauses[0].Item1.Extent.Text })
+    $guardCondition = @($allConditions | Where-Object { $_ -match 'Test-IsAdministrator' -and $_ -match 'UiSelfTest' })
     if ($guardCondition.Count -ne 1 -or $guardCondition[0] -notmatch '-not\s+\$UiSelfTest') {
         throw 'The elevated-start guard must let the UI self-test through.'
+    }
+    # A dry run makes no changes, so it must stay usable where every process is
+    # elevated. Only real changes are refused there.
+    $dryRunGuard = @($allConditions | Where-Object { $_ -match 'Test-IsAdministrator' -and $_ -match 'WhatIf' })
+    if ($dryRunGuard.Count -ne 1 -or $dryRunGuard[0] -notmatch '-not\s+\$WhatIf') {
+        throw 'The elevated-start guard must let a dry run through.'
     }
     $launcherPath = Join-Path $PSScriptRoot 'Start-Dingo.cmd'
     if (-not (Test-Path -LiteralPath $launcherPath) -or (Get-Content -LiteralPath $launcherPath -Raw) -notmatch '%\*') { throw 'Start-Dingo.cmd does not forward command-line arguments.' }
@@ -2271,9 +2277,15 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
         Write-CliErrorResponse 'Use -ApplyPreferred to make changes, or -WhatIf to preview them.' 2
         exit 2
     }
-    if (Test-IsAdministrator) {
-        Write-CliErrorResponse 'Start Dingo from the signed-in desktop account, not from an elevated PowerShell window. Dingo will request administrator approval only for settings that need it.' 2 $(if ($WhatIf) { 'WhatIf' } else { 'ApplyPreferred' })
+    # A dry run changes nothing, so it stays available where every process is
+    # elevated, such as Windows Sandbox. Only real changes are refused.
+    if ((Test-IsAdministrator) -and -not $WhatIf) {
+        Write-CliErrorResponse 'Start Dingo from the signed-in desktop account, not from an elevated PowerShell window. Dingo will request administrator approval only for settings that need it.' 2 'ApplyPreferred'
         exit 2
+    }
+    $elevatedDryRun = [bool]((Test-IsAdministrator) -and $WhatIf)
+    if ($elevatedDryRun) {
+        Write-CliStatus 'Note: this dry run is elevated, so account settings are read from the elevated account. That is the same account under UAC, but not if you elevated as somebody else.'
     }
     if (-not (Enter-DingoSingleInstance)) {
         Write-CliErrorResponse 'Dingo is already running for this Windows account.' 3 $(if ($WhatIf) { 'WhatIf' } else { 'ApplyPreferred' })
@@ -2303,7 +2315,7 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             $exitCode = if ($blocked) { 2 } else { 0 }
             if ($OutputFormat -eq 'Json') {
                 [Console]::Out.WriteLine((ConvertTo-Json -InputObject ([PSCustomObject]@{
-                    Version=$script:DingoVersion; Mode='WhatIf'; Success=(-not [bool]$blocked); ExitCode=$exitCode; Changed=$false; Plan=$plan
+                    Version=$script:DingoVersion; Mode='WhatIf'; Success=(-not [bool]$blocked); ExitCode=$exitCode; Changed=$false; Elevated=$elevatedDryRun; Plan=$plan
                 }) -Depth 7))
             } else {
                 Write-CliStatus "Dingo dry run: $($selected.Count) preferred setting(s) would be applied. No changes were made."
