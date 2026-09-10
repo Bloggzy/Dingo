@@ -16,7 +16,7 @@ No installation or PowerShell modules are required. Windows PowerShell 5.1 is in
 
 ## Quick apply without the GUI
 
-Use the same launcher with `-ApplyPreferred` to apply all 31 preferred settings without opening the selection window:
+Use the same launcher with `-ApplyPreferred` to apply all 32 preferred settings without opening the selection window:
 
 ```bat
 Start-Dingo.cmd -ApplyPreferred
@@ -97,11 +97,15 @@ Start-Dingo.cmd -Help
 - Dingo installs tools. It never uninstalls or downgrades one. A tool already present is reported as installed and left alone, whatever version it is.
 - If winget reports that a package is already present with nothing newer available, Dingo treats that as a success, because the tool is installed either way. Detection normally prevents this from happening at all.
 - `-ApplyPreferred` now installs missing tools as well as changing settings, because "installed" is the preferred state for a tool card. Use `-Exclude` with the `tool-` IDs, or `-Include`, if you want settings only.
+- Dingo detects Eric Zimmerman's tools by looking for **Timeline Explorer** and **Registry Explorer**, not for a command-line tool. A partial copy holding only the command-line tools is common, and detecting on those would wrongly report a complete install.
+- The `script` install kind downloads a PowerShell script and runs it with administrator rights. That is how the author distributes these tools, and it is the same thing you would do by hand. Dingo refuses any address that is not `https://`, and logs the URL and the SHA256 of the file it actually ran.
+- Re-running the Eric Zimmerman install updates the tools in place, because the author's script only fetches what has changed. A tool card stays tickable after it reports installed, so ticking it again is how you update.
+- Eric Zimmerman's tools land in `C:\DFIR\Tools\EZTools\net9`, in a mixed layout: some tools are a loose `.exe`, others get their own folder. They are not on the PATH yet.
 - Tool file associations and Desktop or Start Menu shortcuts are not built yet.
 
 ## Settings included
 
-Thirty-one settings, of which four are tools. The ID in the first column is the stable name used by `-Include` and `-Exclude`. **Scope** is whose settings change, and **Admin** is whether Windows asks for administrator approval. Run `Start-Dingo.cmd -ListSettings` for the same list from the tool itself.
+Thirty-two settings, of which five are tools. The ID in the first column is the stable name used by `-Include` and `-Exclude`. **Scope** is whose settings change, and **Admin** is whether Windows asks for administrator approval. Run `Start-Dingo.cmd -ListSettings` for the same list from the tool itself.
 
 ### Region and language
 
@@ -170,8 +174,11 @@ Tool cards live on their own **Tools** tab. Dingo checks whether each tool is al
 | `tool-notepadplusplus` | Notepad++ | System | yes | Installed |
 | `tool-ripgrep` | ripgrep | User | no | Installed |
 | `tool-sqlitebrowser` | DB Browser for SQLite | System | yes | Installed |
+| `tool-eztools` | Eric Zimmerman's tools | System | yes | Installed |
 
 A tool installs machine-wide where its winget package supports it, which needs administrator approval. ripgrep ships as a portable package, so it installs into the signed-in account only and needs no approval. winget adds ripgrep to the user PATH by itself.
+
+Eric Zimmerman's tools are not in winget. Dingo runs the author's own `Get-ZimmermanTools.ps1` instead, fetched over https from `EricZimmerman/Get-ZimmermanTools` on GitHub, and installs into `C:\DFIR\Tools\EZTools`. The SHA256 of the downloaded script is written to the log before it runs, so you can audit what was executed. That download is several hundred megabytes and is given 45 minutes.
 
 Detection does not depend on winget. Dingo reads the Windows uninstall list under both HKLM and HKCU, checks the usual install folders, and looks on the PATH. A tool installed by hand, or by Chocolatey, is still found.
 
@@ -200,10 +207,14 @@ Put a `Tools.json` file next to `Dingo.ps1`. A new `id` adds a tool. An `id` tha
 | `name` | yes | Shown on the card |
 | `category` | no | Defaults to `Tools` |
 | `description` | no | Defaults to "Install \<name\>" |
-| `install.kind` | no | Only `winget` in this version. Defaults to `winget` |
-| `install.package` | yes | The exact winget package id |
+| `install.kind` | no | `winget` (default) or `script` |
+| `install.package` | winget only | The exact winget package id |
+| `install.url` | script only | `https://` address of the install script. Plain `http` is refused |
+| `install.dest` | script only | Folder the script installs into. Dingo creates it if needed |
+| `install.arguments` | no | Extra arguments for the script. `-Dest` is always passed for you |
+| `install.timeoutMinutes` | no | 1 to 240. Defaults to 15 for winget and 45 for a script |
 | `install.scope` | no | `machine` (default) or `user`. This decides whether the card needs administrator approval |
-| `install.source` | no | Defaults to `winget` |
+| `install.source` | no | winget only. Defaults to `winget` |
 | `detect` | yes | One or more rules. The first rule that matches wins |
 
 Detect rule kinds:
