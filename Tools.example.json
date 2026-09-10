@@ -11,6 +11,11 @@
       "detect": [
         { "kind": "uninstall-key", "match": "HxD*" },
         { "kind": "file", "path": "%ProgramFiles%/HxD/HxD.exe" }
+      ],
+      // Optional. Add this when the installer makes no shortcut of its own.
+      // A target that is not on disk is skipped, not treated as a failure.
+      "shortcuts": [
+        { "name": "HxD", "target": "%ProgramFiles%/HxD/HxD.exe" }
       ]
     },
     {
