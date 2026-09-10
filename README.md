@@ -235,8 +235,10 @@ The **File associations** tab decides which program opens which file type. These
 | ID | Card | Types it offers |
 | --- | --- | --- |
 | `assoc-notepadplusplus` | Notepad++ file types | `.json` `.md` `.yml` `.yaml` `.ini` `.conf` |
-| `assoc-eztools` | Eric Zimmerman's tools file types | `.csv` `.tsv` |
+| `assoc-eztools` | Eric Zimmerman's tools file types | `.csv` `.tsv` (Timeline Explorer), `.dat` (Registry Explorer) |
 | `assoc-sqlitebrowser` | DB Browser for SQLite file types | `.db` `.sqlite` `.sqlite3` |
+
+One card can send different file types to different programs. On an analysis VM a `.dat` file is almost always a registry hive, `NTUSER.DAT` or `UsrClass.dat`, so that type goes to Registry Explorer while `.csv` and `.tsv` go to Timeline Explorer.
 
 These cards run after the tool cards, so installing a tool and setting its file types happens in one run. A type whose program is not installed is left alone, and the card says so.
 

@@ -607,9 +607,13 @@ function Get-BuiltInToolCatalog {
             }
             shims=[PSCustomObject]@{ from='C:/DFIR/Tools/EZTools/net9'; pattern='*.exe'; recurse=$true }
             # Timeline Explorer is the reason most analysts open a csv at all.
+            # .dat goes to Registry Explorer: on an analysis VM a .dat file is
+            # almost always a registry hive, NTUSER.DAT or UsrClass.dat. Windows
+            # leaves .dat unclaimed, so Dingo can take it.
             associations=@(
                 [PSCustomObject]@{ extension='.csv'; target='C:/DFIR/Tools/EZTools/net9/TimelineExplorer/TimelineExplorer.exe'; description='Comma separated values' },
-                [PSCustomObject]@{ extension='.tsv'; target='C:/DFIR/Tools/EZTools/net9/TimelineExplorer/TimelineExplorer.exe'; description='Tab separated values' }
+                [PSCustomObject]@{ extension='.tsv'; target='C:/DFIR/Tools/EZTools/net9/TimelineExplorer/TimelineExplorer.exe'; description='Tab separated values' },
+                [PSCustomObject]@{ extension='.dat'; target='C:/DFIR/Tools/EZTools/net9/RegistryExplorer/RegistryExplorer.exe'; description='Registry hive' }
             )
             # Get-ZimmermanTools makes no shortcuts at all, so the window tools are
             # invisible in the Start menu. A target that is not on disk is skipped.
@@ -2827,6 +2831,12 @@ if ($SelfTest) {
         }
     }
     if (-not $notepadAssociations.Count -or $notepadAssociations -notcontains '.json') { throw 'Notepad++ should offer to open .json.' }
+    # One card can point different file types at different programs. .dat is a
+    # registry hive, so it must go to Registry Explorer, not Timeline Explorer.
+    $hiveAssociation = @(($builtInTools | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1).Associations |
+        Where-Object Extension -eq '.dat')
+    if ($hiveAssociation.Count -ne 1) { throw 'Eric Zimmerman''s tools should offer to open .dat.' }
+    if ($hiveAssociation[0].Target -notlike '*RegistryExplorer.exe') { throw '.dat must open with Registry Explorer.' }
     $badExtensionRejected = $false
     try {
         [void](ConvertTo-ToolDefinition ([PSCustomObject]@{
