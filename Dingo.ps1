@@ -41,7 +41,7 @@ $script:LanguageChangePending = $false
 $script:InstanceMutex = $null
 $script:PendingApply = $null
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.5.7'
+$script:DingoVersion = '0.5.8'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -671,11 +671,22 @@ function Get-UninstallEntry([string]$Match) {
     return $null
 }
 
+function Get-DisplayVersion([string]$Version) {
+    # A .NET build stamps its git commit onto the product version, so Timeline
+    # Explorer reports 2026.5.0+74bece05a5... Everything after the plus is build
+    # metadata and means nothing to the person reading the card.
+    if ([string]::IsNullOrWhiteSpace($Version)) { return '' }
+    $trimmed = $Version.Trim()
+    $plus = $trimmed.IndexOf('+')
+    if ($plus -gt 0) { $trimmed = $trimmed.Substring(0, $plus) }
+    return $trimmed
+}
+
 function Find-InstalledTool($Tool) {
     foreach ($rule in @($Tool.Detect)) {
         if ($rule.Kind -eq 'uninstall-key') {
             $entry = Get-UninstallEntry $rule.Match
-            if ($entry) { return [PSCustomObject]@{ Version=$entry.Version; Evidence="Windows lists it as '$($entry.Name)'." } }
+            if ($entry) { return [PSCustomObject]@{ Version=(Get-DisplayVersion $entry.Version); Evidence="Windows lists it as '$($entry.Name)'." } }
         } elseif ($rule.Kind -eq 'file') {
             $path = [Environment]::ExpandEnvironmentVariables($rule.Path)
             if ($path.Contains('*') -or $path.Contains('?')) {
@@ -685,13 +696,13 @@ function Find-InstalledTool($Tool) {
                 if ($matches.Count) {
                     $item = $matches[0]
                     $version = if ($item.PSIsContainer) { $item.Name } else {
-                        try { [string]$item.VersionInfo.ProductVersion } catch { '' }
+                        try { Get-DisplayVersion ([string]$item.VersionInfo.ProductVersion) } catch { '' }
                     }
                     return [PSCustomObject]@{ Version=$version; Evidence="Found $($item.FullName)." }
                 }
             } elseif (Test-Path -LiteralPath $path -PathType Leaf) {
                 $version = ''
-                try { $version = [string](Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo.ProductVersion } catch { $version = '' }
+                try { $version = Get-DisplayVersion ([string](Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo.ProductVersion) } catch { $version = '' }
                 return [PSCustomObject]@{ Version=$version; Evidence="Found $path." }
             }
         } elseif ($rule.Kind -eq 'command') {
@@ -1257,21 +1268,21 @@ function Get-Settings {
     # add more of them later without a code change.
     foreach ($tool in (Get-ToolCatalog)) {
         [void]$settings.Add((New-Setting $tool.Id $tool.Category $tool.Name $tool.Description 'Installed' $null 'Package' @($tool) $false $false `
-            @{ WingetRequired = ($tool.InstallKind -eq 'winget'); RequiredTools = @($tool.Requires) } 'Tools' 'Not installed'))
+            @{ WingetRequired = ($tool.InstallKind -eq 'winget'); RequiredTools = @($tool.Requires) } 'Install tools' 'Not installed'))
     }
     # Shortcuts come after the tool cards, because a shortcut is only written for
     # a program that is already on disk.
     [void]$settings.Add((New-Setting 'tools-start-menu' 'Tools' 'Start menu shortcuts' `
         "Puts a shortcut for each installed window tool into a DFIR Tools folder in the Start menu, for every account on this computer. Some installers make no shortcut at all, so the program is on disk but nobody can find it. Turning this off removes only the shortcuts Dingo made." `
-        'Created' 'Not created' 'Shortcut' @([PSCustomObject]@{ Scope='Machine'; Folder=$script:StartMenuShortcutDirectory }) $false $false @{} 'Tools'))
+        'Created' 'Not created' 'Shortcut' @([PSCustomObject]@{ Scope='Machine'; Folder=$script:StartMenuShortcutDirectory }) $false $false @{} 'Tool shortcuts'))
     [void]$settings.Add((New-Setting 'tools-desktop' 'Tools' 'Desktop shortcuts' `
         "Puts the same shortcuts on the shared Desktop, for every account on this computer. Turning this off removes only the shortcuts Dingo made." `
-        'Created' 'Not created' 'Shortcut' @([PSCustomObject]@{ Scope='Machine'; Folder=$script:DesktopShortcutDirectory }) $false $false @{} 'Tools'))
+        'Created' 'Not created' 'Shortcut' @([PSCustomObject]@{ Scope='Machine'; Folder=$script:DesktopShortcutDirectory }) $false $false @{} 'Tool shortcuts'))
     # Added last on purpose. The elevated worker runs the plan in this order, so
     # the launchers are written after the tools they point at are installed.
     [void]$settings.Add((New-Setting 'tools-on-path' 'Tools' 'Run tools from anywhere' `
         "Puts one small launcher for each installed command-line tool into $script:ShimDirectory, then adds that single folder to the computer PATH. You can then type EvtxECmd from any folder. The folder is added at the end of the PATH, so a tool can never shadow a Windows command." `
-        'On the PATH' 'Not on the PATH' 'ToolPath' @() $false $false @{} 'Tools'))
+        'On the PATH' 'Not on the PATH' 'ToolPath' @() $false $false @{} 'Tool shortcuts'))
     return ,$settings
 }
 
@@ -2328,7 +2339,7 @@ if ($SelfTest) {
     $toolSettings = @($script:Settings | Where-Object Kind -eq 'Package')
     if ($toolSettings.Count -ne @(Get-ToolCatalog).Count) { throw "Every catalog tool must become a setting; found $($toolSettings.Count)." }
     foreach ($toolSetting in $toolSettings) {
-        if ($toolSetting.Tab -ne 'Tools') { throw "Tool '$($toolSetting.Id)' must sit on the Tools tab." }
+        if ($toolSetting.Tab -ne 'Install tools') { throw "Tool '$($toolSetting.Id)' must sit on the Install tools tab." }
         if ($toolSetting.CanChoose) { throw "Tool '$($toolSetting.Id)' must not offer an uninstall option." }
         if ($toolSetting.DefaultState -ne 'Not installed') { throw "Tool '$($toolSetting.Id)' must report 'Not installed' as the untouched state." }
         if (@($toolSetting.Entries).Count -ne 1) { throw "Tool '$($toolSetting.Id)' must carry exactly one tool definition." }
@@ -2400,8 +2411,8 @@ if ($SelfTest) {
     # handling on a stand-in value before it is ever written to the registry.
     $pathSetting = $script:Settings | Where-Object Id -eq 'tools-on-path' | Select-Object -First 1
     if (-not $pathSetting) { throw 'The command-line access setting is missing.' }
-    if ($pathSetting.Tab -ne 'Tools' -or -not $pathSetting.RequiresAdmin -or -not $pathSetting.CanChoose) {
-        throw 'Command-line access must be a reversible Tools card that requests administrator approval.'
+    if ($pathSetting.Tab -ne 'Tool shortcuts' -or -not $pathSetting.RequiresAdmin -or -not $pathSetting.CanChoose) {
+        throw 'Command-line access must be a reversible Tool shortcuts card that requests administrator approval.'
     }
     if ($script:Settings[-1].Id -ne 'tools-on-path') {
         throw 'Command-line access must be applied last, after the tools its launchers point at.'
@@ -2471,8 +2482,8 @@ if ($SelfTest) {
     foreach ($shortcutId in @('tools-start-menu','tools-desktop')) {
         $shortcutSetting = $script:Settings | Where-Object Id -eq $shortcutId | Select-Object -First 1
         if (-not $shortcutSetting) { throw "The '$shortcutId' setting is missing." }
-        if ($shortcutSetting.Tab -ne 'Tools' -or -not $shortcutSetting.RequiresAdmin -or -not $shortcutSetting.CanChoose) {
-            throw "'$shortcutId' must be a reversible Tools card that requests administrator approval."
+        if ($shortcutSetting.Tab -ne 'Tool shortcuts' -or -not $shortcutSetting.RequiresAdmin -or -not $shortcutSetting.CanChoose) {
+            throw "'$shortcutId' must be a reversible Tool shortcuts card that requests administrator approval."
         }
         $shortcutIndex = [array]::IndexOf(@($script:Settings | ForEach-Object { $_.Id }), $shortcutId)
         $lastToolIndex = [array]::IndexOf(@($script:Settings | ForEach-Object { $_.Id }), @($toolSettings)[-1].Id)
@@ -2735,7 +2746,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
           </ScrollViewer>
         </Grid>
       </TabItem>
-      <TabItem Header="Tools">
+      <TabItem Header="Install tools">
         <Grid>
           <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
           <Border Background="#E8F6EE" Padding="12" Margin="8">
@@ -2743,6 +2754,17 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
           </Border>
           <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
             <StackPanel Name="ToolSettingsPanel" Margin="8,0,8,8"/>
+          </ScrollViewer>
+        </Grid>
+      </TabItem>
+      <TabItem Header="Tool shortcuts">
+        <Grid>
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <Border Background="#E8F6EE" Padding="12" Margin="8">
+            <TextBlock Name="ShortcutsScopeText" Text="Ways to reach the tools you installed: Start menu and Desktop shortcuts, and launchers that let you run the command-line tools from any folder." TextWrapping="Wrap"/>
+          </Border>
+          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel Name="ShortcutSettingsPanel" Margin="8,0,8,8"/>
           </ScrollViewer>
         </Grid>
       </TabItem>
@@ -2762,13 +2784,13 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
-foreach ($name in @('ScopeTabs','UserScopeText','BothScopeText','ToolsScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','ProgressBar','SummaryText','AdminSummaryText','OpenLogButton','ApplyButton')) {
+foreach ($name in @('ScopeTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','ProgressBar','SummaryText','AdminSummaryText','OpenLogButton','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
 $desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $UserScopeText.Text = "These settings affect only $desktopIdentity. A gold 'Admin approval required' label identifies a protected per-account policy that needs elevation."
 $BothScopeText.Text = "These choices affect $desktopIdentity and the whole computer. Administrator approval is used only for the computer-wide part."
-$ToolsScopeText.Text = "Analyst tools. Dingo checks whether each one is already installed, and installs the missing ones with winget. Dingo never removes a tool. Add more tools by putting a Tools.json file next to Dingo.ps1."
+$ToolsScopeText.Text = "Analyst tools. Dingo checks whether each one is already installed, and installs the missing ones with winget. Dingo never removes a tool. Add more tools by putting a Tools.json file next to Dingo.ps1. Shortcuts and command-line access are on the next tab."
 if ($script:ToolCatalogWarning) {
     $ToolsScopeText.Text = "$($script:ToolCatalogWarning) The built-in tool list is being used instead."
     $ToolsScopeText.Foreground = '#8A2B21'
@@ -2939,7 +2961,8 @@ foreach ($item in $script:Settings) {
         'User' { [void]$UserSettingsPanel.Children.Add($card) }
         'System' { [void]$SystemSettingsPanel.Children.Add($card) }
         'Both' { [void]$BothSettingsPanel.Children.Add($card) }
-        'Tools' { [void]$ToolSettingsPanel.Children.Add($card) }
+        'Install tools' { [void]$ToolSettingsPanel.Children.Add($card) }
+        'Tool shortcuts' { [void]$ShortcutSettingsPanel.Children.Add($card) }
         default { throw "Setting '$($item.Id)' asks for unknown tab '$($item.Tab)'." }
     }
 }
@@ -2949,7 +2972,11 @@ if ($UiSelfTest) {
     $adminSettings = @($script:Settings | Where-Object RequiresAdmin)
     if ($adminSettings | Where-Object { -not $_.AdminBadgeControl }) { throw 'Every setting that requires administrator approval must show an admin badge.' }
     if (-not $AdminSummaryText) { throw 'The selected administrator-change summary is unavailable.' }
-    "UI self-test passed: $($script:Settings.Count) setting cards across 4 tabs."
+    # Every tab must hold cards, so a renamed tab cannot leave an empty one.
+    if ($ScopeTabs.Items.Count -ne @($script:Settings | Group-Object Tab).Count) {
+        throw "Every tab must hold cards: $($ScopeTabs.Items.Count) tabs for $(@($script:Settings | Group-Object Tab).Count) groups of cards."
+    }
+    "UI self-test passed: $($script:Settings.Count) setting cards across $($ScopeTabs.Items.Count) tabs."
     $window.Close()
     exit 0
 }

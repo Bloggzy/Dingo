@@ -7,7 +7,7 @@ A self-contained, state-aware PowerShell/WPF utility for applying a repeatable s
 1. Copy the entire Dingo folder to the VM.
 2. Double-click Start-Dingo.cmd.
    Do not use **Run as administrator**. Dingo keeps its main window in your signed-in account and asks for administrator credentials later, only when needed.
-3. Choose the **My account**, **Whole computer**, **My account + whole computer**, or **Tools** tab.
+3. Choose the **My account**, **Whole computer**, **My account + whole computer**, **Install tools**, or **Tool shortcuts** tab.
 4. Each card explains the normal Windows choice, the current choice, and the available choices in plain language.
 5. Tick the cards to change, or use **Choose all my preferred settings**.
 6. Choose **Apply checked changes**. Windows requests administrator approval when the selection includes a whole-computer setting or a protected account policy marked **Admin approval required**.
@@ -109,7 +109,7 @@ Start-Dingo.cmd -Help
 - Eric Zimmerman's tools land in `C:\DFIR\Tools\EZTools\net9`, in a mixed layout: some tools are a loose `.exe`, others get their own folder. Tick **Run tools from anywhere** to reach them from any folder.
 - Dingo reads the computer PATH without expanding it and writes it back as an expandable value. Real machines hold entries such as `%USERPROFILE%\go\bin`, and reading PATH the easy way expands those, which would permanently bake one account's folders into the computer PATH. The self-test proves this on a stand-in value before anything is written.
 - A PATH change reaches new windows only. Restart any open terminal, and sign out and back in for programs started from Explorer.
-- Tool file associations and Desktop or Start Menu shortcuts are not built yet.
+- Tool file associations are not built yet. Start menu and Desktop shortcuts are, on the **Tool shortcuts** tab.
 
 ## Settings included
 
@@ -174,7 +174,13 @@ Thirty-six settings. Six install tools. Two make shortcuts, and one puts the too
 
 ### Tools
 
-Tool cards live on their own **Tools** tab. Dingo checks whether each tool is already installed, and installs the missing ones with winget. Dingo never uninstalls a tool, so these cards are one-way and have no second option.
+Tool cards live on the **Install tools** tab. Dingo checks whether each tool is already installed, and installs the missing ones with winget. Dingo never uninstalls a tool, so these cards are one-way and have no second option.
+
+The **Tool shortcuts** tab holds the three cards that make an installed tool easy to reach: Start menu shortcuts, Desktop shortcuts, and command-line access.
+
+A reported version comes from the tool itself. A .NET build stamps its git commit onto that version, so Timeline Explorer reports `2026.5.0+74bece05a5...`. Dingo shows only the part before the plus.
+
+Cards on the **Install tools** tab:
 
 | ID | Tool | Scope | Admin | Preferred |
 | --- | --- | --- | --- | --- |
@@ -184,6 +190,11 @@ Tool cards live on their own **Tools** tab. Dingo checks whether each tool is al
 | `tool-sqlitebrowser` | DB Browser for SQLite | System | yes | Installed |
 | `tool-dotnet-desktop-9` | .NET 9 Desktop Runtime | System | yes | Installed |
 | `tool-eztools` | Eric Zimmerman's tools | System | yes | Installed |
+
+Cards on the **Tool shortcuts** tab:
+
+| ID | Card | Scope | Admin | Preferred |
+| --- | --- | --- | --- | --- |
 | `tools-start-menu` | Start menu shortcuts | System | yes | Created |
 | `tools-desktop` | Desktop shortcuts | System | yes | Created |
 | `tools-on-path` | Run tools from anywhere | System | yes | On the PATH |
@@ -270,7 +281,7 @@ Detect rule kinds:
 | `file` | `path` | A file that must exist, or a wildcard such as `.../Microsoft.WindowsDesktop.App/9.*` to match a versioned folder whose exact patch number is unknown. A matched folder reports its own name as the version. `%ProgramFiles%` and other environment names are expanded. A backslash starts an escape in JSON, so write the path with forward slashes, or double every backslash |
 | `command` | `command` | An executable that must be on the PATH, for example `rg.exe` |
 
-A tool entry Dingo cannot understand is skipped, and the reason is written to the log and shown at the top of the Tools tab. A `Tools.json` that will not parse at all is ignored, and the built-in list is used instead. Dingo still starts either way.
+A tool entry Dingo cannot understand is skipped, and the reason is written to the log and shown at the top of the Install tools tab. A `Tools.json` that will not parse at all is ignored, and the built-in list is used instead. Dingo still starts either way.
 
 `Tools.json` names commands that Dingo will run. Treat it with the same care as `Dingo.ps1` itself.
 
