@@ -41,9 +41,15 @@ $script:LanguageChangePending = $false
 $script:InstanceMutex = $null
 $script:PendingApply = $null
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.5.5'
+$script:DingoVersion = '0.5.6'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
+$script:ToolCatalogCache = $null
+$script:ShimDirectory = 'C:\DFIR\Tools\bin'
+# Only files carrying this marker are ever deleted, so a launcher someone wrote
+# by hand in the same folder is left alone.
+$script:ShimMarker = 'REM Written by Dingo. Safe to delete.'
+$script:MachineEnvironmentSubKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
 $automaticArguments = @(Get-Variable -Name args -ValueOnly -ErrorAction SilentlyContinue)
 $script:UnexpectedArguments = @(@($UnexpectedArguments) + $automaticArguments | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
 
@@ -139,9 +145,25 @@ function Get-SettingAdvisory($Setting) {
     # A caveat that Dingo cannot fix by writing the setting. Dingo still applies
     # the value, because it takes effect if the VM is later joined to a domain
     # or enrolled, but the operator is told plainly that it does nothing today.
-    if (-not $Setting.Requirements.ContainsKey('ManagedDevice')) { return '' }
-    if (Test-DeviceIsManaged) { return '' }
-    return 'Edge blocks this policy because this device is not joined to a domain or Entra ID and is not enrolled in Intune. Dingo writes and verifies the value, but Edge ignores it. Set the search engine by hand at edge://settings/searchEngines, or apply this on a managed image.'
+    if ($Setting.Requirements.ContainsKey('ManagedDevice')) {
+        if (-not (Test-DeviceIsManaged)) {
+            return 'Edge blocks this policy because this device is not joined to a domain or Entra ID and is not enrolled in Intune. Dingo writes and verifies the value, but Edge ignores it. Set the search engine by hand at edge://settings/searchEngines, or apply this on a managed image.'
+        }
+    }
+    # A tool can install perfectly and still not start, because something it
+    # depends on is absent. Say so rather than reporting an unqualified success.
+    if ($Setting.Requirements.ContainsKey('RequiredTools')) {
+        $missing = New-Object System.Collections.ArrayList
+        foreach ($requiredId in @($Setting.Requirements['RequiredTools'])) {
+            $required = @(Get-ToolCatalog | Where-Object Id -eq $requiredId)[0]
+            if (-not $required) { [void]$missing.Add($requiredId); continue }
+            if (-not (Find-InstalledTool $required)) { [void]$missing.Add($required.Name) }
+        }
+        if ($missing.Count) {
+            return "This tool needs $($missing -join ' and '), which is not installed. Tick that card as well, or the tool will not start."
+        }
+    }
+    return ''
 }
 
 function Initialize-Log {
@@ -402,6 +424,20 @@ function ConvertTo-ToolDefinition($Raw) {
     }
     if (-not $rules.Count) { throw "Tool '$id' has no detect rules, so Dingo could never tell whether it is installed." }
 
+    # A tool may offer command-line programs. Dingo writes one launcher per
+    # program into a single folder, so only that folder goes on the PATH.
+    $shims = $null
+    $rawShims = Get-JsonField $Raw 'shims' $null
+    if ($rawShims) {
+        $from = [string](Get-JsonField $rawShims 'from' '')
+        if ([string]::IsNullOrWhiteSpace($from)) { throw "Tool '$id' has a shims block with no 'from' folder." }
+        $shims = [PSCustomObject]@{
+            From = $from
+            Pattern = [string](Get-JsonField $rawShims 'pattern' '*.exe')
+            Recurse = [bool](Get-JsonField $rawShims 'recurse' $true)
+        }
+    }
+
     [PSCustomObject]@{
         Id = $id
         Name = $name
@@ -414,6 +450,8 @@ function ConvertTo-ToolDefinition($Raw) {
         Url = $url
         Dest = $dest
         Arguments = @(Get-JsonField $install 'arguments' @())
+        Shims = $shims
+        Requires = @(Get-JsonField $Raw 'requires' @())
         TimeoutSeconds = ($timeoutMinutes * 60)
         Detect = @($rules)
     }
@@ -449,8 +487,18 @@ function Get-BuiltInToolCatalog {
             )
         },
         [PSCustomObject]@{
+            # Listed before the tools that need it, because the elevated worker
+            # applies the plan in catalog order.
+            id='tool-dotnet-desktop-9'; name='.NET 9 Desktop Runtime'; category='Forensics'
+            description="Eric Zimmerman's tools are built on .NET 9, which a fresh Windows 11 install does not include. Without this they fail to start with 'You must install .NET to run this application'."
+            install=[PSCustomObject]@{ kind='winget'; package='Microsoft.DotNet.DesktopRuntime.9'; scope='machine' }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='C:/Program Files/dotnet/shared/Microsoft.WindowsDesktop.App/9.*' }
+            )
+        },
+        [PSCustomObject]@{
             id='tool-eztools'; name="Eric Zimmerman's tools"; category='Forensics'
-            description='The full DFIR tool set, including Timeline Explorer, Registry Explorer, EvtxECmd, and RECmd. Installed with the author''s own Get-ZimmermanTools script.'
+            description='The full DFIR tool set, including Timeline Explorer, Registry Explorer, EvtxECmd, and RECmd. Installed with the author''s own Get-ZimmermanTools script. Needs the .NET 9 Desktop Runtime, which is the card above.'
             install=[PSCustomObject]@{
                 kind='script'; scope='machine'
                 url='https://raw.githubusercontent.com/EricZimmerman/Get-ZimmermanTools/master/Get-ZimmermanTools.ps1'
@@ -458,6 +506,8 @@ function Get-BuiltInToolCatalog {
                 arguments=@('-NetVersion','9')
                 timeoutMinutes=45
             }
+            shims=[PSCustomObject]@{ from='C:/DFIR/Tools/EZTools/net9'; pattern='*.exe'; recurse=$true }
+            requires=@('tool-dotnet-desktop-9')
             # Detect on the two GUI tools, not on a command-line one. A partial
             # copy of the command-line tools is common, and it would otherwise
             # be reported as a complete install. Either GUI tool proves a full run.
@@ -481,6 +531,7 @@ function Get-BuiltInToolCatalog {
 function Get-ToolCatalogPath { Join-Path $PSScriptRoot 'Tools.json' }
 
 function Get-ToolCatalog {
+    if ($null -ne $script:ToolCatalogCache) { return $script:ToolCatalogCache }
     $problems = New-Object System.Collections.ArrayList
     $map = New-Object System.Collections.Specialized.OrderedDictionary
     foreach ($raw in (Get-BuiltInToolCatalog)) {
@@ -509,7 +560,8 @@ function Get-ToolCatalog {
     }
     foreach ($problem in $problems) { Write-Log 'WARN' "Tool catalog: $problem" }
     $script:ToolCatalogWarning = if ($problems.Count) { "Dingo ignored part of Tools.json. $($problems -join ' ')" } else { '' }
-    return @($map.Values)
+    $script:ToolCatalogCache = @($map.Values)
+    return $script:ToolCatalogCache
 }
 
 function Get-WingetPath {
@@ -553,7 +605,18 @@ function Find-InstalledTool($Tool) {
             if ($entry) { return [PSCustomObject]@{ Version=$entry.Version; Evidence="Windows lists it as '$($entry.Name)'." } }
         } elseif ($rule.Kind -eq 'file') {
             $path = [Environment]::ExpandEnvironmentVariables($rule.Path)
-            if (Test-Path -LiteralPath $path -PathType Leaf) {
+            if ($path.Contains('*') -or $path.Contains('?')) {
+                # A wildcard lets a rule match a versioned folder, such as the
+                # .NET runtime, whose exact patch number is not known in advance.
+                $matches = @(Get-Item -Path $path -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+                if ($matches.Count) {
+                    $item = $matches[0]
+                    $version = if ($item.PSIsContainer) { $item.Name } else {
+                        try { [string]$item.VersionInfo.ProductVersion } catch { '' }
+                    }
+                    return [PSCustomObject]@{ Version=$version; Evidence="Found $($item.FullName)." }
+                }
+            } elseif (Test-Path -LiteralPath $path -PathType Leaf) {
                 $version = ''
                 try { $version = [string](Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo.ProductVersion } catch { $version = '' }
                 return [PSCustomObject]@{ Version=$version; Evidence="Found $path." }
@@ -646,6 +709,177 @@ function Install-ScriptPackage($Tool) {
     } finally {
         Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Send-EnvironmentChange {
+    if (-not ('Dingo.NativeMethods' -as [type])) { Send-InternationalSettingChange | Out-Null }
+    $result = [IntPtr]::Zero
+    # WM_SETTINGCHANGE with 'Environment' tells running programs to reread PATH.
+    # Already-open windows keep the old value until they are restarted.
+    [void][Dingo.NativeMethods]::SendMessageTimeout([IntPtr]0xffff,0x001A,[IntPtr]::Zero,'Environment',2,5000,[ref]$result)
+}
+
+function Get-MachinePathValue {
+    $key = Get-Item -LiteralPath "HKLM:\$script:MachineEnvironmentSubKey" -ErrorAction Stop
+    # Read the raw value. Expanding it would bake entries such as
+    # %USERPROFILE%\go\bin into one account's literal path when written back.
+    return [string]$key.GetValue('Path','',[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+}
+
+function Set-MachinePathValue([string]$Value) {
+    if (-not (Test-IsAdministrator)) { throw 'Changing the computer PATH requires elevation.' }
+    if ([string]::IsNullOrWhiteSpace($Value)) { throw 'Refusing to write an empty computer PATH.' }
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($script:MachineEnvironmentSubKey, $true)
+    if (-not $key) { throw 'Could not open the computer environment key for writing.' }
+    try { $key.SetValue('Path', $Value, [Microsoft.Win32.RegistryValueKind]::ExpandString) }
+    finally { $key.Close() }
+}
+
+function Split-PathValue([string]$PathValue) {
+    return @(($PathValue -split ';') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+}
+
+function Test-PathContainsFolder([string]$PathValue, [string]$Folder) {
+    $target = $Folder.TrimEnd('\')
+    foreach ($part in (Split-PathValue $PathValue)) {
+        if ($part.TrimEnd('\') -eq $target) { return $true }
+    }
+    return $false
+}
+
+# The two functions below do the string work only. Keeping them free of registry
+# access is what lets the self-test prove PATH is never damaged.
+function Add-FolderToPathValue([string]$PathValue, [string]$Folder) {
+    if (Test-PathContainsFolder $PathValue $Folder) { return $PathValue }
+    # Append rather than prepend, so a tool can never shadow a Windows command.
+    if ([string]::IsNullOrWhiteSpace($PathValue)) { return $Folder }
+    return ($PathValue.TrimEnd(';') + ';' + $Folder)
+}
+
+function Remove-FolderFromPathValue([string]$PathValue, [string]$Folder) {
+    $target = $Folder.TrimEnd('\')
+    return (@(Split-PathValue $PathValue | Where-Object { $_.TrimEnd('\') -ne $target }) -join ';')
+}
+
+function Add-FolderToMachinePath([string]$Folder) {
+    $current = Get-MachinePathValue
+    $updated = Add-FolderToPathValue $current $Folder
+    if ($updated -eq $current) { return $false }
+    Set-MachinePathValue $updated
+    Write-Log 'INFO' "Added '$Folder' to the computer PATH."
+    return $true
+}
+
+function Remove-FolderFromMachinePath([string]$Folder) {
+    $current = Get-MachinePathValue
+    if (-not (Test-PathContainsFolder $current $Folder)) { return $false }
+    Set-MachinePathValue (Remove-FolderFromPathValue $current $Folder)
+    Write-Log 'INFO' "Removed '$Folder' from the computer PATH."
+    return $true
+}
+
+function Get-ExpectedShims {
+    $shims = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach ($tool in (Get-ToolCatalog)) {
+        if (-not $tool.Shims) { continue }
+        $from = [Environment]::ExpandEnvironmentVariables($tool.Shims.From)
+        if (-not (Test-Path -LiteralPath $from -PathType Container)) { continue }
+        foreach ($file in @(Get-ChildItem -LiteralPath $from -Filter $tool.Shims.Pattern -File -Recurse:$tool.Shims.Recurse -ErrorAction SilentlyContinue)) {
+            $name = [IO.Path]::GetFileNameWithoutExtension($file.Name)
+            if ($shims.Contains($name)) {
+                Write-Log 'WARN' "Two tools both provide '$name'; keeping $($shims[$name])."
+                continue
+            }
+            $shims[$name] = $file.FullName
+        }
+    }
+    return $shims
+}
+
+function Get-DingoShimFiles {
+    if (-not (Test-Path -LiteralPath $script:ShimDirectory -PathType Container)) { return @() }
+    return @(Get-ChildItem -LiteralPath $script:ShimDirectory -Filter '*.cmd' -File -ErrorAction SilentlyContinue | Where-Object {
+        $content = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue
+        $content -and $content.Contains($script:ShimMarker)
+    })
+}
+
+function Test-ShimIsCurrent([string]$ShimPath, [string]$TargetPath) {
+    $content = Get-Content -LiteralPath $ShimPath -Raw -ErrorAction SilentlyContinue
+    if (-not $content -or -not $content.Contains($script:ShimMarker)) { return $false }
+    return $content.Contains('"' + $TargetPath + '"')
+}
+
+function Write-ToolShim([string]$Name, [string]$TargetPath) {
+    $shimPath = Join-Path $script:ShimDirectory "$Name.cmd"
+    $lines = @(
+        '@echo off',
+        $script:ShimMarker,
+        ('"{0}" %*' -f $TargetPath)
+    )
+    # cmd.exe reads .cmd files as ANSI, so do not write a UTF-8 byte order mark.
+    [IO.File]::WriteAllText($shimPath, (($lines -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    if (-not (Test-ShimIsCurrent $shimPath $TargetPath)) { throw "Verification failed for the launcher '$Name.cmd'." }
+}
+
+function Get-ToolPathKindState($Setting) {
+    $expected = Get-ExpectedShims
+    $onPath = Test-PathContainsFolder (Get-MachinePathValue) $script:ShimDirectory
+    $total = $expected.Count
+    $current = 0
+    foreach ($name in @($expected.Keys)) {
+        $shimPath = Join-Path $script:ShimDirectory "$name.cmd"
+        if ((Test-Path -LiteralPath $shimPath -PathType Leaf) -and (Test-ShimIsCurrent $shimPath $expected[$name])) { $current++ }
+    }
+    $stale = @(Get-DingoShimFiles).Count
+    if ($onPath -and $current -eq $total) {
+        $detail = if ($total) { "$total launchers in $script:ShimDirectory, and that folder is on the computer PATH." }
+                  else { "$script:ShimDirectory is on the computer PATH. No installed tool offers command-line programs yet." }
+        return (New-StateResult 'Preferred' $Setting.PreferredState $detail)
+    }
+    if (-not $onPath -and $stale -eq 0) {
+        return (New-StateResult 'Alternate' $Setting.AlternateState "$script:ShimDirectory is not on the computer PATH.")
+    }
+    $parts = New-Object System.Collections.ArrayList
+    [void]$parts.Add($(if ($onPath) { 'the folder is on the computer PATH' } else { 'the folder is not on the computer PATH' }))
+    [void]$parts.Add("$current of $total launchers are present and current")
+    return (New-StateResult 'Partial' 'Partly set up' (($parts -join ', ') + '.'))
+}
+
+function Set-ToolPathKindPart($Setting, [string]$DesiredState, [string]$Scope) {
+    if ($DesiredState -eq $Setting.PreferredState) {
+        if (-not (Test-Path -LiteralPath $script:ShimDirectory -PathType Container)) {
+            New-Item -ItemType Directory -Path $script:ShimDirectory -Force -ErrorAction Stop | Out-Null
+            Write-Log 'INFO' "Created $script:ShimDirectory."
+        }
+        $expected = Get-ExpectedShims
+        foreach ($name in @($expected.Keys)) { Write-ToolShim $name $expected[$name] }
+        # Drop launchers Dingo wrote for programs that are no longer installed.
+        foreach ($file in (Get-DingoShimFiles)) {
+            $name = [IO.Path]::GetFileNameWithoutExtension($file.Name)
+            if (-not $expected.Contains($name)) {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+                Write-Log 'INFO' "Removed the stale launcher '$($file.Name)'."
+            }
+        }
+        [void](Add-FolderToMachinePath $script:ShimDirectory)
+        if (-not (Test-PathContainsFolder (Get-MachinePathValue) $script:ShimDirectory)) {
+            throw "Verification failed: '$script:ShimDirectory' is not on the computer PATH."
+        }
+        Write-Log 'INFO' "Wrote $($expected.Count) launcher(s) into $script:ShimDirectory."
+    } else {
+        [void](Remove-FolderFromMachinePath $script:ShimDirectory)
+        if (Test-PathContainsFolder (Get-MachinePathValue) $script:ShimDirectory) {
+            throw "Verification failed: '$script:ShimDirectory' is still on the computer PATH."
+        }
+        foreach ($file in (Get-DingoShimFiles)) { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue }
+        # Leave the folder if anything Dingo did not write is still in it.
+        if ((Test-Path -LiteralPath $script:ShimDirectory -PathType Container) -and
+            -not @(Get-ChildItem -LiteralPath $script:ShimDirectory -Force -ErrorAction SilentlyContinue).Count) {
+            Remove-Item -LiteralPath $script:ShimDirectory -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Send-EnvironmentChange
 }
 
 function Get-PackageKindState($Setting) {
@@ -825,8 +1059,13 @@ function Get-Settings {
     # add more of them later without a code change.
     foreach ($tool in (Get-ToolCatalog)) {
         [void]$settings.Add((New-Setting $tool.Id $tool.Category $tool.Name $tool.Description 'Installed' $null 'Package' @($tool) $false $false `
-            @{ WingetRequired = ($tool.InstallKind -eq 'winget') } 'Tools' 'Not installed'))
+            @{ WingetRequired = ($tool.InstallKind -eq 'winget'); RequiredTools = @($tool.Requires) } 'Tools' 'Not installed'))
     }
+    # Added last on purpose. The elevated worker runs the plan in this order, so
+    # the launchers are written after the tools they point at are installed.
+    [void]$settings.Add((New-Setting 'tools-on-path' 'Tools' 'Run tools from anywhere' `
+        "Puts one small launcher for each installed command-line tool into $script:ShimDirectory, then adds that single folder to the computer PATH. You can then type EvtxECmd from any folder. The folder is added at the end of the PATH, so a tool can never shadow a Windows command." `
+        'On the PATH' 'Not on the PATH' 'ToolPath' @() $false $false @{} 'Tools'))
     return ,$settings
 }
 
@@ -1537,6 +1776,7 @@ function Initialize-SettingHandlers {
         $tool = @($entries)[0]
         @(if ($tool -and $tool.Scope -eq 'user') { 'User' } else { 'Machine' })
     } 'Get-PackageKindState' 'Set-PackageKindPart'
+    Register-SettingHandler 'ToolPath' { param($entries) @('Machine') } 'Get-ToolPathKindState' 'Set-ToolPathKindPart'
     Register-SettingHandler 'Terminal' { param($entries) @('User') } 'Get-TerminalKindState' 'Set-TerminalKindPart'
     Register-SettingHandler 'WidgetsPackage' { param($entries) @('User') } 'Get-WidgetsKindState' 'Set-WidgetsKindPart' @{ User=@('Get-AppxPackage','Remove-AppxPackage') }
 }
@@ -1657,7 +1897,7 @@ if ($FinalizeInternationalSettings) {
 
 if ($SelfTest) {
     # Tools.json may add tools, so the total is the fixed settings plus the catalog.
-    $expectedSettingCount = 27 + @(Get-ToolCatalog).Count
+    $expectedSettingCount = 28 + @(Get-ToolCatalog).Count
     if ($script:Settings.Count -ne $expectedSettingCount) { throw "Expected $expectedSettingCount settings, found $($script:Settings.Count)." }
     foreach ($workerHelper in @('Test-DisplayLanguagePackInstalled','Install-DisplayLanguagePack','Write-Utf8FileAtomically','New-ApplyResult','New-OperationComponent')) {
         if (-not (Get-Command $workerHelper -CommandType Function -ErrorAction SilentlyContinue)) { throw "Elevated-worker helper is unavailable: $workerHelper" }
@@ -1674,7 +1914,7 @@ if ($SelfTest) {
     if ($launcherAst.Extent.Text -notmatch '-ElevationBroker' -or $launcherAst.Extent.Text -match '-Verb\s+RunAs') { throw 'The WPF launcher must delegate UAC to the non-WPF elevation broker.' }
     $duplicates = $script:Settings | Group-Object Id | Where-Object Count -gt 1
     if ($duplicates) { throw "Duplicate IDs: $($duplicates.Name -join ', ')" }
-    if ($script:SettingHandlers.Count -ne 7) { throw "Expected 7 setting handlers, found $($script:SettingHandlers.Count)." }
+    if ($script:SettingHandlers.Count -ne 8) { throw "Expected 8 setting handlers, found $($script:SettingHandlers.Count)." }
     foreach ($setting in $script:Settings) { [void](Get-SettingHandler $setting.Kind) }
     foreach ($dispatcherName in @('Get-SettingState','Set-SettingPart')) {
         $dispatcherAst = $selfTestAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $dispatcherName },$true)
@@ -1707,6 +1947,22 @@ if ($SelfTest) {
     $guiApplyAst = $selfTestAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Complete-ApplyChanges' },$true)
     $sharedApplyCall = if ($guiApplyAst) { $guiApplyAst.Find({ param($node) $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Invoke-SettingChange' },$true) } else { $null }
     if (-not $sharedApplyCall) { throw 'The GUI is not using the shared setting-application core.' }
+    # Every self-test must stay runnable where all processes are elevated, such as
+    # Windows Sandbox. Only the real GUI is refused there.
+    # Match on the condition, not the body. Searching the body would find this
+    # self-test block itself, because the message text appears here too.
+    $allConditions = @($selfTestAst.FindAll({ param($node) $node -is [Management.Automation.Language.IfStatementAst] },$true) |
+        ForEach-Object { $_.Clauses[0].Item1.Extent.Text })
+    $guardCondition = @($allConditions | Where-Object { $_ -match 'Test-IsAdministrator' -and $_ -match 'UiSelfTest' })
+    if ($guardCondition.Count -ne 1 -or $guardCondition[0] -notmatch '-not\s+\$UiSelfTest') {
+        throw 'The elevated-start guard must let the UI self-test through.'
+    }
+    # A dry run makes no changes, so it must stay usable where every process is
+    # elevated. Only real changes are refused there.
+    $dryRunGuard = @($allConditions | Where-Object { $_ -match 'Test-IsAdministrator' -and $_ -match 'WhatIf' })
+    if ($dryRunGuard.Count -ne 1 -or $dryRunGuard[0] -notmatch '-not\s+\$WhatIf') {
+        throw 'The elevated-start guard must let a dry run through.'
+    }
     $launcherPath = Join-Path $PSScriptRoot 'Start-Dingo.cmd'
     if (-not (Test-Path -LiteralPath $launcherPath) -or (Get-Content -LiteralPath $launcherPath -Raw) -notmatch '%\*') { throw 'Start-Dingo.cmd does not forward command-line arguments.' }
     $updateSetting = $script:Settings | Where-Object Id -eq 'windows-update-continuity'
@@ -1839,15 +2095,27 @@ if ($SelfTest) {
         $script:DeviceIsManaged = $true
         if (Get-SettingAdvisory $advisoryMock) { throw 'A managed device must produce no caveat.' }
         $script:DeviceIsManaged = $false
-        foreach ($shipped in $script:Settings) {
+        # A tool caveat depends on what this machine has installed, so those are
+        # checked separately below rather than asserted to be absent.
+        foreach ($shipped in @($script:Settings | Where-Object { -not $_.Requirements.ContainsKey('RequiredTools') -or -not @($_.Requirements['RequiredTools']).Count })) {
             if (Get-SettingAdvisory $shipped) { throw "Setting '$($shipped.Id)' carries an unexpected caveat." }
         }
+        # A tool that needs another tool must say so when that one is absent, and
+        # must stay silent when it is present. Neither may fail preflight.
+        $dependentMock = ($script:Settings | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1).PSObject.Copy()
+        $dependentMock.Requirements = @{ RequiredTools = @('tool-definitely-not-in-the-catalog') }
+        if ((Get-SettingAdvisory $dependentMock) -notmatch 'will not start') { throw 'A tool with a missing dependency must produce a caveat.' }
+        if (-not (Test-SettingPreflight $dependentMock).Available) { throw 'A dependency caveat must never fail preflight.' }
+        $dependentMock.Requirements = @{ RequiredTools = @() }
+        if (Get-SettingAdvisory $dependentMock) { throw 'A tool with no dependencies must produce no caveat.' }
+        $ezRequires = @(($script:Settings | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1).Requirements['RequiredTools'])
+        if ($ezRequires -notcontains 'tool-dotnet-desktop-9') { throw "Eric Zimmerman's tools must declare the .NET runtime they need." }
     } finally {
         $script:DeviceIsManaged = $savedManagedState
     }
     # Tool cards are one-way on purpose: Dingo installs, and never uninstalls.
     $builtInTools = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
-    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools')) {
+    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9')) {
         if (@($builtInTools | Where-Object Id -eq $expectedId).Count -ne 1) { throw "The built-in tool catalog is missing '$expectedId'." }
     }
     $toolSettings = @($script:Settings | Where-Object Kind -eq 'Package')
@@ -1905,8 +2173,72 @@ if ($SelfTest) {
     $ezSetting = $script:Settings | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1
     if (-not $ezSetting.RequiresAdmin) { throw 'The Eric Zimmerman tool set must request administrator approval.' }
     if ([bool]$ezSetting.Requirements['WingetRequired']) { throw 'A script install must not be blocked by a missing winget.' }
+    # Eric Zimmerman's tools will not start without the .NET 9 Desktop Runtime,
+    # and a fresh Windows 11 install does not have it. It must be offered, and it
+    # must be installed first, because the worker applies the plan in this order.
+    $runtimeIndex = [array]::IndexOf(@($builtInTools | ForEach-Object { $_.Id }), 'tool-dotnet-desktop-9')
+    $ezIndex = [array]::IndexOf(@($builtInTools | ForEach-Object { $_.Id }), 'tool-eztools')
+    if ($runtimeIndex -lt 0 -or $ezIndex -lt 0 -or $runtimeIndex -gt $ezIndex) {
+        throw 'The .NET runtime must be listed before the tools that need it.'
+    }
     $missingTool = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-absent'; name='Absent'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='file'; path='%ProgramFiles%\Dingo-Definitely-Absent\x.exe' }) })
     if (Find-InstalledTool $missingTool) { throw 'Tool detection reported a missing tool as installed.' }
+    # A wildcard rule must match a versioned folder and report its name as the version.
+    $wildcardTool = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-wildcard'; name='Wildcard'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='file'; path='C:/Windows/Dingo-Definitely-Absent-*' }) })
+    if (Find-InstalledTool $wildcardTool) { throw 'A wildcard rule matched a folder that does not exist.' }
+    $wildcardHit = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-wildcard2'; name='Wildcard'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='file'; path='C:/Windows/Microsoft.NET/Frame*' }) })
+    $wildcardFound = Find-InstalledTool $wildcardHit
+    if (-not $wildcardFound -or -not $wildcardFound.Version) { throw 'A wildcard rule did not match a folder that does exist.' }
+    # PATH damage is the worst thing this tool could do, so prove the string
+    # handling on a stand-in value before it is ever written to the registry.
+    $pathSetting = $script:Settings | Where-Object Id -eq 'tools-on-path' | Select-Object -First 1
+    if (-not $pathSetting) { throw 'The command-line access setting is missing.' }
+    if ($pathSetting.Tab -ne 'Tools' -or -not $pathSetting.RequiresAdmin -or -not $pathSetting.CanChoose) {
+        throw 'Command-line access must be a reversible Tools card that requests administrator approval.'
+    }
+    if ($script:Settings[-1].Id -ne 'tools-on-path') {
+        throw 'Command-line access must be applied last, after the tools its launchers point at.'
+    }
+    $samplePath = 'C:\Windows\system32;%USERPROFILE%\go\bin;C:\Program Files\Git\cmd'
+    if (@(Split-PathValue "$samplePath;;  ;").Count -ne 3) { throw 'Empty PATH entries must be dropped.' }
+    if ((Split-PathValue $samplePath)[1] -ne '%USERPROFILE%\go\bin') { throw 'PATH entries must not be expanded.' }
+    foreach ($variant in @('C:\DFIR\Tools\bin','c:\dfir\tools\bin','C:\DFIR\Tools\bin\')) {
+        if (-not (Test-PathContainsFolder "$samplePath;C:\DFIR\Tools\bin" $variant)) { throw "PATH matching failed for '$variant'." }
+    }
+    if (Test-PathContainsFolder $samplePath 'C:\DFIR\Tools\bin') { throw 'PATH matching reported a folder that is absent.' }
+    $added = Add-FolderToPathValue $samplePath 'C:\DFIR\Tools\bin'
+    if ($added -ne "$samplePath;C:\DFIR\Tools\bin") { throw 'Adding to PATH must append one entry to the end.' }
+    if ((Add-FolderToPathValue $added 'C:\DFIR\Tools\bin') -ne $added) { throw 'Adding to PATH twice must change nothing.' }
+    if ((Remove-FolderFromPathValue $added 'C:\DFIR\Tools\bin') -ne $samplePath) { throw 'Removing from PATH must restore the original value.' }
+    if ((Remove-FolderFromPathValue $samplePath 'C:\DFIR\Tools\bin') -ne $samplePath) { throw 'Removing an absent folder must change nothing.' }
+    $emptyRejected = $false
+    try { Set-MachinePathValue '  ' } catch { $emptyRejected = $true }
+    if (-not $emptyRejected) { throw 'Writing an empty computer PATH must be refused.' }
+    # Launchers: written correctly, recognised again, and never deleting a file
+    # somebody else put in the same folder.
+    $shimTestDirectory = Join-Path $env:TEMP ("Dingo-shim-test-{0}" -f [Guid]::NewGuid().ToString('N'))
+    $savedShimDirectory = $script:ShimDirectory
+    try {
+        $script:ShimDirectory = $shimTestDirectory
+        New-Item -ItemType Directory -Path $shimTestDirectory -Force | Out-Null
+        $foreignPath = Join-Path $shimTestDirectory 'mine.cmd'
+        [IO.File]::WriteAllText($foreignPath, "@echo off`r`necho hand written`r`n", (New-Object Text.UTF8Encoding($false)))
+        Write-ToolShim 'EvtxECmd' 'C:\DFIR\Tools\EZTools\net9\EvtxeCmd\EvtxECmd.exe'
+        $shimPath = Join-Path $shimTestDirectory 'EvtxECmd.cmd'
+        $shimText = Get-Content -LiteralPath $shimPath -Raw
+        $expectedCall = '"C:\DFIR\Tools\EZTools\net9\EvtxeCmd\EvtxECmd.exe" %*'
+        if (-not $shimText.Contains($expectedCall)) { throw 'The launcher does not call its program with the supplied arguments.' }
+        if ([IO.File]::ReadAllBytes($shimPath)[0] -eq 0xEF) { throw 'A launcher must not start with a byte order mark; cmd.exe would choke on it.' }
+        if (-not (Test-ShimIsCurrent $shimPath 'C:\DFIR\Tools\EZTools\net9\EvtxeCmd\EvtxECmd.exe')) { throw 'A freshly written launcher was not recognised.' }
+        if (Test-ShimIsCurrent $shimPath 'C:\Somewhere\Else.exe') { throw 'A launcher pointing elsewhere was treated as current.' }
+        if (Test-ShimIsCurrent $foreignPath 'C:\anything.exe') { throw 'A hand-written file must never be treated as a Dingo launcher.' }
+        $owned = @(Get-DingoShimFiles | Select-Object -ExpandProperty Name)
+        if ($owned.Count -ne 1 -or $owned[0] -ne 'EvtxECmd.cmd') { throw "Dingo claimed the wrong launcher files: $($owned -join ', ')" }
+        if (-not (Test-Path -LiteralPath $foreignPath)) { throw 'The hand-written file disappeared.' }
+    } finally {
+        $script:ShimDirectory = $savedShimDirectory
+        Remove-Item -LiteralPath $shimTestDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
     $toggleCount = @($script:Settings | Where-Object CanChoose).Count
     if ($toggleCount -lt 20) { throw "Expected at least 20 reversible settings, found $toggleCount." }
     "Self-test passed: $($script:Settings.Count) settings; $toggleCount reversible; $($toolSettings.Count) tools."
@@ -1945,9 +2277,15 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
         Write-CliErrorResponse 'Use -ApplyPreferred to make changes, or -WhatIf to preview them.' 2
         exit 2
     }
-    if (Test-IsAdministrator) {
-        Write-CliErrorResponse 'Start Dingo from the signed-in desktop account, not from an elevated PowerShell window. Dingo will request administrator approval only for settings that need it.' 2 $(if ($WhatIf) { 'WhatIf' } else { 'ApplyPreferred' })
+    # A dry run changes nothing, so it stays available where every process is
+    # elevated, such as Windows Sandbox. Only real changes are refused.
+    if ((Test-IsAdministrator) -and -not $WhatIf) {
+        Write-CliErrorResponse 'Start Dingo from the signed-in desktop account, not from an elevated PowerShell window. Dingo will request administrator approval only for settings that need it.' 2 'ApplyPreferred'
         exit 2
+    }
+    $elevatedDryRun = [bool]((Test-IsAdministrator) -and $WhatIf)
+    if ($elevatedDryRun) {
+        Write-CliStatus 'Note: this dry run is elevated, so account settings are read from the elevated account. That is the same account under UAC, but not if you elevated as somebody else.'
     }
     if (-not (Enter-DingoSingleInstance)) {
         Write-CliErrorResponse 'Dingo is already running for this Windows account.' 3 $(if ($WhatIf) { 'WhatIf' } else { 'ApplyPreferred' })
@@ -1977,7 +2315,7 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             $exitCode = if ($blocked) { 2 } else { 0 }
             if ($OutputFormat -eq 'Json') {
                 [Console]::Out.WriteLine((ConvertTo-Json -InputObject ([PSCustomObject]@{
-                    Version=$script:DingoVersion; Mode='WhatIf'; Success=(-not [bool]$blocked); ExitCode=$exitCode; Changed=$false; Plan=$plan
+                    Version=$script:DingoVersion; Mode='WhatIf'; Success=(-not [bool]$blocked); ExitCode=$exitCode; Changed=$false; Elevated=$elevatedDryRun; Plan=$plan
                 }) -Depth 7))
             } else {
                 Write-CliStatus "Dingo dry run: $($selected.Count) preferred setting(s) would be applied. No changes were made."
@@ -2038,7 +2376,10 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
     exit $exitCode
 }
 
-if (Test-IsAdministrator) {
+# The UI self-test builds the window, checks it, and closes it without changing
+# anything, so it must stay runnable where every process is elevated, such as
+# Windows Sandbox. The other self-tests already run before this guard.
+if ((Test-IsAdministrator) -and -not $UiSelfTest) {
     Add-Type -AssemblyName PresentationFramework
     $message = @(
         'Dingo was started as an administrator. Close this window and start it normally.',
