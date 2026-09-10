@@ -41,7 +41,7 @@ $script:LanguageChangePending = $false
 $script:InstanceMutex = $null
 $script:PendingApply = $null
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.5.4'
+$script:DingoVersion = '0.5.5'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $automaticArguments = @(Get-Variable -Name args -ValueOnly -ErrorAction SilentlyContinue)
@@ -372,11 +372,22 @@ function ConvertTo-ToolDefinition($Raw) {
 
     $install = Get-JsonField $Raw 'install' $null
     $installKind = [string](Get-JsonField $install 'kind' 'winget')
-    if ($installKind -notin @('winget')) { throw "Tool '$id' uses install kind '$installKind', which this version of Dingo cannot run." }
+    if ($installKind -notin @('winget','script')) { throw "Tool '$id' uses install kind '$installKind', which this version of Dingo cannot run." }
     $package = [string](Get-JsonField $install 'package' '')
-    if ([string]::IsNullOrWhiteSpace($package)) { throw "Tool '$id' has no winget package id." }
+    $url = [string](Get-JsonField $install 'url' '')
+    $dest = [string](Get-JsonField $install 'dest' '')
+    if ($installKind -eq 'winget') {
+        if ([string]::IsNullOrWhiteSpace($package)) { throw "Tool '$id' has no winget package id." }
+    } else {
+        # A downloaded installer script runs with administrator rights, so refuse
+        # anything that is not fetched over TLS from a named host.
+        if ($url -notmatch '^https://[^/\s]+/\S+$') { throw "Tool '$id' needs an https:// url for its install script." }
+        if ([string]::IsNullOrWhiteSpace($dest)) { throw "Tool '$id' needs a dest folder for its install script." }
+    }
     $scope = [string](Get-JsonField $install 'scope' 'machine')
     if ($scope -notin @('machine','user')) { throw "Tool '$id' has scope '$scope'; use 'machine' or 'user'." }
+    $timeoutMinutes = [int](Get-JsonField $install 'timeoutMinutes' $(if ($installKind -eq 'script') { 45 } else { 15 }))
+    if ($timeoutMinutes -lt 1 -or $timeoutMinutes -gt 240) { throw "Tool '$id' has a timeout of $timeoutMinutes minutes; use 1 to 240." }
 
     $rules = New-Object System.Collections.ArrayList
     foreach ($rawRule in @(Get-JsonField $Raw 'detect' @())) {
@@ -400,6 +411,10 @@ function ConvertTo-ToolDefinition($Raw) {
         Package = $package
         Source = [string](Get-JsonField $install 'source' 'winget')
         Scope = $scope
+        Url = $url
+        Dest = $dest
+        Arguments = @(Get-JsonField $install 'arguments' @())
+        TimeoutSeconds = ($timeoutMinutes * 60)
         Detect = @($rules)
     }
 }
@@ -431,6 +446,24 @@ function Get-BuiltInToolCatalog {
             detect=@(
                 [PSCustomObject]@{ kind='uninstall-key'; match='RipGrep*' },
                 [PSCustomObject]@{ kind='command'; command='rg.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-eztools'; name="Eric Zimmerman's tools"; category='Forensics'
+            description='The full DFIR tool set, including Timeline Explorer, Registry Explorer, EvtxECmd, and RECmd. Installed with the author''s own Get-ZimmermanTools script.'
+            install=[PSCustomObject]@{
+                kind='script'; scope='machine'
+                url='https://raw.githubusercontent.com/EricZimmerman/Get-ZimmermanTools/master/Get-ZimmermanTools.ps1'
+                dest='C:\DFIR\Tools\EZTools'
+                arguments=@('-NetVersion','9')
+                timeoutMinutes=45
+            }
+            # Detect on the two GUI tools, not on a command-line one. A partial
+            # copy of the command-line tools is common, and it would otherwise
+            # be reported as a complete install. Either GUI tool proves a full run.
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='C:/DFIR/Tools/EZTools/net9/TimelineExplorer/TimelineExplorer.exe' },
+                [PSCustomObject]@{ kind='file'; path='C:/DFIR/Tools/EZTools/net9/RegistryExplorer/RegistryExplorer.exe' }
             )
         },
         [PSCustomObject]@{
@@ -533,7 +566,8 @@ function Find-InstalledTool($Tool) {
     return $null
 }
 
-function Install-WingetPackage($Tool, [int]$TimeoutSeconds = 900) {
+function Install-WingetPackage($Tool) {
+    $TimeoutSeconds = $Tool.TimeoutSeconds
     $winget = Get-WingetPath
     if (-not $winget) { throw 'winget is not available on this computer, so Dingo cannot install anything.' }
     $arguments = @(
@@ -541,12 +575,25 @@ function Install-WingetPackage($Tool, [int]$TimeoutSeconds = 900) {
         '--accept-package-agreements','--accept-source-agreements','--disable-interactivity','--silent'
     )
     Write-Log 'INFO' "Installing $($Tool.Name): winget $($arguments -join ' ')"
+    $run = Invoke-ChildProcess $winget $arguments $TimeoutSeconds "The winget install of $($Tool.Package)"
+    Write-Log 'DEBUG' "winget exit code $($run.ExitCode) for $($Tool.Package): $($run.Output)"
+    # The package is already present and there is nothing newer. Dingo asked for
+    # the tool to be installed, and it is, so that is a success.
+    if ($run.ExitCode -eq -1978335189) {
+        Write-Log 'INFO' "$($Tool.Name) was already installed and is up to date."
+        return
+    }
+    if ($run.ExitCode -ne 0) {
+        throw "winget exited with code $($run.ExitCode) for $($Tool.Package). $(Get-OutputTail $run.Output)"
+    }
+}
+
+function Invoke-ChildProcess([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label) {
     # Start-Process -PassThru does not keep the process handle, so its ExitCode
-    # stays empty and a successful install would look like a failure. Owning the
-    # handle here gives both a reliable exit code and a working timeout.
+    # stays empty and a success would look like a failure. Own the handle here.
     $startInfo = New-Object Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $winget
-    $startInfo.Arguments = (@($arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' ')
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = (@($Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' ')
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
@@ -558,24 +605,46 @@ function Install-WingetPackage($Tool, [int]$TimeoutSeconds = 900) {
         $standardOutput = $process.StandardOutput.ReadToEndAsync()
         $standardError = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            try { $process.Kill() } catch { Write-Log 'WARN' "Could not stop the winget process for $($Tool.Package)." }
-            throw "winget did not finish installing $($Tool.Name) within $([math]::Round($TimeoutSeconds / 60)) minutes."
+            try { $process.Kill() } catch { Write-Log 'WARN' "Could not stop the $Label process." }
+            throw "$Label did not finish within $([math]::Round($TimeoutSeconds / 60)) minutes."
         }
-        $exitCode = $process.ExitCode
         $output = (([string]$standardOutput.Result + ' ' + [string]$standardError.Result) -replace '\s+',' ').Trim()
-        Write-Log 'DEBUG' "winget exit code $exitCode for $($Tool.Package): $output"
-        # 0x8A150014: the package is already present and there is nothing newer.
-        # Dingo asked for the tool to be installed, and it is, so that is a success.
-        if ($exitCode -eq -1978335189) {
-            Write-Log 'INFO' "$($Tool.Name) was already installed and is up to date."
-            return
-        }
-        if ($exitCode -ne 0) {
-            $tail = if ($output.Length -gt 300) { $output.Substring($output.Length - 300) } else { $output }
-            throw "winget exited with code $exitCode for $($Tool.Package). $tail"
-        }
+        return [PSCustomObject]@{ ExitCode = $process.ExitCode; Output = $output }
     } finally {
         if ($process) { $process.Dispose() }
+    }
+}
+
+function Get-OutputTail([string]$Text, [int]$Length = 300) {
+    if ($Text.Length -gt $Length) { return $Text.Substring($Text.Length - $Length) }
+    return $Text
+}
+
+function Install-ScriptPackage($Tool) {
+    if ($Tool.Url -notmatch '^https://') { throw "The install script for $($Tool.Name) must be fetched over https." }
+    $scriptPath = Join-Path $env:TEMP ("Dingo-installer-{0}.ps1" -f [Guid]::NewGuid().ToString('N'))
+    try {
+        # Windows PowerShell 5.1 can still default to an older protocol.
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Write-Log 'INFO' "Downloading the $($Tool.Name) install script from $($Tool.Url)."
+        Invoke-WebRequest -Uri $Tool.Url -OutFile $scriptPath -UseBasicParsing -ErrorAction Stop
+        # Record what was actually executed, so a run can be audited afterwards.
+        $hash = (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        Write-Log 'INFO' "Install script SHA256 $hash for $($Tool.Name)."
+
+        if (-not (Test-Path -LiteralPath $Tool.Dest -PathType Container)) {
+            New-Item -ItemType Directory -Path $Tool.Dest -Force -ErrorAction Stop | Out-Null
+            Write-Log 'INFO' "Created $($Tool.Dest)."
+        }
+        $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-NonInteractive','-File',$scriptPath,'-Dest',$Tool.Dest) + @($Tool.Arguments)
+        Write-Log 'INFO' "Running the $($Tool.Name) install script into $($Tool.Dest)."
+        $run = Invoke-ChildProcess (Get-PowerShellHostPath) $arguments $Tool.TimeoutSeconds "The $($Tool.Name) install script"
+        Write-Log 'DEBUG' "Install script exit code $($run.ExitCode) for $($Tool.Name): $(Get-OutputTail $run.Output 2000)"
+        if ($run.ExitCode -ne 0) {
+            throw "The $($Tool.Name) install script exited with code $($run.ExitCode). $(Get-OutputTail $run.Output)"
+        }
+    } finally {
+        Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -592,8 +661,9 @@ function Get-PackageKindState($Setting) {
 function Set-PackageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     $tool = @($Setting.Entries)[0]
     if ($DesiredState -ne $Setting.PreferredState) { throw "Dingo installs $($tool.Name) but never removes it." }
-    if ($tool.InstallKind -ne 'winget') { throw "Install kind '$($tool.InstallKind)' is not supported in this version of Dingo." }
-    Install-WingetPackage $tool
+    if ($tool.InstallKind -eq 'winget') { Install-WingetPackage $tool }
+    elseif ($tool.InstallKind -eq 'script') { Install-ScriptPackage $tool }
+    else { throw "Install kind '$($tool.InstallKind)' is not supported in this version of Dingo." }
 }
 
 function Get-Settings {
@@ -1777,7 +1847,7 @@ if ($SelfTest) {
     }
     # Tool cards are one-way on purpose: Dingo installs, and never uninstalls.
     $builtInTools = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
-    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser')) {
+    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools')) {
         if (@($builtInTools | Where-Object Id -eq $expectedId).Count -ne 1) { throw "The built-in tool catalog is missing '$expectedId'." }
     }
     $toolSettings = @($script:Settings | Where-Object Kind -eq 'Package')
@@ -1807,7 +1877,15 @@ if ($SelfTest) {
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a'; kind='chocolatey' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a'; scope='everyone' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a' }; detect=@() },
-        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='guess' }) }
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='guess' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a'; timeoutMinutes=0 }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a'; timeoutMinutes=999 }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        # A downloaded installer script runs elevated, so plain http, a non-url,
+        # and a missing destination must all be refused.
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; url='http://example.com/a.ps1'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; url='file:///c:/a.ps1'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; url='https://example.com/a.ps1' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) }
     )) {
         $rejected = $false
         try { [void](ConvertTo-ToolDefinition $badTool) } catch { $rejected = $true }
@@ -1817,6 +1895,16 @@ if ($SelfTest) {
     $minimalTool = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-minimal'; name='Minimal'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='command'; command='cmd.exe' }) })
     if ($minimalTool.Scope -ne 'machine' -or $minimalTool.Source -ne 'winget' -or $minimalTool.Category -ne 'Tools') { throw 'Tool defaults are wrong.' }
     if (-not (Find-InstalledTool $minimalTool)) { throw 'Tool detection did not find cmd.exe on the PATH.' }
+    # Eric Zimmerman's tools are fetched by the author's own script, not by winget.
+    $ezTool = $builtInTools | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1
+    if ($ezTool.InstallKind -ne 'script') { throw 'The Eric Zimmerman tool set must use the script install kind.' }
+    if ($ezTool.Url -notmatch '^https://raw\.githubusercontent\.com/EricZimmerman/') { throw 'The Get-ZimmermanTools script must come from its own repository over https.' }
+    if ($ezTool.Dest -ne 'C:\DFIR\Tools\EZTools') { throw 'The Eric Zimmerman tool set must install to C:\DFIR\Tools\EZTools.' }
+    if ($ezTool.Scope -ne 'machine') { throw 'Writing to C:\DFIR needs administrator approval.' }
+    if ($ezTool.TimeoutSeconds -lt 1800) { throw 'The Eric Zimmerman download needs a long timeout.' }
+    $ezSetting = $script:Settings | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1
+    if (-not $ezSetting.RequiresAdmin) { throw 'The Eric Zimmerman tool set must request administrator approval.' }
+    if ([bool]$ezSetting.Requirements['WingetRequired']) { throw 'A script install must not be blocked by a missing winget.' }
     $missingTool = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-absent'; name='Absent'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='file'; path='%ProgramFiles%\Dingo-Definitely-Absent\x.exe' }) })
     if (Find-InstalledTool $missingTool) { throw 'Tool detection reported a missing tool as installed.' }
     $toggleCount = @($script:Settings | Where-Object CanChoose).Count
