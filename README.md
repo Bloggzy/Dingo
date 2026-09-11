@@ -9,8 +9,8 @@ A self-contained, state-aware PowerShell/WPF utility for applying a repeatable s
    Do not use **Run as administrator**. Dingo keeps its main window in your signed-in account and asks for administrator credentials later, only when needed.
 3. Choose the **My account**, **Whole computer**, **My account + whole computer**, **Install tools**, **Tool shortcuts**, or **File associations** tab.
 4. Each card explains the normal Windows choice, the current choice, and the available choices in plain language.
-5. Tick the cards to change, or use **Choose all my preferred settings**.
-6. Choose **Apply checked changes**. Windows requests administrator approval when the selection includes a whole-computer setting or a protected account policy marked **Admin approval required**.
+5. Turn on the switches for the cards to change, or use **Choose all my preferred settings**.
+6. Choose **Apply selected changes**. Windows requests administrator approval when the selection includes a whole-computer setting or a protected account policy marked **Admin approval required**.
 
 No installation or PowerShell modules are required. Windows PowerShell 5.1 is included with Windows 11.
 
@@ -56,15 +56,15 @@ Start-Dingo.cmd -Help
 
 `-h` and `-?` are short aliases for `-Help`.
 
-Current version: **0.6.8**. Phase 4 VM testing corrected wildcard detection in 0.6.3, association write ordering in 0.6.4, cleanup of Explorer's per-user Open With cache in 0.6.5, native Windows association command paths in 0.6.6, and actionable sign-out/restart guidance in 0.6.7-0.6.8. Version 0.6.8 gives the guidance its own footer row and names only settings still partially applied. Phase 1 is **0.6.0**, Phase 2 is **0.6.1**; patch versions roll over after `.9`.
+Current version: **0.6.9**. Phase 4 VM testing corrected wildcard detection in 0.6.3, association write ordering in 0.6.4, cleanup of Explorer's per-user Open With cache in 0.6.5, native Windows association command paths in 0.6.6, and actionable sign-out/restart guidance in 0.6.7-0.6.8. Version 0.6.9 replaces each card's labelled checkbox with a compact unlabelled selection switch while retaining the same batch-selection behavior. Phase 1 is **0.6.0**, Phase 2 is **0.6.1**; patch versions roll over after `.9`.
 
 ## Behaviour and safety
 
 - Every item is applied independently and checked against its declared verification basis. Registry checks establish stored values and types, not effective Windows or application behavior. Tool detection does not prove execution.
-- Current-state reads distinguish preferred, alternate, partial, unavailable, and error states. A read error is never treated as a missing setting, and **Check only settings that need changing** leaves unreadable settings unchecked.
+- Current-state reads distinguish preferred, alternate, partial, unavailable, and error states. A read error is never treated as a missing setting, and **Select only settings that need changing** leaves unreadable settings unselected.
 - Results track each registry entry and file extension, including before/after snapshots, requested state, outcome, and scope. Registry writes stop after the first failed entry in that scope and mark remaining entries skipped. Successful earlier changes remain visible as partially applied; there is no automatic rollback. JSON results include the final state and verification basis.
 - The GUI stays in the signed-in desktop account, so per-user settings affect the correct Windows profile even when separate administrator credentials are needed. Protected per-user policy values are written by the elevated helper directly to that desktop user's SID, not to the administrator's profile.
-- Twenty-eight settings offer plainly labelled reversible choices. The five one-way targets are UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal. The six tool cards offer **Installed** and **Update installed tool**; neither removes a tool. Each can be left alone by unticking its card.
+- Twenty-eight settings offer plainly labelled reversible choices. The five one-way targets are UTC, Australian region, Australian language, ISO date/time formats, and Widgets removal. The six tool cards offer **Installed** and **Update installed tool**; neither removes a tool. Each can be left alone by turning off its selection switch.
 - Applying a selection freezes a separate copy of the plan before preflight. Card choices and the Explorer restart checkbox stay disabled until the operation finishes; the administrator and account steps use the captured choices.
 - Shortcut and launcher creation refuses to overwrite a same-name file that Dingo did not create. Existing conflicts are checked in preflight and checked again before writing, including targets discovered after a tool installs. Rename or move the conflicting file before retrying.
 - **Read settings again** rereads every configured value without making changes.
@@ -109,8 +109,8 @@ Current version: **0.6.8**. Phase 4 VM testing corrected wildcard detection in 0
 - Eric Zimmerman's tools are built on .NET 9, and a fresh Windows 11 install does not include it. Without it every tool fails to start with `You must install .NET to run this application`. Dingo therefore offers **.NET 9 Desktop Runtime** as its own card, listed before the tools that need it so a single run installs them in the right order. This was found by testing in Windows Sandbox, which is as bare as a freshly imaged VM.
 - Dingo detects Eric Zimmerman's tools by looking for **Timeline Explorer** and **Registry Explorer**, not for a command-line tool. A partial copy holding only the command-line tools is common, and detecting on those would wrongly report a complete install.
 - The `script` install kind downloads a PowerShell script and runs it with administrator rights. That is how the author distributes these tools, and it is the same thing you would do by hand. Dingo refuses any address that is not `https://`, and logs the URL and the SHA256 of the file it actually ran.
-- To update Eric Zimmerman's tools, choose **Update installed tool** on its card, then apply the checked change. This runs the author's script again to fetch changed tools. Choosing **Installed** again leaves a detected installation alone. Use the same explicit update choice for winget tools; if a tool is missing, choose **Installed** first.
-- Eric Zimmerman's tools land in `C:\DFIR\Tools\EZTools\net9`, in a mixed layout: some tools are a loose `.exe`, others get their own folder. Tick **Run tools from anywhere** to reach them from any folder.
+- To update Eric Zimmerman's tools, choose **Update installed tool** on its card, then apply the selected change. This runs the author's script again to fetch changed tools. Choosing **Installed** again leaves a detected installation alone. Use the same explicit update choice for winget tools; if a tool is missing, choose **Installed** first.
+- Eric Zimmerman's tools land in `C:\DFIR\Tools\EZTools\net9`, in a mixed layout: some tools are a loose `.exe`, others get their own folder. Select **Run tools from anywhere** to reach them from any folder.
 - Dingo reads the computer PATH without expanding it and writes it back as an expandable value. Real machines hold entries such as `%USERPROFILE%\go\bin`, and reading PATH the easy way expands those, which would permanently bake one account's folders into the computer PATH. The self-test proves this on a stand-in value before anything is written.
 - A PATH change reaches new windows only. Restart any open terminal, and sign out and back in for programs started from Explorer.
 - File associations can only be set for a file type nothing has claimed yet. Windows protects a type that already carries a user choice, and no supported method can take one on a computer that is not joined to a domain. Dingo says which types it cannot take, on the card, and adds an Open with entry for those instead.

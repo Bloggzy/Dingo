@@ -311,7 +311,7 @@ try {
         Assert-Throws { Complete-ApplyChanges $plan @{} } 'Simulated completion failure'
         Assert (-not $script:ApplyInProgress -and $ScopeTabs.IsEnabled -and $RestartExplorerCheckBox.IsEnabled) 'Failure left plan controls locked.'
     }
-    Test-Case 'Actual WPF cards expose update and inherit the busy lock' {
+    Test-Case 'Actual WPF cards use accessible selection toggles and inherit the busy lock' {
         Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
         $xamlAssignment = $ast.EndBlock.Statements | Where-Object {
             $_ -is [Management.Automation.Language.AssignmentStatementAst] -and $_.Left.Extent.Text -eq '[xml]$xaml'
@@ -337,7 +337,13 @@ try {
             $script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$UncheckButton,$RefreshButton)
             Set-ActionButtonsEnabled $false
             foreach ($item in $script:Settings) {
-                Assert (-not $item.ApplyControl.IsEnabled) 'A card checkbox is enabled during apply.'
+                Assert ($item.ApplyControl -is [Windows.Controls.Primitives.ToggleButton]) 'A card does not use a selection toggle.'
+                Assert ($null -eq $item.ApplyControl.Content) 'A selection toggle has visible label content.'
+                Assert ([System.Windows.Automation.AutomationProperties]::GetName($item.ApplyControl) -eq "Select $($item.Name) for changes") 'A selection toggle has no setting-specific accessible name.'
+                $item.ApplyControl.ApplyTemplate() | Out-Null
+                Assert ([bool]$item.ApplyControl.Template.FindName('Track',$item.ApplyControl)) 'A selection toggle has no visible track.'
+                Assert ([bool]$item.ApplyControl.Template.FindName('Thumb',$item.ApplyControl)) 'A selection toggle has no visible thumb.'
+                Assert (-not $item.ApplyControl.IsEnabled) 'A card selection toggle is enabled during apply.'
                 foreach ($radio in $item.ChoiceControls) { Assert (-not $radio.IsEnabled) 'A card choice is enabled during apply.' }
             }
             Set-ActionButtonsEnabled $true

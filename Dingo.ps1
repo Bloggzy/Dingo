@@ -44,7 +44,7 @@ $script:PendingApply = $null
 $script:ApplyInProgress = $false
 $script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.6.8'
+$script:DingoVersion = '0.6.9'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -214,7 +214,7 @@ function Get-SettingAdvisory($Setting) {
             if (-not (Find-InstalledTool $required)) { [void]$missing.Add($required.Name) }
         }
         if ($missing.Count) {
-            return "This tool needs $($missing -join ' and '), which is not installed. Tick that card as well, or the tool will not start."
+            return "This tool needs $($missing -join ' and '), which is not installed. Select that card as well, or the tool will not start."
         }
     }
     return ''
@@ -3466,6 +3466,36 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
   <Window.Resources>
     <Style TargetType="Button"><Setter Property="Padding" Value="13,8"/><Setter Property="Margin" Value="0,0,8,0"/></Style>
     <Style TargetType="RadioButton"><Setter Property="Margin" Value="0,4,14,2"/><Setter Property="FontSize" Value="14"/></Style>
+    <Style x:Key="SelectionToggleStyle" TargetType="{x:Type ToggleButton}">
+      <Setter Property="Width" Value="40"/>
+      <Setter Property="Height" Value="22"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="{x:Type ToggleButton}">
+            <Grid Background="Transparent">
+              <Border x:Name="FocusRing" BorderBrush="#0B6EBD" BorderThickness="2" CornerRadius="13" Margin="-3" Opacity="0"/>
+              <Border x:Name="Track" Background="#A9B7C5" BorderBrush="#8FA1B2" BorderThickness="1" CornerRadius="11">
+                <Ellipse x:Name="Thumb" Width="16" Height="16" Margin="2" HorizontalAlignment="Left" Fill="White"/>
+              </Border>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="Track" Property="Background" Value="#0B6EBD"/>
+                <Setter TargetName="Track" Property="BorderBrush" Value="#0B6EBD"/>
+                <Setter TargetName="Thumb" Property="HorizontalAlignment" Value="Right"/>
+              </Trigger>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="FocusRing" Property="Opacity" Value="1"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.5"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
   </Window.Resources>
   <Grid Margin="18">
     <Grid.RowDefinitions>
@@ -3473,12 +3503,12 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     </Grid.RowDefinitions>
     <StackPanel Grid.Row="0" Margin="0,0,0,12">
       <TextBlock Text="Dingo - Windows 11 Preferences" FontSize="25" FontWeight="SemiBold" Foreground="#17212B"/>
-      <TextBlock Text="Pick a tab, read what Windows uses now, choose what you want, then tick the setting and click Apply checked changes." Foreground="#52606D" FontSize="14" Margin="0,4,0,0"/>
+      <TextBlock Text="Pick a tab, read what Windows uses now, choose what you want, then select the settings to change and click Apply selected changes." Foreground="#52606D" FontSize="14" Margin="0,4,0,0"/>
     </StackPanel>
     <WrapPanel Grid.Row="1" Margin="0,0,0,10">
       <Button Name="AllPreferredButton" Content="Choose all my preferred settings" Background="#E5F2FF"/>
-      <Button Name="NeededButton" Content="Check only settings that need changing"/>
-      <Button Name="UncheckButton" Content="Uncheck everything"/>
+      <Button Name="NeededButton" Content="Select only settings that need changing"/>
+      <Button Name="UncheckButton" Content="Clear all selections"/>
       <Button Name="RefreshButton" Content="Read settings again"/>
       <CheckBox Name="RestartExplorerCheckBox" Content="Restart File Explorer when finished" IsChecked="True" VerticalAlignment="Center" Margin="12,0,0,0"/>
     </WrapPanel>
@@ -3557,7 +3587,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
       <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right">
         <TextBlock Name="AdminSummaryText" Visibility="Collapsed" VerticalAlignment="Center" Foreground="#8A4B08" FontWeight="SemiBold" TextWrapping="Wrap" MaxWidth="250" Margin="0,0,14,0"/>
         <Button Name="OpenLogButton" Content="Open log folder"/>
-        <Button Name="ApplyButton" Content="Apply checked changes" Background="#0B6EBD" Foreground="White" FontWeight="SemiBold"/>
+        <Button Name="ApplyButton" Content="Apply selected changes" Background="#0B6EBD" Foreground="White" FontWeight="SemiBold"/>
       </StackPanel>
     </Grid>
   </Grid>
@@ -3616,9 +3646,9 @@ function Update-SelectionSummary {
     $selected = @($script:Settings | Where-Object Selected)
     $selectedAdmin = @($selected | Where-Object RequiresAdmin)
     $ApplyButton.Content = if ($selected.Count) {
-        "Apply $($selected.Count) checked change$(if ($selected.Count -eq 1) { '' } else { 's' })"
+        "Apply $($selected.Count) selected change$(if ($selected.Count -eq 1) { '' } else { 's' })"
     } else {
-        'Apply checked changes'
+        'Apply selected changes'
     }
     if ($selectedAdmin.Count) {
         $AdminSummaryText.Text = "$($selectedAdmin.Count) selected setting$(if ($selectedAdmin.Count -eq 1) { '' } else { 's' }) require$(if ($selectedAdmin.Count -eq 1) { 's' }) administrator approval"
@@ -3639,18 +3669,19 @@ function New-SettingCard($Item) {
     $border.Margin = '0,0,0,8'
 
     $grid = New-Object Windows.Controls.Grid
-    foreach ($width in @(78,315,220,300,200)) {
+    foreach ($width in @(58,315,220,300,200)) {
         $column = New-Object Windows.Controls.ColumnDefinition
         $column.Width = $width
         [void]$grid.ColumnDefinitions.Add($column)
     }
 
-    $applyCheck = New-Object Windows.Controls.CheckBox
-    $applyCheck.Content = 'Change'
+    $applyCheck = New-Object Windows.Controls.Primitives.ToggleButton
+    $applyCheck.Style = $window.FindResource('SelectionToggleStyle')
     $applyCheck.IsChecked = $Item.Selected
     $applyCheck.VerticalAlignment = 'Top'
     $applyCheck.Margin = '5,7,0,0'
-    $applyCheck.ToolTip = 'Tick this box if you want Dingo to change this setting.'
+    $applyCheck.ToolTip = 'Include this setting in the next apply.'
+    [System.Windows.Automation.AutomationProperties]::SetName($applyCheck, "Select $($Item.Name) for changes")
     $applyCheck.Tag = $Item
     $applyCheck.Add_Checked({ param($sender,$eventArgs) $sender.Tag.Selected = $true; Update-SelectionSummary })
     $applyCheck.Add_Unchecked({ param($sender,$eventArgs) $sender.Tag.Selected = $false; Update-SelectionSummary })
@@ -3723,7 +3754,7 @@ function New-SettingCard($Item) {
         [void]$choiceControls.Add($radio)
     }
     if (-not $Item.CanChoose) {
-        [void]$choices.Children.Add((New-CardText 'This item has one recommended target. Untick the box if you want to leave it alone.' 11 'Normal' '#627D98'))
+        [void]$choices.Children.Add((New-CardText 'This item has one recommended target. Turn off its selection switch if you want to leave it alone.' 11 'Normal' '#627D98'))
     }
     Add-CardColumn $grid $choices 3
 
@@ -3760,6 +3791,14 @@ foreach ($item in $script:Settings) {
 
 if ($UiSelfTest) {
     if ($script:ActionButtons | Where-Object IsEnabled) { throw 'Action buttons must remain disabled until the initial state scan finishes.' }
+    foreach ($item in $script:Settings) {
+        if ($item.ApplyControl -isnot [Windows.Controls.Primitives.ToggleButton] -or $null -ne $item.ApplyControl.Content) {
+            throw "Setting '$($item.Id)' does not use the unlabelled selection switch."
+        }
+        if ([Windows.Automation.AutomationProperties]::GetName($item.ApplyControl) -ne "Select $($item.Name) for changes") {
+            throw "Setting '$($item.Id)' selection switch has no accessible name."
+        }
+    }
     $adminSettings = @($script:Settings | Where-Object RequiresAdmin)
     if ($adminSettings | Where-Object { -not $_.AdminBadgeControl }) { throw 'Every setting that requires administrator approval must show an admin badge.' }
     if (-not $AdminSummaryText) { throw 'The selected administrator-change summary is unavailable.' }
@@ -3816,7 +3855,7 @@ function Update-CurrentStates {
         }
         $preferred = @($script:Settings | Where-Object { $_.CurrentState.Status -eq 'Preferred' }).Count
         $unreadable = @($script:Settings | Where-Object { $_.CurrentState.Status -in @('Error','Unavailable') }).Count
-        $SummaryText.Text = "$preferred of $count settings already use your preferred choice. Nothing changes until you click Apply checked changes."
+        $SummaryText.Text = "$preferred of $count settings already use your preferred choice. Nothing changes until you click Apply selected changes."
         if ($unreadable) { $SummaryText.Text += " $unreadable setting$(if ($unreadable -eq 1) { '' } else { 's' }) could not be evaluated and will not be auto-selected." }
         Write-Log 'INFO' "State refresh complete: $preferred of $count preferred."
     } finally {
@@ -3887,7 +3926,7 @@ function Complete-ApplyChanges([array]$Selected, [hashtable]$AdministratorResult
 $AllPreferredButton.Add_Click({
     foreach ($item in $script:Settings) { $item.DesiredState = $item.PreferredState; $item.Selected = $true }
     Refresh-UI
-    $SummaryText.Text = 'All settings are checked and set to the choices marked "my preference". Click Apply checked changes when ready.'
+    $SummaryText.Text = 'All settings are selected and set to the choices marked "my preference". Click Apply selected changes when ready.'
 })
 $NeededButton.Add_Click({
     foreach ($item in $script:Settings) {
@@ -3896,13 +3935,13 @@ $NeededButton.Add_Click({
     }
     Refresh-UI
     $unknown = @($script:Settings | Where-Object { $_.CurrentState.Status -in @('Error','Unavailable','Unknown') }).Count
-    $SummaryText.Text = 'Only settings known not to match your preference are checked.'
-    if ($unknown) { $SummaryText.Text += " $unknown unreadable or unavailable setting$(if ($unknown -eq 1) { ' was' } else { 's were' }) left unchecked." }
+    $SummaryText.Text = 'Only settings known not to match your preference are selected.'
+    if ($unknown) { $SummaryText.Text += " $unknown unreadable or unavailable setting$(if ($unknown -eq 1) { ' was' } else { 's were' }) left unselected." }
 })
 $UncheckButton.Add_Click({
     foreach ($item in $script:Settings) { $item.Selected = $false }
     Refresh-UI
-    $SummaryText.Text = 'Everything is unchecked. No setting will be changed.'
+    $SummaryText.Text = 'All selections are cleared. No setting will be changed.'
 })
 $RefreshButton.Add_Click({ Update-CurrentStates })
 $OpenLogButton.Add_Click({ Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $script:LogFile) })
@@ -3911,7 +3950,7 @@ $ApplyButton.Add_Click({
     if ($script:ApplyInProgress) { return }
     $selected = @(New-ApplyPlan @($script:Settings | Where-Object Selected))
     if (-not $selected) {
-        [System.Windows.MessageBox]::Show('Nothing is checked. Tick the settings you want Dingo to change.', 'Nothing selected') | Out-Null
+        [System.Windows.MessageBox]::Show('Nothing is selected. Turn on the switches for the settings you want Dingo to change.', 'Nothing selected') | Out-Null
         return
     }
     Set-ActionButtonsEnabled $false
