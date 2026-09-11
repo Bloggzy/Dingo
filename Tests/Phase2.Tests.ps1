@@ -174,6 +174,16 @@ try {
             Assert ((Invoke-SettingChange $setting @{}).Success) 'Broken registration could not be repaired.'
         }
     }
+    Test-Case 'Association targets are stored as native Windows paths' {
+        $a=[pscustomobject]@{ Scope='User'; Extension='.aaa'; Target='C:/Program Files/Test Tool/Test.exe'; Description='Test file' }
+        $target=Get-AssociationTarget $a
+        Assert ($target -eq 'C:\Program Files\Test Tool\Test.exe') "Association target was not normalized: $target"
+        Invoke-AssociationFixture {
+            Register-AssociationProgId $a
+            $command=$store.Commands[(Get-AssociationProgId $a)]
+            Assert ($command -eq '"C:\Program Files\Test Tool\Test.exe" "%1"') "Association command used a non-native path: $command"
+        }
+    }
     Test-Case 'Missing one target cannot be hidden by another successful association' {
         Invoke-AssociationFixture {
             $a=New-TestAssociation '.aaa'; $b=New-TestAssociation '.bbb'; $b.Target=Join-Path $scratch 'AbsentProgram.exe'

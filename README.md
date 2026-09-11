@@ -56,7 +56,7 @@ Start-Dingo.cmd -Help
 
 `-h` and `-?` are short aliases for `-Help`.
 
-Current version: **0.6.5**. Phase 4 VM testing corrected wildcard detection in 0.6.3, association write ordering in 0.6.4, and cleanup of Explorer's per-user Open With cache in 0.6.5. Phase 1 is **0.6.0**, Phase 2 is **0.6.1**; patch versions roll over after `.9`.
+Current version: **0.6.8**. Phase 4 VM testing corrected wildcard detection in 0.6.3, association write ordering in 0.6.4, cleanup of Explorer's per-user Open With cache in 0.6.5, native Windows association command paths in 0.6.6, and actionable sign-out/restart guidance in 0.6.7-0.6.8. Version 0.6.8 gives the guidance its own footer row and names only settings still partially applied. Phase 1 is **0.6.0**, Phase 2 is **0.6.1**; patch versions roll over after `.9`.
 
 ## Behaviour and safety
 
@@ -90,7 +90,7 @@ Current version: **0.6.5**. Phase 4 VM testing corrected wildcard detection in 0
 - Microsoft now ships Copilot in several forms. The Windows setting applies the legacy Windows Copilot policy and hides integrated UI, but does not uninstall the newer standalone app. Microsoft recommends AppLocker or managed uninstall policy for centrally blocking that app.
 - **Edge search engines are set with `ManagedSearchEngines`, not `DefaultSearchProvider*`.** Edge treats `DefaultSearchProvider*` as a protected policy and blocks it on any device that is not domain joined, Entra joined, or Intune enrolled, reporting `Error, Ignored` at `edge://policy`. `ManagedSearchEngines` is not protected and does apply. It replaces the whole engine list, so Bing is never created rather than removed. Dingo writes it to the `Recommended` key so an analyst can still change engines afterwards, and clears the five `DefaultSearchProvider*` values because `DefaultSearchProviderSearchURL` suppresses `ManagedSearchEngines`. Only the default entry may carry `is_default`: adding `"is_default": false` to another entry makes Edge reject the whole policy with no error anywhere. Restart Edge to finish applying it. Verified on Edge 152, Windows 11 25H2, unmanaged.
 - On a profile where someone already chose a search engine by hand, that choice is kept. The policy still removes Bing from the list. A freshly imaged VM has no such choice, so it takes effect there.
-- Every other Edge policy Dingo writes was confirmed applied on an unmanaged instance, with none reported as ignored: `edge-first-run` (6 values), `edge-passwords` (4), `edge-copilot` (5), and `edge-debloat` (16 visible on the policy page, plus one under `EdgeUpdate`). `DefaultSearchProvider*` was the only blocked family, and Dingo no longer uses it.
+- Every current Edge policy Dingo writes was confirmed applied on an unmanaged instance, with none reported as ignored: `edge-first-run` (6 values), `edge-passwords` (4), `edge-copilot` (5), and `edge-debloat` (14 visible on the policy page, plus one under `EdgeUpdate`). `DefaultSearchProvider*` was the only blocked family, and Dingo no longer uses it. Version 0.6.6 also removes the retired `WalletDonationEnabled` and `WebWidgetAllowed` values left by earlier Dingo versions.
 - To check any Edge policy yourself, restart Edge, visit `edge://policy`, click **Reload policies**, then **Export to JSON**. Each policy in that file carries an `ignored` flag and an `error` string, which is far quicker than guessing from behaviour.
 - Removing the entire Recommended section is edition/build dependent. The tool disables recent and suggested content and applies the section-hiding policy where available.
 - Microsoft does not ship a standalone full display pack for English (Australia). Windows exposes **English (Australia)** as a selectable interface language once the British English (`en-GB`) base resources are installed. Dingo installs that underlying display pack when needed, then selects `en-AU` for the Windows interface, input, spelling, regional formats, and system locale. Windows applies and reports the requested UI language after sign-out or restart.
@@ -306,7 +306,7 @@ Put a `Tools.json` file next to `Dingo.ps1`. A new `id` adds a tool. An `id` tha
 | `shortcuts[].arguments` | no | Extra arguments passed to the program |
 | `associations` | no | List of file types this tool should open |
 | `associations[].extension` | yes, inside the list | Must start with a dot, for example `.json` |
-| `associations[].target` | yes, inside the list | The program that opens it. Write it with forward slashes |
+| `associations[].target` | yes, inside the list | The program that opens it. Forward or backslashes are accepted; Dingo stores a native Windows path |
 | `associations[].description` | no | The file type name Explorer shows, for example `JSON file` |
 
 Detect rule kinds:
@@ -323,7 +323,7 @@ A tool entry Dingo cannot understand is skipped, and the reason is written to th
 
 ## Execution and interrupted runs
 
-Installer arguments preserve empty values, embedded quotes, and trailing backslashes. Both output streams are drained concurrently, retaining the last 64 KiB of characters from each. A Windows Job Object tracks the assigned installer and descendants, including children that outlive their parent. Timeout closes the job and reports possible partial installation. This is not a security sandbox: external installer services and any process that escapes before assignment may remain active. Job assignment failure stops the run instead of continuing without tracking. Real winget, UAC, and installer-service behavior still needs disposable-VM validation.
+Installer arguments preserve empty values, embedded quotes, and trailing backslashes. Both output streams are drained concurrently, retaining the last 64 KiB of characters from each. A Windows Job Object tracks the assigned installer and descendants, including children that outlive their parent. Timeout closes the job and reports possible partial installation. This is not a security sandbox: external installer services and any process that escapes before assignment may remain active. Job assignment failure stops the run instead of continuing without tracking. Phase 4 validated real winget, UAC, script-installer, timeout, and interruption behavior on the recorded disposable VM; other Windows builds and installer-service edge cases still require appropriate testing.
 
 Script downloads have a 120-second network timeout and refuse redirects. Use a direct HTTPS URL for custom scripts. Pin updates require reviewing the new revision and calculating a new expected hash; merely recording an observed hash does not establish trust.
 

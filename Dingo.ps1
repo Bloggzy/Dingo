@@ -44,7 +44,7 @@ $script:PendingApply = $null
 $script:ApplyInProgress = $false
 $script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.6.5'
+$script:DingoVersion = '0.6.8'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -813,6 +813,17 @@ function Find-ToolDetectionRule($rule) {
     return $null
 }
 
+function Get-RestartInstruction([string[]]$SettingNames) {
+    $names = @($SettingNames | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)
+    if ($names.Count -eq 1) {
+        return "$($names[0]) needs you to sign out and back in, or restart Windows, before it can finish applying. Then click Read settings again."
+    }
+    if ($names.Count -gt 1) {
+        return "These settings need you to sign out and back in, or restart Windows, before they can finish applying: $($names -join ', '). Then click Read settings again."
+    }
+    'Sign out and back in, or restart Windows, to finish applying the selected settings. Then click Read settings again.'
+}
+
 function Get-ToolDetection($Tool) {
     $matched = New-Object Collections.ArrayList
     $missing = New-Object Collections.ArrayList
@@ -1374,7 +1385,10 @@ function Get-AssociationProgId($Association) {
 }
 
 function Get-AssociationTarget($Association) {
-    return [Environment]::ExpandEnvironmentVariables($Association.Target)
+    # Catalog paths use forward slashes so Tools.json remains easy to edit, but
+    # Explorer's shell association launcher can reject an otherwise valid local
+    # executable command written in that form. Store a native Windows path.
+    return [Environment]::ExpandEnvironmentVariables($Association.Target).Replace('/', '\')
 }
 
 function Get-ExtensionUserChoice([string]$Extension) {
@@ -1775,17 +1789,19 @@ function Get-Settings {
     # None of these are protected policies, so they apply on an unmanaged VM.
     # The three NewTabPage values are what actually removes the news feed,
     # weather, and background images; WinUtil's Edge debloat does not cover them.
-    [void]$settings.Add((New-Setting 'edge-debloat' 'Microsoft Edge' 'Clutter, promotions, and new tab page' 'Remove the new tab page news feed, weather, background images, and quick links, plus Collections, shopping, Rewards, wallet donations, Insider and default-browser promotions, the web widget, feedback, telemetry, and the Copilot Discover Chat extension. Sends Do Not Track. Restart Edge to finish applying it.' 'Removed' 'Edge default' 'Registry' @(
+    [void]$settings.Add((New-Setting 'edge-debloat' 'Microsoft Edge' 'Clutter, promotions, and new tab page' 'Remove the new tab page news feed, weather, background images, and quick links, plus Collections, shopping, Rewards, Insider and default-browser promotions, feedback, telemetry, and the Copilot Discover Chat extension. Sends Do Not Track. Restart Edge to finish applying it.' 'Removed' 'Edge default' 'Registry' @(
         (New-Entry Machine $edge 'NewTabPageContentEnabled' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'NewTabPageAllowedBackgroundTypes' 3 $script:RemoveValue),
         (New-Entry Machine $edge 'NewTabPageQuickLinksEnabled' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'EdgeCollectionsEnabled' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'EdgeShoppingAssistantEnabled' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'ShowMicrosoftRewards' 0 $script:RemoveValue),
-        (New-Entry Machine $edge 'WalletDonationEnabled' 0 $script:RemoveValue),
+        # These retired policies were written by earlier Dingo versions. Remove
+        # them for either card choice so an upgrade cleans up existing machines.
+        (New-Entry Machine $edge 'WalletDonationEnabled' $script:RemoveValue $script:RemoveValue),
         (New-Entry Machine $edge 'MicrosoftEdgeInsiderPromotionEnabled' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'DefaultBrowserSettingsCampaignEnabled' 0 $script:RemoveValue),
-        (New-Entry Machine $edge 'WebWidgetAllowed' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'WebWidgetAllowed' $script:RemoveValue $script:RemoveValue),
         (New-Entry Machine $edge 'UserFeedbackAllowed' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'AlternateErrorPagesEnabled' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'EdgeAssetDeliveryServiceEnabled' 0 $script:RemoveValue),
@@ -2503,8 +2519,11 @@ function Invoke-SettingChange($Item, [hashtable]$AdministratorResults) {
         $expectedStatus = if ($Item.Kind -eq 'Package' -or $Item.DesiredState -eq $Item.PreferredState) { 'Preferred' } else { 'Alternate' }
         if ($Item.CurrentState.Status -ne $expectedStatus) {
             $reason = if ($Item.CurrentState.Status -eq 'Error') { "$($Item.CurrentState.DisplayText): $($Item.CurrentState.Details)" } else { $Item.CurrentState.DisplayText }
-            [void]$components.Add((New-OperationComponent 'Final verification' 'Failed' "Windows reports '$reason'."))
-            throw "Windows still reports '$reason' instead of '$($Item.DesiredState)'."
+            $followUp = if ($Item.RestartRequired -and $Item.CurrentState.Status -eq 'Partial') {
+                ' ' + (Get-RestartInstruction -SettingNames @([string]$Item.Name))
+            } else { '' }
+            [void]$components.Add((New-OperationComponent 'Final verification' 'Failed' "Windows reports '$reason'.$followUp"))
+            throw "Windows still reports '$reason' instead of '$($Item.DesiredState)'.$followUp"
         }
         $verification = Get-VerificationDescription $Item
         [void]$components.Add((New-OperationComponent 'Final verification' 'Succeeded' "$verification $($Item.CurrentState.Details)"))
@@ -2966,8 +2985,8 @@ if ($SelfTest) {
     $requiredDebloat = @{
         NewTabPageContentEnabled=0; NewTabPageAllowedBackgroundTypes=3; NewTabPageQuickLinksEnabled=0
         EdgeCollectionsEnabled=0; EdgeShoppingAssistantEnabled=0; ShowMicrosoftRewards=0
-        WalletDonationEnabled=0; MicrosoftEdgeInsiderPromotionEnabled=0; DefaultBrowserSettingsCampaignEnabled=0
-        WebWidgetAllowed=0; UserFeedbackAllowed=0; AlternateErrorPagesEnabled=0
+        MicrosoftEdgeInsiderPromotionEnabled=0; DefaultBrowserSettingsCampaignEnabled=0
+        UserFeedbackAllowed=0; AlternateErrorPagesEnabled=0
         EdgeAssetDeliveryServiceEnabled=0; DiagnosticData=0; ConfigureDoNotTrack=1
         CreateDesktopShortcutDefault=0
     }
@@ -2975,6 +2994,12 @@ if ($SelfTest) {
         $entry = $debloatSetting.Entries | Where-Object Name -eq $valueName | Select-Object -First 1
         if (-not $entry) { throw "The Edge debloat setting is missing '$valueName'." }
         if ([int]$entry.Preferred -ne [int]$requiredDebloat[$valueName]) { throw "'$valueName' has the wrong preferred value." }
+    }
+    foreach ($retiredPolicy in @('WalletDonationEnabled','WebWidgetAllowed')) {
+        $entry = $debloatSetting.Entries | Where-Object Name -eq $retiredPolicy | Select-Object -First 1
+        if (-not $entry -or $entry.Preferred -ne $script:RemoveValue -or $entry.Alternate -ne $script:RemoveValue) {
+            throw "Retired Edge policy '$retiredPolicy' must be removed for either card choice."
+        }
     }
     if (-not ($debloatSetting.Entries | Where-Object { $_.Path -match 'ExtensionInstallBlocklist$' })) {
         throw 'The Edge debloat setting must block the Copilot Discover Chat extension.'
@@ -3526,14 +3551,15 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
       </TabItem>
     </TabControl>
     <ProgressBar Name="ProgressBar" Grid.Row="3" Height="8" Margin="0,10,0,8" Minimum="0" Maximum="100"/>
-    <DockPanel Grid.Row="4">
-      <TextBlock Name="SummaryText" Text="Reading current settings..." VerticalAlignment="Center" Foreground="#334E68" TextWrapping="Wrap" MaxWidth="850"/>
-      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+    <Grid Grid.Row="4">
+      <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+      <TextBlock Name="SummaryText" Grid.Row="0" Text="Reading current settings..." VerticalAlignment="Center" Foreground="#334E68" TextWrapping="Wrap" Margin="0,0,0,6"/>
+      <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right">
         <TextBlock Name="AdminSummaryText" Visibility="Collapsed" VerticalAlignment="Center" Foreground="#8A4B08" FontWeight="SemiBold" TextWrapping="Wrap" MaxWidth="250" Margin="0,0,14,0"/>
         <Button Name="OpenLogButton" Content="Open log folder"/>
         <Button Name="ApplyButton" Content="Apply checked changes" Background="#0B6EBD" Foreground="White" FontWeight="SemiBold"/>
       </StackPanel>
-    </DockPanel>
+    </Grid>
   </Grid>
 </Window>
 '@
@@ -3802,6 +3828,8 @@ function Update-CurrentStates {
 function Complete-ApplyChanges([array]$Selected, [hashtable]$AdministratorResults) {
     try {
         $success = 0; $partial = 0; $failed = 0; $needsExplorer = $false; $needsRestart = $false
+        $restartNames = New-Object System.Collections.ArrayList
+        $partialRestartNames = New-Object System.Collections.ArrayList
         $applyResults = New-Object System.Collections.ArrayList
         $ProgressBar.IsIndeterminate = $false
         for ($i = 0; $i -lt $Selected.Count; $i++) {
@@ -3816,16 +3844,25 @@ function Complete-ApplyChanges([array]$Selected, [hashtable]$AdministratorResult
             if ($result.Outcome -eq 'Succeeded') {
                 $success++
                 if ($item.RestartExplorer) { $needsExplorer = $true }
-                if ($item.RestartRequired) { $needsRestart = $true }
+                if ($item.RestartRequired) {
+                    $needsRestart = $true
+                    if (-not $restartNames.Contains([string]$item.Name)) { [void]$restartNames.Add([string]$item.Name) }
+                }
             } else {
                 if ($result.Outcome -eq 'PartiallyApplied') {
                     $partial++
+                    if ($item.RestartRequired -and -not $partialRestartNames.Contains([string]$item.Name)) {
+                        [void]$partialRestartNames.Add([string]$item.Name)
+                    }
                 } else {
                     $failed++
                 }
                 if (@($result.Components | Where-Object Outcome -eq 'Succeeded').Count) {
                     if ($item.RestartExplorer) { $needsExplorer = $true }
-                    if ($item.RestartRequired) { $needsRestart = $true }
+                    if ($item.RestartRequired) {
+                        $needsRestart = $true
+                        if (-not $restartNames.Contains([string]$item.Name)) { [void]$restartNames.Add([string]$item.Name) }
+                    }
                 }
             }
             $ProgressBar.Value = [math]::Round((($i + 1) / $Selected.Count) * 100)
@@ -3835,7 +3872,8 @@ function Complete-ApplyChanges([array]$Selected, [hashtable]$AdministratorResult
         if ($needsExplorer -and $script:ApplyRestartExplorer) {
             [void](Restart-DesktopExplorer)
         }
-        $suffix = if ($needsRestart) { ' Restart or sign out to finish some changes.' } else { '' }
+        $guidanceNames = if ($partialRestartNames.Count) { @($partialRestartNames) } else { @($restartNames) }
+        $suffix = if ($needsRestart) { ' ' + (Get-RestartInstruction -SettingNames $guidanceNames) } else { '' }
         $SummaryText.Text = "Finished: $success worked; $partial partially applied; $failed failed.$suffix"
         $ProgressBar.Value = 100
         Refresh-UI

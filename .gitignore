@@ -1,7 +1,7 @@
 # Dingo run-time output
 Logs/
 Tests/Phase4/Evidence/
-Dingo-*-Phase4.zip
+Dingo-*.zip
 
 # Windows Terminal backups written by Dingo
 *.backup-*

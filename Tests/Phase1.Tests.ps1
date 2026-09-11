@@ -267,6 +267,37 @@ try {
         Assert ($script:RestartCalls -eq 1) 'Completion reread the mutable restart checkbox.'
         Assert (-not $script:ApplyInProgress -and $ScopeTabs.IsEnabled -and $RestartExplorerCheckBox.IsEnabled) 'GUI remained locked after completion.'
     }
+    Test-Case 'Restart guidance names the setting and tells the user how to refresh' {
+        $message = Get-RestartInstruction -SettingNames @('Australian English')
+        Assert ($message -match '^Australian English needs you to sign out and back in, or restart Windows') 'Restart guidance does not connect the pending setting to the required action.'
+        Assert ($message -match 'Australian English') 'Restart guidance does not name the pending setting.'
+        Assert ($message -match 'Read settings again') 'Restart guidance does not tell the user how to refresh Dingo.'
+    }
+    Test-Case 'GUI completion shows actionable guidance for a partially applied restart setting' {
+        $ScopeTabs = [pscustomobject]@{IsEnabled=$false}
+        $RestartExplorerCheckBox = [pscustomobject]@{IsEnabled=$false;IsChecked=$false}
+        $SummaryText = [pscustomobject]@{Text=''}
+        $ProgressBar = [pscustomobject]@{Value=0;IsIndeterminate=$true}
+        $script:ActionButtons = @([pscustomobject]@{IsEnabled=$false})
+        $script:ApplyInProgress = $true
+        $script:ApplyRestartExplorer = $false
+        function Refresh-UI {}
+        function Invoke-SettingChange($Item, $AdministratorResults) {
+            $Item.Status = 'Partially applied'
+            $Item.CurrentState = New-StateResult Partial 'Partly configured: system locale is en-GB'
+            return New-ApplyResult $Item.Id @(
+                (New-OperationComponent 'Language write' Succeeded 'accepted'),
+                (New-OperationComponent 'Final verification' Failed 'pending sign-in')
+            ) 'pending sign-in' $false $true
+        }
+        $card = $script:Settings | Where-Object Id -eq 'language-au'
+        $plan = @(New-ApplyPlan @($card))
+        [void](Complete-ApplyChanges $plan @{})
+        Assert ($SummaryText.Text -match '1 partially applied; 0 failed') 'GUI summary lost the partial-result counts.'
+        Assert ($SummaryText.Text -match 'Sign out and back in, or restart Windows') 'GUI summary lacks an explicit completion action.'
+        Assert ($SummaryText.Text -match 'Australian English') 'GUI summary does not name the pending setting.'
+        Assert ($SummaryText.Text -match 'Read settings again') 'GUI summary does not explain how to verify after sign-in.'
+    }
     Test-Case 'Unexpected completion failure releases the busy lock' {
         $ScopeTabs = [pscustomobject]@{IsEnabled=$false}
         $RestartExplorerCheckBox = [pscustomobject]@{IsEnabled=$false;IsChecked=$false}
@@ -290,9 +321,13 @@ try {
         $reader = New-Object Xml.XmlNodeReader $xaml
         $window = [Windows.Markup.XamlReader]::Load($reader)
         try {
-            foreach ($name in @('ScopeTabs','RestartExplorerCheckBox','ApplyButton','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','AdminSummaryText')) {
+            foreach ($name in @('ScopeTabs','RestartExplorerCheckBox','ApplyButton','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','AdminSummaryText','SummaryText')) {
                 Set-Variable -Name $name -Value $window.FindName($name)
             }
+            $actionPanel = $ApplyButton.Parent
+            Assert ($SummaryText.Parent -eq $actionPanel.Parent) 'Completion guidance and actions do not share the expected footer grid.'
+            Assert ([Windows.Controls.Grid]::GetRow($SummaryText) -lt [Windows.Controls.Grid]::GetRow($actionPanel)) 'Completion guidance shares the administrator/action row and can be obscured.'
+            Assert ($SummaryText.TextWrapping -eq [Windows.TextWrapping]::Wrap) 'Completion guidance cannot wrap within its own row.'
             function Get-SettingAdvisory { '' }
             $script:Settings = Get-Settings
             $panels = @{ User='UserSettingsPanel'; System='SystemSettingsPanel'; Both='BothSettingsPanel'; 'Install tools'='ToolSettingsPanel'; 'Tool shortcuts'='ShortcutSettingsPanel'; 'File associations'='AssociationSettingsPanel' }
