@@ -14,6 +14,7 @@ param(
     [switch]$ApplyPreferred,
     [switch]$WhatIf,
     [switch]$ListSettings,
+    [switch]$RecoveryReport,
     [Alias('?','h')]
     [switch]$Help,
     [switch]$Version,
@@ -40,8 +41,10 @@ $script:RemoveValue = '__REMOVE_VALUE__'
 $script:LanguageChangePending = $false
 $script:InstanceMutex = $null
 $script:PendingApply = $null
+$script:ApplyInProgress = $false
+$script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.5.9'
+$script:DingoVersion = '0.6.8'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -124,7 +127,7 @@ function Exit-DingoSingleInstance {
 # Keep the launcher separate from the WPF host so a failed GUI process cannot
 # strand the command shell, and hold the per-user mutex for the host's lifetime.
 # Avoid persistent user-wide shell workarounds; the host process only owns the UI.
-if (-not ($SelfTest -or $StateSelfTest -or $UiSelfTest -or $ApplyPreferred -or $WhatIf -or $ListSettings -or $Help -or $Version -or $Include -or $Exclude -or $script:UnexpectedArguments.Count -or $MachineWorker -or $ElevationBroker -or $FinalizeInternationalSettings -or $WpfHost)) {
+if (-not ($SelfTest -or $StateSelfTest -or $UiSelfTest -or $ApplyPreferred -or $WhatIf -or $ListSettings -or $RecoveryReport -or $Help -or $Version -or $Include -or $Exclude -or $script:UnexpectedArguments.Count -or $MachineWorker -or $ElevationBroker -or $FinalizeInternationalSettings -or $WpfHost)) {
     if (-not (Enter-DingoSingleInstance)) {
         Add-Type -AssemblyName PresentationFramework
         [System.Windows.MessageBox]::Show('Dingo is already running for this Windows account.', 'Dingo is already running', 'OK', 'Information') | Out-Null
@@ -190,6 +193,9 @@ function Test-DeviceIsManaged {
 }
 
 function Get-SettingAdvisory($Setting) {
+    if ($Setting.Id -eq 'windows-update-continuity') {
+        return 'Registry configuration only: automatic-restart prevention is not verified. This does not cancel pending or user-scheduled restarts, establish effective management policy, or guarantee an uninterrupted processing window. Update notifications, including restart warnings, are suppressed by this selection.'
+    }
     # A caveat that Dingo cannot fix by writing the setting. Dingo still applies
     # the value, because it takes effect if the VM is later joined to a domain
     # or enrolled, but the operator is told plainly that it does nothing today.
@@ -227,6 +233,36 @@ function Write-Log([string]$Level, [string]$Message) {
     if (-not $script:LogFile) { return }
     $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Level, $Message
     Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8
+}
+
+function Write-OperationJournal($Event, $OperationId, $SettingId, $Scope, $Data) {
+    if (-not $script:LogFile) { return }
+    # Each process owns its file; worker and GUI never append to the same stream.
+    $path = "$($script:LogFile).$PID.journal.jsonl"
+    $record = [ordered]@{ SchemaVersion=1; Utc=[DateTime]::UtcNow.ToString('o'); ProcessId=$PID; Event=$Event; OperationId=$OperationId; SettingId=$SettingId; Scope=$Scope; Data=$Data }
+    $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes((ConvertTo-Json $record -Depth 16 -Compress) + "`n")
+    $stream = [IO.File]::Open($path, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+}
+
+function Get-RecoveryReport([string]$Directory) {
+    if (-not (Test-Path -LiteralPath $Directory)) { return }
+    foreach ($file in @(Get-ChildItem -LiteralPath $Directory -Filter '*.journal.jsonl' -File -ErrorAction Stop)) {
+        $pending = @{}
+        foreach ($line in [IO.File]::ReadLines($file.FullName)) {
+            try {
+                $record = ConvertFrom-Json $line -ErrorAction Stop
+                if ($record.SchemaVersion -ne 1 -or -not $record.OperationId) { throw 'Invalid journal record.' }
+                if ($record.Event -eq 'Started') { $pending[$record.OperationId] = $record }
+                elseif ($record.Event -eq 'Completed') { $pending.Remove($record.OperationId) }
+            } catch {
+                [pscustomobject]@{ Journal=$file.FullName; SettingId=''; Scope=''; Status='Unreadable record'; Details='Journal is incomplete or invalid; inspect it manually. No replay was attempted.' }
+            }
+        }
+        foreach ($record in $pending.Values) {
+            [pscustomobject]@{ Journal=$file.FullName; SettingId=$record.SettingId; Scope=$record.Scope; Status='Completion unknown'; Details='A scope started without a durable completion record. It may still be running or may have changed the workstation; reread state and inspect installer processes before retrying.' }
+        }
+    }
 }
 
 function Write-Utf8FileAtomically {
@@ -339,7 +375,8 @@ function Get-OperationOutcome([array]$Components) {
     if (-not $attempted) { return 'Skipped' }
     $succeeded = @($attempted | Where-Object Outcome -eq 'Succeeded').Count
     $failed = @($attempted | Where-Object Outcome -eq 'Failed').Count
-    if ($failed -and $succeeded) { return 'PartiallyApplied' }
+    $changed = @($Components | Where-Object { $_.PSObject.Properties['ChangeStatus'] -and $_.ChangeStatus -eq 'Changed' }).Count
+    if ($failed -and ($succeeded -or $changed)) { return 'PartiallyApplied' }
     if ($failed) { return 'Failed' }
     return 'Succeeded'
 }
@@ -396,6 +433,7 @@ function New-Setting {
     $options = New-Object System.Collections.ArrayList
     [void]$options.Add($PreferredState)
     if (-not [string]::IsNullOrWhiteSpace($AlternateState)) { [void]$options.Add($AlternateState) }
+    if ($Kind -eq 'Package') { [void]$options.Add('Update installed tool') }
     $handler = Get-SettingHandler $Kind
     $scopes = @(& $handler.GetScopes $Entries)
     $requirementCopy = @{}
@@ -446,6 +484,8 @@ function ConvertTo-ToolDefinition($Raw) {
     $package = [string](Get-JsonField $install 'package' '')
     $url = [string](Get-JsonField $install 'url' '')
     $dest = [string](Get-JsonField $install 'dest' '')
+    $expectedHash = [string](Get-JsonField $install 'sha256' '')
+    if ($expectedHash -and $expectedHash -notmatch '^[0-9a-fA-F]{64}$') { throw "Tool '$id' needs a 64-character SHA256 hash." }
     if ($installKind -eq 'winget') {
         if ([string]::IsNullOrWhiteSpace($package)) { throw "Tool '$id' has no winget package id." }
     } else {
@@ -460,9 +500,15 @@ function ConvertTo-ToolDefinition($Raw) {
     if ($timeoutMinutes -lt 1 -or $timeoutMinutes -gt 240) { throw "Tool '$id' has a timeout of $timeoutMinutes minutes; use 1 to 240." }
 
     $rules = New-Object System.Collections.ArrayList
+    $detectMode = [string](Get-JsonField $Raw 'detectMode' 'any')
+    if ($detectMode -notin @('any','all')) { throw "Tool '$id' needs detectMode 'any' or 'all'." }
     foreach ($rawRule in @(Get-JsonField $Raw 'detect' @())) {
         $ruleKind = [string](Get-JsonField $rawRule 'kind' '')
         if ($ruleKind -notin @('uninstall-key','file','command')) { throw "Tool '$id' has an unknown detect rule '$ruleKind'." }
+        $requiredField = switch ($ruleKind) { 'uninstall-key' { 'match' }; 'file' { 'path' }; 'command' { 'command' } }
+        if ([string]::IsNullOrWhiteSpace([string](Get-JsonField $rawRule $requiredField ''))) {
+            throw "Tool '$id' has a $ruleKind rule without '$requiredField'."
+        }
         [void]$rules.Add([PSCustomObject]@{
             Kind = $ruleKind
             Match = [string](Get-JsonField $rawRule 'match' '')
@@ -535,6 +581,7 @@ function ConvertTo-ToolDefinition($Raw) {
         Source = [string](Get-JsonField $install 'source' 'winget')
         Scope = $scope
         Url = $url
+        Sha256 = $expectedHash
         Dest = $dest
         Arguments = @(Get-JsonField $install 'arguments' @())
         Shims = $shims
@@ -543,6 +590,7 @@ function ConvertTo-ToolDefinition($Raw) {
         Requires = @(Get-JsonField $Raw 'requires' @())
         TimeoutSeconds = ($timeoutMinutes * 60)
         Detect = @($rules)
+        DetectMode = $detectMode
     }
 }
 
@@ -600,7 +648,8 @@ function Get-BuiltInToolCatalog {
             description='The full DFIR tool set, including Timeline Explorer, Registry Explorer, EvtxECmd, and RECmd. Installed with the author''s own Get-ZimmermanTools script. Needs the .NET 9 Desktop Runtime, which is the card above.'
             install=[PSCustomObject]@{
                 kind='script'; scope='machine'
-                url='https://raw.githubusercontent.com/EricZimmerman/Get-ZimmermanTools/master/Get-ZimmermanTools.ps1'
+                url='https://raw.githubusercontent.com/EricZimmerman/Get-ZimmermanTools/d808d1dfe6446faf884576a8a1c11b6875197a19/Get-ZimmermanTools.ps1'
+                sha256='B9122527E7049D2AB3F9A58BC972189AAC62FAD9A83FDA59EA6B70C7360D7834'
                 dest='C:\DFIR\Tools\EZTools'
                 arguments=@('-NetVersion','9')
                 timeoutMinutes=45
@@ -627,12 +676,13 @@ function Get-BuiltInToolCatalog {
                 [PSCustomObject]@{ name='EZViewer'; target='C:/DFIR/Tools/EZTools/net9/EZViewer/EZViewer.exe' }
             )
             requires=@('tool-dotnet-desktop-9')
-            # Detect on the two GUI tools, not on a command-line one. A partial
-            # copy of the command-line tools is common, and it would otherwise
-            # be reported as a complete install. Either GUI tool proves a full run.
+            # A minimum inventory, not proof that every upstream tool downloaded.
+            detectMode='all'
             detect=@(
                 [PSCustomObject]@{ kind='file'; path='C:/DFIR/Tools/EZTools/net9/TimelineExplorer/TimelineExplorer.exe' },
-                [PSCustomObject]@{ kind='file'; path='C:/DFIR/Tools/EZTools/net9/RegistryExplorer/RegistryExplorer.exe' }
+                [PSCustomObject]@{ kind='file'; path='C:/DFIR/Tools/EZTools/net9/RegistryExplorer/RegistryExplorer.exe' },
+                [PSCustomObject]@{ kind='file'; path='C:/DFIR/Tools/EZTools/net9/EvtxECmd/EvtxECmd.exe' },
+                [PSCustomObject]@{ kind='file'; path='C:/DFIR/Tools/EZTools/net9/RECmd/RECmd.exe' }
             )
         },
         [PSCustomObject]@{
@@ -707,8 +757,8 @@ function Get-UninstallEntry([string]$Match) {
     )
     foreach ($root in $roots) {
         if (-not (Test-Path -LiteralPath $root)) { continue }
-        foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
-            $values = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+        foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction Stop)) {
+            $values = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
             $displayName = [string](Get-JsonField $values 'DisplayName' '')
             if ($displayName -and $displayName -like $Match) {
                 return [PSCustomObject]@{
@@ -733,8 +783,7 @@ function Get-DisplayVersion([string]$Version) {
     return $trimmed
 }
 
-function Find-InstalledTool($Tool) {
-    foreach ($rule in @($Tool.Detect)) {
+function Find-ToolDetectionRule($rule) {
         if ($rule.Kind -eq 'uninstall-key') {
             $entry = Get-UninstallEntry $rule.Match
             if ($entry) { return [PSCustomObject]@{ Version=(Get-DisplayVersion $entry.Version); Evidence="Windows lists it as '$($entry.Name)'." } }
@@ -743,7 +792,8 @@ function Find-InstalledTool($Tool) {
             if ($path.Contains('*') -or $path.Contains('?')) {
                 # A wildcard lets a rule match a versioned folder, such as the
                 # .NET runtime, whose exact patch number is not known in advance.
-                $matches = @(Get-Item -Path $path -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+                $matches = @(try { Get-Item -Path $path -ErrorAction Stop | Sort-Object Name -Descending }
+                    catch [System.Management.Automation.ItemNotFoundException] { })
                 if ($matches.Count) {
                     $item = $matches[0]
                     $version = if ($item.PSIsContainer) { $item.Name } else {
@@ -760,11 +810,55 @@ function Find-InstalledTool($Tool) {
             $command = Get-Command $rule.Command -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($command) { return [PSCustomObject]@{ Version=''; Evidence="Found $($command.Source) on the PATH." } }
         }
-    }
     return $null
 }
 
-function Install-WingetPackage($Tool) {
+function Get-RestartInstruction([string[]]$SettingNames) {
+    $names = @($SettingNames | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)
+    if ($names.Count -eq 1) {
+        return "$($names[0]) needs you to sign out and back in, or restart Windows, before it can finish applying. Then click Read settings again."
+    }
+    if ($names.Count -gt 1) {
+        return "These settings need you to sign out and back in, or restart Windows, before they can finish applying: $($names -join ', '). Then click Read settings again."
+    }
+    'Sign out and back in, or restart Windows, to finish applying the selected settings. Then click Read settings again.'
+}
+
+function Get-ToolDetection($Tool) {
+    $matched = New-Object Collections.ArrayList
+    $missing = New-Object Collections.ArrayList
+    $mode = [string](Get-JsonField $Tool 'DetectMode' 'any')
+    foreach ($rule in @($Tool.Detect)) {
+        $found = Find-ToolDetectionRule $rule
+        if ($found) { [void]$matched.Add($found); if ($mode -eq 'any') { break } }
+        else {
+            $label = switch ($rule.Kind) { 'file' { $rule.Path }; 'command' { $rule.Command }; default { $rule.Match } }
+            [void]$missing.Add([string]$label)
+        }
+    }
+    $complete = if ($mode -eq 'all') { $matched.Count -gt 0 -and $missing.Count -eq 0 } else { $matched.Count -gt 0 }
+    [PSCustomObject]@{
+        Complete=$complete; MatchedCount=$matched.Count; RequiredCount=@($Tool.Detect).Count; Mode=$mode
+        Version=$(if ($matched.Count) { $matched[0].Version } else { '' })
+        Evidence=(@($matched | ForEach-Object { $_.Evidence }) -join ' '); Missing=@($missing)
+    }
+}
+
+function Find-InstalledTool($Tool) {
+    $detection = Get-ToolDetection $Tool
+    if ($detection.Complete) { return $detection }
+    return $null
+}
+
+function Get-MissingToolRequirements($Tool) {
+    foreach ($id in @($Tool.Requires)) {
+        $required = Get-ToolCatalog | Where-Object Id -eq $id | Select-Object -First 1
+        if (-not $required) { [string]$id }
+        elseif (-not (Find-InstalledTool $required)) { [string]$required.Name }
+    }
+}
+
+function Install-WingetPackage($Tool, [bool]$AllowUpgrade = $false) {
     $TimeoutSeconds = $Tool.TimeoutSeconds
     $winget = Get-WingetPath
     if (-not $winget) { throw 'winget is not available on this computer, so Dingo cannot install anything.' }
@@ -772,13 +866,15 @@ function Install-WingetPackage($Tool) {
         'install','--id',$Tool.Package,'--exact','--source',$Tool.Source,'--scope',$Tool.Scope,
         '--accept-package-agreements','--accept-source-agreements','--disable-interactivity','--silent'
     )
+    if (-not $AllowUpgrade) { $arguments += '--no-upgrade' }
     Write-Log 'INFO' "Installing $($Tool.Name): winget $($arguments -join ' ')"
     $run = Invoke-ChildProcess $winget $arguments $TimeoutSeconds "The winget install of $($Tool.Package)"
     Write-Log 'DEBUG' "winget exit code $($run.ExitCode) for $($Tool.Package): $($run.Output)"
-    # The package is already present and there is nothing newer. Dingo asked for
-    # the tool to be installed, and it is, so that is a success.
-    if ($run.ExitCode -eq -1978335189) {
-        Write-Log 'INFO' "$($Tool.Name) was already installed and is up to date."
+    # UPDATE_NOT_APPLICABLE (0x8A15002B), or PACKAGE_ALREADY_INSTALLED
+    # (0x8A150061) when --no-upgrade prevented an implicit upgrade. The shared
+    # executor still verifies installation using the catalog's detection rules.
+    if ($run.ExitCode -eq -1978335189 -or (-not $AllowUpgrade -and $run.ExitCode -eq -1978335135)) {
+        Write-Log 'INFO' "$($Tool.Name) is already installed; winget made no change."
         return
     }
     if ($run.ExitCode -ne 0) {
@@ -786,29 +882,131 @@ function Install-WingetPackage($Tool) {
     }
 }
 
+function ConvertTo-NativeArgument([AllowEmptyString()][string]$Value) {
+    # Windows CRT argv rules: escape quotes and double trailing backslashes.
+    if ($Value.IndexOf([char]0) -ge 0) { throw 'A process argument contains a null character.' }
+    return '"' + [regex]::Replace([regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
+}
+
+function Initialize-ProcessOutputReader {
+    if ('Dingo.ProcessOutput' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+using System.Runtime.InteropServices;
+using System.ComponentModel;
+namespace Dingo {
+    public sealed class InstallerJob : System.IDisposable {
+        [StructLayout(LayoutKind.Sequential)] struct BasicLimits {
+            public long PerProcess, PerJob; public uint Flags; public System.UIntPtr Min, Max;
+            public uint ActiveLimit; public System.UIntPtr Affinity; public uint Priority, Scheduling;
+        }
+        [StructLayout(LayoutKind.Sequential)] struct IoCounters { public ulong A,B,C,D,E,F; }
+        [StructLayout(LayoutKind.Sequential)] struct Limits {
+            public BasicLimits Basic; public IoCounters Io; public System.UIntPtr ProcessMemory, JobMemory, PeakProcess, PeakJob;
+        }
+        [StructLayout(LayoutKind.Sequential)] struct Accounting {
+            public long A,B,C,D; public uint Faults, Total, Active, Terminated;
+        }
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern System.IntPtr CreateJobObject(System.IntPtr security, string name);
+        [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetInformationJobObject(System.IntPtr job, int kind, ref Limits info, uint size);
+        [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(System.IntPtr job, int kind, out Accounting info, uint size, System.IntPtr length);
+        [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(System.IntPtr job, System.IntPtr process);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(System.IntPtr handle);
+        System.IntPtr handle;
+        public InstallerJob() {
+            handle=CreateJobObject(System.IntPtr.Zero,null);
+            if (handle==System.IntPtr.Zero) throw new Win32Exception();
+            var limits=new Limits(); limits.Basic.Flags=0x2000;
+            if (!SetInformationJobObject(handle,9,ref limits,(uint)Marshal.SizeOf(typeof(Limits)))) { var error=new Win32Exception(); Dispose(); throw error; }
+        }
+        public void Assign(System.Diagnostics.Process process) {
+            if (!AssignProcessToJobObject(handle,process.Handle)) throw new Win32Exception();
+        }
+        public uint ActiveProcesses {
+            get { Accounting info; if (!QueryInformationJobObject(handle,1,out info,(uint)Marshal.SizeOf(typeof(Accounting)),System.IntPtr.Zero)) throw new Win32Exception(); return info.Active; }
+        }
+        public void Dispose() { if (handle!=System.IntPtr.Zero) { CloseHandle(handle); handle=System.IntPtr.Zero; } }
+    }
+    public static class ProcessOutput {
+        public static async Task<string> ReadTailAsync(StreamReader reader) {
+            var tail = new StringBuilder();
+            var buffer = new char[4096];
+            int count;
+            while ((count = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0) {
+                tail.Append(buffer, 0, count);
+                if (tail.Length > 65536) tail.Remove(0, tail.Length - 65536);
+            }
+            return tail.ToString();
+        }
+    }
+}
+'@
+}
+
+function Stop-InstallerProcessTree($Process) {
+    if ($Process.HasExited) { return }
+    $stop = New-Object Diagnostics.ProcessStartInfo
+    $stop.FileName = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    $stop.Arguments = "/PID $($Process.Id) /T /F"
+    $stop.UseShellExecute = $false
+    $stop.CreateNoWindow = $true
+    $stop.RedirectStandardOutput = $true
+    $stop.RedirectStandardError = $true
+    $killer = $null
+    try {
+        $killer = [Diagnostics.Process]::Start($stop)
+        $discardOutput = $killer.StandardOutput.ReadToEndAsync()
+        $discardError = $killer.StandardError.ReadToEndAsync()
+        if (-not $killer.WaitForExit(5000)) { $killer.Kill() }
+        elseif ($killer.ExitCode -ne 0) { Write-Log 'WARN' "Process-tree termination returned $($killer.ExitCode): $($discardError.Result)" }
+    } catch { Write-Log 'WARN' "Process-tree termination failed: $($_.Exception.Message)" }
+    finally { if ($killer) { $killer.Dispose() } }
+    if (-not $Process.HasExited) { try { $Process.Kill() } catch { Write-Log 'WARN' 'Installer process could not be stopped.' } }
+    [void]$Process.WaitForExit(5000)
+}
+
 function Invoke-ChildProcess([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label) {
     # Start-Process -PassThru does not keep the process handle, so its ExitCode
     # stays empty and a success would look like a failure. Own the handle here.
     $startInfo = New-Object Diagnostics.ProcessStartInfo
     $startInfo.FileName = $FilePath
-    $startInfo.Arguments = (@($Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' ')
+    if ($TimeoutSeconds -lt 1 -or $TimeoutSeconds -gt 14400) { throw 'Process timeout must be between 1 and 14400 seconds.' }
+    Initialize-ProcessOutputReader
+    $startInfo.Arguments = (@($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $process = $null
+    $job = New-Object Dingo.InstallerJob
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     try {
         $process = [Diagnostics.Process]::Start($startInfo)
-        # Read both pipes while the process runs, or a full pipe buffer deadlocks it.
-        $standardOutput = $process.StandardOutput.ReadToEndAsync()
-        $standardError = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            try { $process.Kill() } catch { Write-Log 'WARN' "Could not stop the $Label process." }
-            throw "$Label did not finish within $([math]::Round($TimeoutSeconds / 60)) minutes."
+        try { $job.Assign($process) } catch {
+            Stop-InstallerProcessTree $process
+            throw "Could not assign the installer to a process job; execution stopped: $($_.Exception.Message)"
         }
+        # Read both pipes while the process runs, or a full pipe buffer deadlocks it.
+        $standardOutput = [Dingo.ProcessOutput]::ReadTailAsync($process.StandardOutput)
+        $standardError = [Dingo.ProcessOutput]::ReadTailAsync($process.StandardError)
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $job.Dispose()
+            throw "$Label timed out after $TimeoutSeconds seconds. Process-tree termination was attempted; installation may be partial and detached installer services may still be active. Inspect the workstation before retrying."
+        }
+        while ($job.ActiveProcesses -gt 0) {
+            if ($watch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                $job.Dispose()
+                throw "$Label descendants timed out after $TimeoutSeconds seconds; installation may be partial. Inspect before retrying."
+            }
+            Start-Sleep -Milliseconds 50
+        }
+        if (-not $standardOutput.Wait(5000) -or -not $standardError.Wait(5000)) { throw "$Label exited but its output pipes stayed open. A descendant may still be running; inspect before retrying." }
         $output = (([string]$standardOutput.Result + ' ' + [string]$standardError.Result) -replace '\s+',' ').Trim()
         return [PSCustomObject]@{ ExitCode = $process.ExitCode; Output = $output }
     } finally {
+        $job.Dispose()
         if ($process) { $process.Dispose() }
     }
 }
@@ -825,10 +1023,18 @@ function Install-ScriptPackage($Tool) {
         # Windows PowerShell 5.1 can still default to an older protocol.
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         Write-Log 'INFO' "Downloading the $($Tool.Name) install script from $($Tool.Url)."
-        Invoke-WebRequest -Uri $Tool.Url -OutFile $scriptPath -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest -Uri $Tool.Url -OutFile $scriptPath -UseBasicParsing -TimeoutSec 120 -MaximumRedirection 0 -ErrorAction Stop
         # Record what was actually executed, so a run can be audited afterwards.
         $hash = (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
         Write-Log 'INFO' "Install script SHA256 $hash for $($Tool.Name)."
+        $expected = [string](Get-JsonField $Tool 'Sha256' '')
+        $signature = Get-AuthenticodeSignature -LiteralPath $scriptPath -ErrorAction Stop
+        Write-OperationJournal 'InstallerProvenance' ([Guid]::NewGuid().ToString('N')) $Tool.Id $Tool.Scope @{
+            Url=$Tool.Url; Sha256=$hash; ExpectedSha256=$expected; SignatureStatus=[string]$signature.Status
+            Signer=if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { '' }
+        }
+        if ($expected -and $hash -ine $expected) { throw "Installer SHA256 mismatch for $($Tool.Name); the script was not executed." }
+        if (-not $expected) { Write-Log 'WARN' "No expected SHA256 configured for $($Tool.Name). Recorded provenance is not a trust check." }
 
         if (-not (Test-Path -LiteralPath $Tool.Dest -PathType Container)) {
             New-Item -ItemType Directory -Path $Tool.Dest -Force -ErrorAction Stop | Out-Null
@@ -945,8 +1151,23 @@ function Test-ShimIsCurrent([string]$ShimPath, [string]$TargetPath) {
     return $content.Contains('"' + $TargetPath + '"')
 }
 
+function Assert-DingoFileOwnership([string]$Path, [ValidateSet('Shim','Shortcut')][string]$Kind) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $file = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Cannot replace '$Path': the destination is a directory or link."
+    }
+    $owned = if ($Kind -eq 'Shim') {
+        @(Get-Content -LiteralPath $Path -ErrorAction Stop) -contains $script:ShimMarker
+    } else {
+        (Read-ShortcutFile $Path).Description -eq $script:ShortcutMarker
+    }
+    if (-not $owned) { throw "Cannot replace '$Path': this file was not created by Dingo. Rename or move it before retrying." }
+}
+
 function Write-ToolShim([string]$Name, [string]$TargetPath) {
     $shimPath = Join-Path $script:ShimDirectory "$Name.cmd"
+    Assert-DingoFileOwnership $shimPath Shim
     $lines = @(
         '@echo off',
         $script:ShimMarker,
@@ -983,11 +1204,14 @@ function Get-ToolPathKindState($Setting) {
 
 function Set-ToolPathKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     if ($DesiredState -eq $Setting.PreferredState) {
+        $expected = Get-ExpectedShims
+        foreach ($name in @($expected.Keys)) {
+            Assert-DingoFileOwnership (Join-Path $script:ShimDirectory "$name.cmd") Shim
+        }
         if (-not (Test-Path -LiteralPath $script:ShimDirectory -PathType Container)) {
             New-Item -ItemType Directory -Path $script:ShimDirectory -Force -ErrorAction Stop | Out-Null
             Write-Log 'INFO' "Created $script:ShimDirectory."
         }
-        $expected = Get-ExpectedShims
         foreach ($name in @($expected.Keys)) { Write-ToolShim $name $expected[$name] }
         # Drop launchers Dingo wrote for programs that are no longer installed.
         foreach ($file in (Get-DingoShimFiles)) {
@@ -1069,6 +1293,7 @@ function Test-ShortcutIsCurrent([string]$Path, $Spec) {
 
 function Write-ToolShortcut([string]$Folder, [string]$Name, $Spec) {
     $shortcutPath = Join-Path $Folder ($Name + '.lnk')
+    Assert-DingoFileOwnership $shortcutPath Shortcut
     $shell = New-Object -ComObject WScript.Shell
     try {
         $link = $shell.CreateShortcut($shortcutPath)
@@ -1115,6 +1340,9 @@ function Set-ShortcutKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     $folder = Get-ShortcutSettingFolder $Setting
     $expected = Get-ExpectedShortcuts
     if ($DesiredState -eq $Setting.PreferredState) {
+        foreach ($name in @($expected.Keys)) {
+            Assert-DingoFileOwnership (Join-Path $folder ($name + '.lnk')) Shortcut
+        }
         if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
             New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop | Out-Null
             Write-Log 'INFO' "Created $folder."
@@ -1157,13 +1385,16 @@ function Get-AssociationProgId($Association) {
 }
 
 function Get-AssociationTarget($Association) {
-    return [Environment]::ExpandEnvironmentVariables($Association.Target)
+    # Catalog paths use forward slashes so Tools.json remains easy to edit, but
+    # Explorer's shell association launcher can reject an otherwise valid local
+    # executable command written in that form. Store a native Windows path.
+    return [Environment]::ExpandEnvironmentVariables($Association.Target).Replace('/', '\')
 }
 
 function Get-ExtensionUserChoice([string]$Extension) {
     $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$Extension\UserChoice"
     if (-not (Test-Path -LiteralPath $key)) { return '' }
-    $values = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+    $values = Get-ItemProperty -LiteralPath $key -ErrorAction Stop
     if ($values -and $values.PSObject.Properties['ProgId']) { return [string]$values.ProgId }
     return ''
 }
@@ -1171,29 +1402,64 @@ function Get-ExtensionUserChoice([string]$Extension) {
 function Get-ExtensionHandlerName([string]$Extension) {
     $key = "HKCU:\Software\Classes\$Extension"
     if (-not (Test-Path -LiteralPath $key)) { return '' }
-    $values = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+    $values = Get-ItemProperty -LiteralPath $key -ErrorAction Stop
     if ($values -and $values.PSObject.Properties['(default)']) { return [string]$values.'(default)' }
     return ''
 }
 
+function Get-AssociationRegistration($Association) {
+    $progId = Get-AssociationProgId $Association
+    $commandPath = "HKCU:\Software\Classes\$progId\shell\open\command"
+    $configuredOpenWithPath = "HKCU:\Software\Classes\$($Association.Extension)\OpenWithProgids"
+    # Explorer may copy a used handler into FileExts as REG_NONE. That second
+    # reference survives removal from Software\Classes unless it is tracked too.
+    $explorerOpenWithPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$($Association.Extension)\OpenWithProgids"
+    $command = if (Test-Path -LiteralPath $commandPath) {
+        [string](Get-Item -LiteralPath $commandPath -ErrorAction Stop).GetValue('', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    } else { '' }
+    $configuredOpenWith = (Test-Path -LiteralPath $configuredOpenWithPath) -and
+        (@((Get-Item -LiteralPath $configuredOpenWithPath -ErrorAction Stop).GetValueNames()) -contains $progId)
+    $explorerOpenWith = (Test-Path -LiteralPath $explorerOpenWithPath) -and
+        (@((Get-Item -LiteralPath $explorerOpenWithPath -ErrorAction Stop).GetValueNames()) -contains $progId)
+    [PSCustomObject]@{
+        Command = $command
+        OpenWithRegistered = [bool]($configuredOpenWith -or $explorerOpenWith)
+        ConfiguredOpenWithRegistered = [bool]$configuredOpenWith
+        ExplorerOpenWithRegistered = [bool]$explorerOpenWith
+    }
+}
+
 function Get-AssociationStatus($Association) {
-    # Windows protects an extension that already carries a user choice with an
-    # undocumented hash. Nothing can take one of those, so it is reported as
-    # blocked rather than attempted and failed.
     $target = Get-AssociationTarget $Association
     $progId = Get-AssociationProgId $Association
     $current = Get-ExtensionHandlerName $Association.Extension
     $userChoice = Get-ExtensionUserChoice $Association.Extension
-    $state = if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { 'ToolMissing' }
-             elseif ($userChoice -and $userChoice -ne $progId) { 'Blocked' }
-             elseif ($current -eq $progId) { 'Ours' }
-             else { 'Available' }
+    $registration = Get-AssociationRegistration $Association
+    $commandCurrent = $registration.Command -eq ('"{0}" "%1"' -f $target)
+    $targetExists = Test-Path -LiteralPath $target -PathType Leaf
+    $blocked = [bool]($userChoice -and $userChoice -ne $progId)
+    $defaultRegistered = $userChoice -eq $progId -or (-not $userChoice -and $current -eq $progId)
+    $state = if (-not $targetExists) { 'ToolMissing' }
+        elseif (($defaultRegistered -or $registration.OpenWithRegistered) -and -not $commandCurrent) { 'BrokenRegistration' }
+        elseif (-not $defaultRegistered -and $commandCurrent -and $registration.OpenWithRegistered) { 'OpenWithOnly' }
+        elseif ($blocked) { 'Blocked' }
+        elseif ($defaultRegistered -and $commandCurrent) { 'DefaultRegistered' }
+        else { 'Available' }
     return [PSCustomObject]@{
         Extension = $Association.Extension
         ProgId = $progId
         Target = $target
         Current = $current
+        UserChoice = $userChoice
         State = $state
+        Status = 'Present'
+        Command = $registration.Command
+        CommandCurrent = [bool]$commandCurrent
+        OpenWithRegistered = $registration.OpenWithRegistered
+        ConfiguredOpenWithRegistered = $registration.ConfiguredOpenWithRegistered
+        ExplorerOpenWithRegistered = $registration.ExplorerOpenWithRegistered
+        PreferredSatisfied = [bool]($targetExists -and $commandCurrent -and $registration.ConfiguredOpenWithRegistered -and ($defaultRegistered -or $blocked))
+        AlternateSatisfied = [bool]($current -ne $progId -and $userChoice -ne $progId -and -not $registration.OpenWithRegistered)
     }
 }
 
@@ -1256,11 +1522,17 @@ function Add-AssociationOpenWithEntry($Association) {
 }
 
 function Remove-AssociationOpenWithEntry($Association) {
-    $key = "HKCU:\Software\Classes\$($Association.Extension)\OpenWithProgids"
-    if (-not (Test-Path -LiteralPath $key)) { return }
-    Remove-ItemProperty -LiteralPath $key -Name (Get-AssociationProgId $Association) -Force -ErrorAction SilentlyContinue
-    if (-not @((Get-Item -LiteralPath $key).GetValueNames() | Where-Object { $_ }).Count) {
-        Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue
+    $progId = Get-AssociationProgId $Association
+    $keys = @(
+        "HKCU:\Software\Classes\$($Association.Extension)\OpenWithProgids",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$($Association.Extension)\OpenWithProgids"
+    )
+    foreach ($key in $keys) {
+        if (-not (Test-Path -LiteralPath $key)) { continue }
+        Remove-ItemProperty -LiteralPath $key -Name $progId -Force -ErrorAction SilentlyContinue
+        if (-not @((Get-Item -LiteralPath $key).GetValueNames() | Where-Object { $_ }).Count) {
+            Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -1286,91 +1558,111 @@ function Remove-EmptyExtensionKey([string]$Extension) {
 
 function Get-AssociationKindState($Setting) {
     $items = @($Setting.Entries | ForEach-Object { Get-AssociationStatus $_ })
-    $ready = @($items | Where-Object { $_.State -ne 'ToolMissing' })
-    if (-not $ready.Count) {
-        return (New-StateResult 'Partial' 'Tool not installed' 'Dingo can set these file types once the tool itself is installed.')
-    }
-    $blocked = @($items | Where-Object State -eq 'Blocked')
-    $changeable = @($items | Where-Object { $_.State -in @('Ours', 'Available') })
-    $ours = @($items | Where-Object State -eq 'Ours')
-    $notes = New-Object System.Collections.ArrayList
-    if ($blocked.Count) {
-        $them = if ($blocked.Count -eq 1) { 'it' } else { 'them' }
-        [void]$notes.Add(("Windows will not let anything take {0}, because another app already owns {1}. Dingo adds this tool to the Open with list for {1} instead." -f
-            (Join-WordList @($blocked | ForEach-Object { $_.Extension })), $them))
-    }
-    if ($changeable.Count -and $ours.Count -eq $changeable.Count) {
-        [void]$notes.Insert(0, ("{0} {1} with this tool." -f (Join-WordList @($ours | ForEach-Object { $_.Extension })), $(if ($ours.Count -eq 1) { 'opens' } else { 'open' })))
-        return (New-StateResult 'Preferred' $Setting.PreferredState ($notes -join ' '))
-    }
-    if (-not $ours.Count) {
-        [void]$notes.Insert(0, ("{0} {1} whatever Windows uses now." -f (Join-WordList @($changeable | ForEach-Object { $_.Extension })), $(if ($changeable.Count -eq 1) { 'keeps' } else { 'keep' })))
-        return (New-StateResult 'Alternate' $Setting.AlternateState ($notes -join ' '))
-    }
-    [void]$notes.Insert(0, ("{0} of {1} file types open with this tool." -f $ours.Count, $changeable.Count))
-    return (New-StateResult 'Partial' 'Partly set' ($notes -join ' '))
+    $preferred = @($items | Where-Object PreferredSatisfied).Count
+    $alternate = @($items | Where-Object AlternateSatisfied).Count
+    $fallback = @($items | Where-Object State -eq 'OpenWithOnly').Count
+    $status = if ($items.Count -and $preferred -eq $items.Count) { 'Preferred' }
+        elseif ($items.Count -and $alternate -eq $items.Count) { 'Alternate' } else { 'Partial' }
+    $text = if ($status -eq 'Preferred') {
+        if ($fallback) { "Configured; Open with fallback for $fallback type(s)" } else { 'Default registrations configured' }
+    } elseif ($status -eq 'Alternate') { $Setting.AlternateState } else { 'Associations partly configured' }
+    $notes = @($items | ForEach-Object {
+        "$($_.Extension): $($_.State); open command valid=$($_.CommandCurrent); configured Open with=$($_.ConfiguredOpenWithRegistered); Explorer Open with=$($_.ExplorerOpenWithRegistered); user choice='$($_.UserChoice)'"
+    }) -join '; '
+    $result = New-StateResult $status $text "$notes. Checks cover registry configuration and target presence; applications are not launched."
+    $result | Add-Member NoteProperty Associations $items
+    return $result
 }
 
-function Set-AssociationKindPart($Setting, [string]$DesiredState, [string]$Scope) {
-    $associations = @($Setting.Entries)
-    if ($DesiredState -eq $Setting.PreferredState) {
-        $ready = @($associations | Where-Object { (Get-AssociationStatus $_).State -ne 'ToolMissing' })
-        if (-not $ready.Count) { throw 'The program these file types would open is not installed yet.' }
-        foreach ($association in $ready) {
-            $status = Get-AssociationStatus $association
-            Register-AssociationProgId $association
-            Add-AssociationOpenWithEntry $association
-            # A blocked extension cannot be taken at all. The Open with entry
-            # above is everything Windows allows, so stop there.
-            if ($status.State -eq 'Blocked') {
-                Write-Log 'INFO' "$($association.Extension) is owned by '$($status.Current)'; added an Open with entry only."
-                continue
-            }
-            if ($status.Current -ne $status.ProgId) { Save-AssociationBackup $association.Extension $status.Current }
-            New-Item -Path "HKCU:\Software\Classes\$($association.Extension)" -Force -ErrorAction Stop | Out-Null
-            Set-ItemProperty -Path "HKCU:\Software\Classes\$($association.Extension)" -Name '(default)' -Value $status.ProgId -ErrorAction Stop
-            if ((Get-ExtensionHandlerName $association.Extension) -ne $status.ProgId) {
-                throw "Verification failed: $($association.Extension) still opens with something else."
-            }
-            Write-Log 'INFO' "$($association.Extension) now opens with $($status.Target)."
-        }
-    } else {
-        foreach ($association in $associations) {
-            $progId = Get-AssociationProgId $association
-            if ((Get-ExtensionHandlerName $association.Extension) -eq $progId) {
-                $previous = Get-AssociationBackup $association.Extension
-                if ($previous) {
-                    Set-ItemProperty -Path "HKCU:\Software\Classes\$($association.Extension)" -Name '(default)' -Value $previous -ErrorAction Stop
+function Set-AssociationKindPart($Setting, [string]$DesiredState, [string]$Scope, $EntryResults = $null) {
+    $failures = New-Object Collections.ArrayList
+    foreach ($association in @($Setting.Entries)) {
+        $before = [PSCustomObject]@{ Status='Error'; Message='Before-state unavailable.' }
+        $outcome = 'Succeeded'; $message = ''
+        try {
+            $before = Get-AssociationStatus $association
+            $progId = $before.ProgId
+            if ($DesiredState -eq $Setting.PreferredState) {
+                if ($before.State -eq 'ToolMissing') { throw "Target program is missing: $($before.Target)" }
+                Register-AssociationProgId $association
+                # Preserve any protected user choice. A verified Open With entry
+                # is a successful fallback, not a claim that the default changed.
+                $choice = Get-ExtensionUserChoice $association.Extension
+                if ($choice -and $choice -ne $progId) {
+                    $message = "Open with registered; protected default '$choice' retained."
                 } else {
-                    Remove-ExtensionHandlerName $association.Extension
+                    if ($before.Current -ne $progId) { Save-AssociationBackup $association.Extension $before.Current }
+                    $extensionPath = "HKCU:\Software\Classes\$($association.Extension)"
+                    if (-not (Test-Path -LiteralPath $extensionPath)) { New-Item -Path $extensionPath -ErrorAction Stop | Out-Null }
+                    Set-ItemProperty -Path $extensionPath -Name '(default)' -Value $progId -ErrorAction Stop
+                    $message = 'Default and Open with registrations configured; open command verified.'
                 }
-                if ((Get-ExtensionHandlerName $association.Extension) -eq $progId) {
-                    throw "Verification failed: $($association.Extension) still points at Dingo's handler."
+                # Write this after the extension default. Windows PowerShell 5.1's
+                # registry provider can recreate a key passed to New-Item -Force,
+                # which removes an OpenWithProgids child written beforehand.
+                Add-AssociationOpenWithEntry $association
+                if (-not (Get-AssociationStatus $association).PreferredSatisfied) { throw 'Association registration verification failed.' }
+            } else {
+                if ($before.UserChoice -eq $progId) {
+                    throw 'Windows still selects this handler through UserChoice. Choose another default in Windows Settings before removing this association; registration retained.'
                 }
+                if ($before.Current -eq $progId) {
+                    $previous = Get-AssociationBackup $association.Extension
+                    if ($previous) { Set-ItemProperty -Path "HKCU:\Software\Classes\$($association.Extension)" -Name '(default)' -Value $previous -ErrorAction Stop }
+                    else { Remove-ExtensionHandlerName $association.Extension }
+                }
+                Remove-AssociationOpenWithEntry $association
+                Remove-EmptyExtensionKey $association.Extension
+                if (-not (Get-AssociationStatus $association).AlternateSatisfied) { throw 'Dingo association references remain after removal.' }
+                Remove-AssociationBackup $association.Extension
+                # Keep the ProgID: other extensions or protected choices outside
+                # this card may reference it. Do not invalidate their commands.
+                $message = 'Extension default restored and Open with entry removed; shared program registration retained.'
             }
-            Remove-AssociationBackup $association.Extension
-            Remove-AssociationOpenWithEntry $association
-            Remove-EmptyExtensionKey $association.Extension
-            Remove-Item -LiteralPath "HKCU:\Software\Classes\$progId" -Recurse -Force -ErrorAction SilentlyContinue
+        } catch {
+            $outcome = 'Failed'; $message = $_.Exception.Message
+            [void]$failures.Add("$($association.Extension): $message")
         }
+        $after = try { Get-AssociationStatus $association } catch { [PSCustomObject]@{ Status='Error'; Message=$_.Exception.Message } }
+        $component = New-ChangeComponent $association.Extension $Scope $outcome $message $before $after $DesiredState
+        if ($null -ne $EntryResults) { [void]$EntryResults.Add($component) }
+        Write-Log 'INFO' ("ENTRY " + (ConvertTo-Json -InputObject $component -Depth 8 -Compress))
     }
     Send-AssociationChange
+    if ($failures.Count) { throw ($failures -join '; ') }
 }
 
 function Get-PackageKindState($Setting) {
     $tool = @($Setting.Entries)[0]
-    $found = Find-InstalledTool $tool
-    if (-not $found) {
-        return (New-StateResult 'Partial' 'Not installed' "Dingo checked the Windows uninstall list and the usual folders for $($tool.Name).")
-    }
-    $text = if ($found.Version) { "Installed ($($found.Version))" } else { 'Installed' }
-    return (New-StateResult 'Preferred' $text $found.Evidence)
+    $found = Get-ToolDetection $tool
+    $missingRuntime = @(Get-MissingToolRequirements $tool)
+    $detail = "Detection: $($found.MatchedCount)/$($found.RequiredCount) rules matched ($($found.Mode)). $($found.Evidence)"
+    if (-not $found.Complete) { $detail += " Missing detection targets: $($found.Missing -join '; ')." }
+    if ($missingRuntime.Count) { $detail += " Missing prerequisites: $($missingRuntime -join ', ')." }
+    $status = if ($found.Complete -and -not $missingRuntime.Count) { 'Preferred' } else { 'Partial' }
+    $text = if (-not $found.Complete) {
+        if ($found.MatchedCount) { 'Incomplete installation' } else { 'Not installed' }
+    } elseif ($missingRuntime.Count) { 'Detected; prerequisites missing' }
+    elseif ($found.Mode -eq 'all') { 'Minimum inventory detected' }
+    elseif ($found.Version) { "Installed ($($found.Version))" } else { 'Installed' }
+    $state = New-StateResult $status $text "$detail Detection does not prove tool execution or every upstream download."
+    $state | Add-Member NoteProperty Detection $found
+    $state | Add-Member NoteProperty MissingPrerequisites $missingRuntime
+    return $state
 }
 
 function Set-PackageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     $tool = @($Setting.Entries)[0]
-    if ($DesiredState -ne $Setting.PreferredState) { throw "Dingo installs $($tool.Name) but never removes it." }
-    if ($tool.InstallKind -eq 'winget') { Install-WingetPackage $tool }
+    $update = $DesiredState -eq 'Update installed tool'
+    if ($DesiredState -ne $Setting.PreferredState -and -not $update) { throw "Dingo installs or updates $($tool.Name) but never removes it." }
+    # Recheck in the executing account immediately before invoking an installer.
+    $installed = Find-InstalledTool $tool
+    if ($installed -and -not $update) {
+        Write-Log 'INFO' "$($tool.Name) is already installed ($($installed.Version)); leaving it unchanged."
+        return
+    }
+    if ($update -and -not $installed) { throw "$($tool.Name) is not installed. Choose Installed to install it first." }
+    if ($tool.InstallKind -eq 'winget') { Install-WingetPackage $tool $update }
     elseif ($tool.InstallKind -eq 'script') { Install-ScriptPackage $tool }
     else { throw "Install kind '$($tool.InstallKind)' is not supported in this version of Dingo." }
 }
@@ -1444,7 +1736,7 @@ function Get-Settings {
         (New-Entry User 'SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsCopilot' 'AllowCopilotRuntime' 0 1)
     ) $true $true))
 
-    [void]$settings.Add((New-Setting 'windows-update-continuity' 'Windows Update' 'Forensic continuity: manual updates and restarts' 'CAUTION: for Windows 11 Pro/Enterprise/Education forensic workstations. Prevents automatic Windows Update downloads/installations, disables update deadlines, blocks update restarts while a user is signed in, and suppresses all update notifications. Check, install, and restart manually during a controlled maintenance window. It cannot cancel a restart that is already pending or override policies continually enforced by your organisation.' 'Protected; manual maintenance' 'Windows-managed/default' 'Registry' @(
+    [void]$settings.Add((New-Setting 'windows-update-continuity' 'Windows Update' 'Forensic continuity: manual update configuration' 'CAUTION: configures registry policies for manual update maintenance and suppresses update notifications, including restart warnings. Dingo verifies the stored values, not effective restart prevention. Pending restarts, Windows policy prerequisites, and organisation management can affect behavior. Schedule maintenance and independently check restart conditions before processing evidence.' 'Configured; manual maintenance' 'Windows-managed/default' 'Registry' @(
         (New-Entry Machine $windowsUpdateAU 'NoAutoUpdate' 1 $script:RemoveValue),
         (New-Entry Machine $windowsUpdateAU 'NoAutoRebootWithLoggedOnUsers' 1 $script:RemoveValue),
         (New-Entry Machine $windowsUpdate 'SetComplianceDeadlineForQU' 0 $script:RemoveValue),
@@ -1497,17 +1789,19 @@ function Get-Settings {
     # None of these are protected policies, so they apply on an unmanaged VM.
     # The three NewTabPage values are what actually removes the news feed,
     # weather, and background images; WinUtil's Edge debloat does not cover them.
-    [void]$settings.Add((New-Setting 'edge-debloat' 'Microsoft Edge' 'Clutter, promotions, and new tab page' 'Remove the new tab page news feed, weather, background images, and quick links, plus Collections, shopping, Rewards, wallet donations, Insider and default-browser promotions, the web widget, feedback, telemetry, and the Copilot Discover Chat extension. Sends Do Not Track. Restart Edge to finish applying it.' 'Removed' 'Edge default' 'Registry' @(
+    [void]$settings.Add((New-Setting 'edge-debloat' 'Microsoft Edge' 'Clutter, promotions, and new tab page' 'Remove the new tab page news feed, weather, background images, and quick links, plus Collections, shopping, Rewards, Insider and default-browser promotions, feedback, telemetry, and the Copilot Discover Chat extension. Sends Do Not Track. Restart Edge to finish applying it.' 'Removed' 'Edge default' 'Registry' @(
         (New-Entry Machine $edge 'NewTabPageContentEnabled' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'NewTabPageAllowedBackgroundTypes' 3 $script:RemoveValue),
         (New-Entry Machine $edge 'NewTabPageQuickLinksEnabled' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'EdgeCollectionsEnabled' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'EdgeShoppingAssistantEnabled' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'ShowMicrosoftRewards' 0 $script:RemoveValue),
-        (New-Entry Machine $edge 'WalletDonationEnabled' 0 $script:RemoveValue),
+        # These retired policies were written by earlier Dingo versions. Remove
+        # them for either card choice so an upgrade cleans up existing machines.
+        (New-Entry Machine $edge 'WalletDonationEnabled' $script:RemoveValue $script:RemoveValue),
         (New-Entry Machine $edge 'MicrosoftEdgeInsiderPromotionEnabled' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'DefaultBrowserSettingsCampaignEnabled' 0 $script:RemoveValue),
-        (New-Entry Machine $edge 'WebWidgetAllowed' 0 $script:RemoveValue),
+        (New-Entry Machine $edge 'WebWidgetAllowed' $script:RemoveValue $script:RemoveValue),
         (New-Entry Machine $edge 'UserFeedbackAllowed' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'AlternateErrorPagesEnabled' 0 $script:RemoveValue),
         (New-Entry Machine $edge 'EdgeAssetDeliveryServiceEnabled' 0 $script:RemoveValue),
@@ -1557,7 +1851,7 @@ function Get-Settings {
         $settingId = 'assoc-' + ($tool.Id -replace '^tool-', '')
         [void]$settings.Add((New-Setting $settingId $tool.Category "$($tool.Name) file types" `
             ("Open $($extensions -join ', ') with $($tool.Name). This is a choice for your account only, so no administrator approval is needed. Windows refuses to hand over a file type another app already owns; Dingo says which ones on the card and adds an Open with entry for those instead.") `
-            'Opens with this tool' 'Whatever Windows uses' 'Association' @($tool.Associations) $false $false @{} 'File associations'))
+            'Configure defaults / Open with' 'Dingo extension choices removed' 'Association' @($tool.Associations) $false $false @{} 'File associations'))
     }
     return ,$settings
 }
@@ -1583,16 +1877,17 @@ function Get-EntryValue($Entry) {
     $path = Get-EntryPath $Entry
     try {
         if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) {
-            return [PSCustomObject]@{ Status='Missing'; Exists=$false; Value=$null; ErrorMessage='' }
+            return [PSCustomObject]@{ Status='Missing'; Exists=$false; Value=$null; ValueType=''; ErrorMessage='' }
         }
         $properties = Get-ItemProperty -LiteralPath $path -ErrorAction Stop
         $property = $properties.PSObject.Properties[$Entry.Name]
         if (-not $property) {
-            return [PSCustomObject]@{ Status='Missing'; Exists=$false; Value=$null; ErrorMessage='' }
+            return [PSCustomObject]@{ Status='Missing'; Exists=$false; Value=$null; ValueType=''; ErrorMessage='' }
         }
-        return [PSCustomObject]@{ Status='Present'; Exists=$true; Value=$property.Value; ErrorMessage='' }
+        $valueType = [string](Get-Item -LiteralPath $path -ErrorAction Stop).GetValueKind($Entry.Name)
+        return [PSCustomObject]@{ Status='Present'; Exists=$true; Value=$property.Value; ValueType=$valueType; ErrorMessage='' }
     } catch {
-        return [PSCustomObject]@{ Status='Error'; Exists=$false; Value=$null; ErrorMessage=$_.Exception.Message }
+        return [PSCustomObject]@{ Status='Error'; Exists=$false; Value=$null; ValueType=''; ErrorMessage=$_.Exception.Message }
     }
 }
 
@@ -1602,7 +1897,7 @@ function Test-EntryValue($Entry, $Expected) {
         throw "Could not read $(Get-EntryPath $Entry)\$($Entry.Name): $($actual.ErrorMessage)"
     }
     if ($Expected -eq $script:RemoveValue) { return -not $actual.Exists }
-    return $actual.Exists -and ([string]$actual.Value -eq [string]$Expected)
+    return $actual.Exists -and $actual.ValueType -eq $Entry.Type -and ([string]$actual.Value -ceq [string]$Expected)
 }
 
 function Set-EntryValue($Entry, $DesiredState, $Setting) {
@@ -1676,6 +1971,7 @@ function ConvertTo-StrictJson([string]$Text) {
             if ($next -eq '*') {
                 $index += 2
                 while ($index + 1 -lt $length -and -not ($Text[$index] -eq '*' -and $Text[$index + 1] -eq '/')) { $index++ }
+                if ($index + 1 -ge $length) { throw 'Unterminated JSONC block comment.' }
                 $index += 2
                 # Keep the JSON tokens either side of the comment apart.
                 [void]$builder.Append(' ')
@@ -1685,8 +1981,30 @@ function ConvertTo-StrictJson([string]$Text) {
         [void]$builder.Append($character)
         $index++
     }
-    # A comma before a closing brace or bracket is legal in JSONC but not in JSON.
-    return ([regex]::Replace($builder.ToString(), ',(?=\s*[}\]])', ''))
+    # Remove trailing commas only outside strings, after comments have become
+    # whitespace. A regex here would also change text such as "keep,}".
+    $clean = $builder.ToString()
+    [void]$builder.Clear()
+    $inString = $false
+    for ($index = 0; $index -lt $clean.Length; $index++) {
+        $character = $clean[$index]
+        if ($inString) {
+            [void]$builder.Append($character)
+            if ($character -eq '\' -and $index + 1 -lt $clean.Length) {
+                $index++
+                [void]$builder.Append($clean[$index])
+            } elseif ($character -eq '"') { $inString = $false }
+            continue
+        }
+        if ($character -eq '"') { $inString = $true }
+        if ($character -eq ',') {
+            $nextIndex = $index + 1
+            while ($nextIndex -lt $clean.Length -and [char]::IsWhiteSpace($clean[$nextIndex])) { $nextIndex++ }
+            if ($nextIndex -lt $clean.Length -and $clean[$nextIndex] -in @('}',']')) { continue }
+        }
+        [void]$builder.Append($character)
+    }
+    return $builder.ToString()
 }
 
 function Read-JsonFileTolerantly([string]$Path) {
@@ -1890,6 +2208,9 @@ function Get-RegistryKindState($Setting) {
     if ($Setting.Id -eq 'windows-copilot' -and $state.Status -eq 'Preferred' -and (Test-CopilotTaskbarPinned)) {
         return New-StateResult 'Partial' "$($state.DisplayText); Copilot app pinned to taskbar"
     }
+    if (@($Setting.Entries | Where-Object { $_.Path -match '(^SOFTWARE\\Policies\\|PolicyManager\\)' }).Count -and $state.Status -in @('Preferred','Alternate') -and $state.DisplayText -notlike 'Configured*') {
+        $state.DisplayText = "Configured: $($state.DisplayText)"
+    }
     return $state
 }
 
@@ -1934,8 +2255,30 @@ function Get-TerminalKindState($Setting) {
 
 function Get-WidgetsKindState($Setting) { New-StateResultForSetting $Setting (Get-WidgetsPackageState) }
 
-function Set-RegistryKindPart($Setting, [string]$DesiredState, [string]$Scope) {
-    foreach ($entry in @($Setting.Entries | Where-Object Scope -eq $Scope)) { Set-EntryValue $entry $DesiredState $Setting }
+function Set-RegistryKindPart($Setting, [string]$DesiredState, [string]$Scope, $EntryResults = $null) {
+    $failure = ''
+    foreach ($entry in @($Setting.Entries | Where-Object Scope -eq $Scope)) {
+        $target = "$(Get-EntryPath $entry)\$($entry.Name)"
+        $wanted = if ($DesiredState -eq $Setting.PreferredState) { $entry.Preferred } else { $entry.Alternate }
+        $before = Get-EntryValue $entry
+        $outcome = 'Skipped'; $message = 'Not attempted after an earlier entry failed.'
+        if (-not $failure) {
+            try {
+                if ($before.Status -eq 'Error') { throw "Cannot read before-state: $($before.ErrorMessage)" }
+                Set-EntryValue $entry $DesiredState $Setting
+                $outcome = 'Succeeded'; $message = 'Registry value and type read back successfully.'
+            } catch {
+                $outcome = 'Failed'; $message = $_.Exception.Message; $failure = "$target : $message"
+            }
+        }
+        $after = Get-EntryValue $entry
+        $component = New-ChangeComponent $target $Scope $outcome $message $before $after ([PSCustomObject]@{
+            Exists=($wanted -ne $script:RemoveValue); Value=$(if ($wanted -ne $script:RemoveValue) { $wanted } else { $null }); ValueType=$entry.Type
+        })
+        if ($null -ne $EntryResults) { [void]$EntryResults.Add($component) }
+        Write-Log 'INFO' ("ENTRY " + (ConvertTo-Json -InputObject $component -Depth 8 -Compress))
+    }
+    if ($failure) { throw $failure }
     if ($Scope -eq 'User' -and $Setting.Id -eq 'iso-time') {
         Send-InternationalSettingChange
         $override = try { (Get-WinUILanguageOverride).Name } catch { '' }
@@ -1985,6 +2328,7 @@ function Get-SettingState($Setting) {
         $handler = Get-SettingHandler $Setting.Kind
         $readCommand = [string]$handler.Read
         $state = & $readCommand $Setting
+        $state | Add-Member NoteProperty VerificationBasis (Get-VerificationDescription $Setting) -Force
         # A setting can be written and verified and still do nothing, so carry the
         # caveat with the state rather than reporting an unqualified success.
         $advisory = Get-SettingAdvisory $Setting
@@ -1999,18 +2343,77 @@ function Get-SettingState($Setting) {
     }
 }
 
-function Set-SettingPart($Setting, [string]$DesiredState, [ValidateSet('User','Machine','ElevatedUser')][string]$Scope) {
+function Set-SettingPart($Setting, [string]$DesiredState, [ValidateSet('User','Machine','ElevatedUser')][string]$Scope, $EntryResults = $null) {
     if ($DesiredState -notin $Setting.StateOptions) { throw "Invalid desired state '$DesiredState'." }
     if (-not (Test-SettingHasScope $Setting $Scope)) { throw "Setting '$($Setting.Id)' does not support scope '$Scope'." }
     $handler = Get-SettingHandler $Setting.Kind
     $applyCommand = [string]$handler.Apply
-    & $applyCommand $Setting $DesiredState $Scope
+    if ($Setting.Kind -in @('Registry','Association')) { & $applyCommand $Setting $DesiredState $Scope $EntryResults }
+    else { & $applyCommand $Setting $DesiredState $Scope }
+}
+
+function Get-VerificationDescription($Setting) {
+    switch ($Setting.Kind) {
+        'Registry' { 'Registry value, type, or absence checked; effective Windows/application behavior is not verified.' }
+        'Association' { 'Extension choices, Open with entries, open commands, and target presence checked; applications were not launched.' }
+        'Package' { 'Catalog detection rules and declared prerequisites checked; execution and every upstream download are not verified.' }
+        default { 'Current state checked using the setting handler; restart/sign-in requirements still apply.' }
+    }
+}
+
+function New-ChangeComponent($Target, $Scope, $Outcome, $Message, $Before, $After, $Requested) {
+    $change = if ($Outcome -eq 'Skipped') { 'NotAttempted' }
+        elseif ($Before.Status -eq 'Error' -or $After.Status -eq 'Error') { 'Unknown' }
+        elseif ((ConvertTo-Json -InputObject $Before -Depth 8 -Compress) -ceq (ConvertTo-Json -InputObject $After -Depth 8 -Compress)) { 'Unchanged' }
+        else { 'Changed' }
+    $component = New-OperationComponent $Target $Outcome $Message
+    $component | Add-Member NoteProperty Scope $Scope
+    $component | Add-Member NoteProperty Before $Before
+    $component | Add-Member NoteProperty After $After
+    $component | Add-Member NoteProperty Requested $Requested
+    $component | Add-Member NoteProperty ChangeStatus $change
+    return $component
+}
+
+function Invoke-SettingPartResults($Setting, $DesiredState, $Scope) {
+    $entries = New-Object Collections.ArrayList
+    $operationId = [Guid]::NewGuid().ToString('N')
+    try {
+        Write-OperationJournal Started $operationId $Setting.Id $Scope @{ DesiredState=$DesiredState; BeforeState=$Setting.CurrentState }
+        Set-SettingPart $Setting $DesiredState $Scope $entries
+        if (-not $entries.Count) { [void]$entries.Add((New-OperationComponent $Scope Succeeded 'Handler completed; final state verification follows.')) }
+    } catch {
+        if (-not @($entries | Where-Object Outcome -eq 'Failed').Count) {
+            [void]$entries.Add((New-OperationComponent $Scope Failed $_.Exception.Message))
+        }
+    }
+    try { Write-OperationJournal Completed $operationId $Setting.Id $Scope @{ Components=@($entries) } }
+    catch { [void]$entries.Add((New-OperationComponent 'Recovery journal' Failed "Could not persist completion: $($_.Exception.Message)")) }
+    return @($entries)
 }
 
 function Write-WorkerResults([System.Collections.IEnumerable]$Results, [string]$Path) {
     $items = @($Results)
     $json = if ($items.Count) { ConvertTo-Json -InputObject $items -Depth 8 } else { '[]' }
     Write-Utf8FileAtomically $Path $json
+}
+
+function New-ApplyPlan([array]$Selected) {
+    # Copy only the model, never WPF controls. Deep-copy nested entries and
+    # requirements so later card edits cannot alter a preflighted operation.
+    foreach ($item in $Selected) {
+        $model = $item | Select-Object Selected,Id,Category,Name,Description,PreferredState,AlternateState,DesiredState,
+            DefaultState,DisplayScope,Tab,StateOptions,CanChoose,CurrentState,Status,Details,LastApplyResult,
+            Kind,Entries,RequiresAdmin,RestartExplorer,RestartRequired,Requirements
+        [Management.Automation.PSSerializer]::Deserialize([Management.Automation.PSSerializer]::Serialize($model, 100))
+    }
+}
+
+function Publish-PlanState($Item) {
+    $card = $script:Settings | Where-Object Id -eq $Item.Id | Select-Object -First 1
+    if (-not $card) { return }
+    # Results may flow back to the UI; editable choices never flow into the plan.
+    foreach ($name in @('Status','Details','CurrentState','LastApplyResult')) { $card.$name = $Item.$name }
 }
 
 function Invoke-AdministratorPlan([array]$Plan, [array]$AllSettings, [string]$CheckpointPath = '') {
@@ -2028,16 +2431,10 @@ function Invoke-AdministratorPlan([array]$Plan, [array]$AllSettings, [string]$Ch
         foreach ($scope in @('Machine','ElevatedUser')) {
             if (-not (Test-SettingHasScope $setting $scope)) { continue }
             $componentName = if ($scope -eq 'Machine') { 'Whole computer' } else { 'Protected account policy' }
-            try {
-                Set-SettingPart $setting ([string]$request.DesiredState) $scope
-                [void]$components.Add((New-OperationComponent $componentName 'Succeeded' 'Applied and verified.'))
-            } catch {
-                [void]$components.Add((New-OperationComponent $componentName 'Failed' $_.Exception.Message))
-                Write-Log 'ERROR' "ADMINISTRATOR COMPONENT FAILED [$($setting.Id)/$scope] $($_.Exception.ToString())"
-            }
+            foreach ($component in @(Invoke-SettingPartResults $setting ([string]$request.DesiredState) $scope)) { [void]$components.Add($component) }
         }
         $failedMessages = @($components | Where-Object Outcome -eq 'Failed' | ForEach-Object { "$($_.Name): $($_.Message)" })
-        $message = if ($failedMessages) { $failedMessages -join '; ' } else { 'Administrator-required components applied and verified.' }
+        $message = if ($failedMessages) { $failedMessages -join '; ' } else { 'Administrator handlers completed; final state verification follows.' }
         $result = New-ApplyResult $setting.Id @($components) $message
         [void]$results.Add($result)
         Write-Log $(if ($result.Success) { 'INFO' } else { 'ERROR' }) "ADMINISTRATOR $($result.Outcome.ToUpperInvariant()) [$($setting.Id)] $message"
@@ -2113,30 +2510,32 @@ function Invoke-SettingChange($Item, [hashtable]$AdministratorResults) {
             foreach ($component in @($administratorResult.Components)) { [void]$components.Add($component) }
         }
         if (Test-SettingHasScope $Item User) {
-            try {
-                Set-SettingPart $Item $Item.DesiredState User
-                [void]$components.Add((New-OperationComponent 'Signed-in account' 'Succeeded' 'Applied.'))
-            } catch {
-                [void]$components.Add((New-OperationComponent 'Signed-in account' 'Failed' $_.Exception.Message))
-                throw
-            }
+            $userResults = @(Invoke-SettingPartResults $Item $Item.DesiredState User)
+            foreach ($component in $userResults) { [void]$components.Add($component) }
+            $failures = @($userResults | Where-Object Outcome -eq 'Failed')
+            if ($failures.Count) { throw (($failures | ForEach-Object Message) -join '; ') }
         }
         $Item.CurrentState = Get-SettingState $Item
-        $expectedStatus = if ($Item.DesiredState -eq $Item.PreferredState) { 'Preferred' } else { 'Alternate' }
+        $expectedStatus = if ($Item.Kind -eq 'Package' -or $Item.DesiredState -eq $Item.PreferredState) { 'Preferred' } else { 'Alternate' }
         if ($Item.CurrentState.Status -ne $expectedStatus) {
             $reason = if ($Item.CurrentState.Status -eq 'Error') { "$($Item.CurrentState.DisplayText): $($Item.CurrentState.Details)" } else { $Item.CurrentState.DisplayText }
-            [void]$components.Add((New-OperationComponent 'Final verification' 'Failed' "Windows reports '$reason'."))
-            throw "Windows still reports '$reason' instead of '$($Item.DesiredState)'."
+            $followUp = if ($Item.RestartRequired -and $Item.CurrentState.Status -eq 'Partial') {
+                ' ' + (Get-RestartInstruction -SettingNames @([string]$Item.Name))
+            } else { '' }
+            [void]$components.Add((New-OperationComponent 'Final verification' 'Failed' "Windows reports '$reason'.$followUp"))
+            throw "Windows still reports '$reason' instead of '$($Item.DesiredState)'.$followUp"
         }
-        [void]$components.Add((New-OperationComponent 'Final verification' 'Succeeded' "Windows reports '$($Item.CurrentState.DisplayText)'."))
+        $verification = Get-VerificationDescription $Item
+        [void]$components.Add((New-OperationComponent 'Final verification' 'Succeeded' "$verification $($Item.CurrentState.Details)"))
         # The write succeeded, so the outcome and the exit code stay successful.
         # Only the operator-facing wording changes when a caveat applies.
         $advisory = Get-SettingAdvisory $Item
-        $message = if ($advisory) { "Applied and verified. $advisory" } else { 'Applied and verified.' }
+        $message = "$verification $($Item.CurrentState.Details)"
+        if ($advisory -and -not $message.Contains($advisory)) { $message += " $advisory" }
         $result = New-ApplyResult $Item.Id @($components) $message $Item.RestartExplorer $Item.RestartRequired
         $Item.LastApplyResult = $result
         $Item.Status = if ($advisory) { 'Applied with caveat' } else { 'Succeeded' }
-        $Item.Details = if ($advisory) { "Written, but Edge ignores it here. $advisory" } else { "Now set to: $($Item.CurrentState.DisplayText)" }
+        $Item.Details = "$($Item.CurrentState.DisplayText). $message"
         Write-Log $(if ($advisory) { 'WARN' } else { 'INFO' }) "SUCCESS [$($Item.Id)] => $($Item.CurrentState.DisplayText)$(if ($advisory) { " (caveat: $advisory)" })"
         return $result
     } catch {
@@ -2209,6 +2608,7 @@ Quick apply:
 
 Discovery:
   Start-Dingo.cmd -ListSettings [-OutputFormat Text|Json]
+  Start-Dingo.cmd -RecoveryReport [-OutputFormat Text|Json]
   Start-Dingo.cmd -Version
   Start-Dingo.cmd -Help
 
@@ -2292,8 +2692,26 @@ function Test-SettingPreflight($Setting) {
             }
         }
         if ($Setting.Requirements.ContainsKey('WingetRequired') -and [bool]$Setting.Requirements['WingetRequired']) {
-            if ($Setting.CurrentState.Status -ne 'Preferred' -and -not (Get-WingetPath)) {
+            if (($Setting.CurrentState.Status -ne 'Preferred' -or $Setting.DesiredState -eq 'Update installed tool') -and -not (Get-WingetPath)) {
                 [void]$problems.Add('winget is not available, so this tool cannot be installed')
+            }
+        }
+        if ($Setting.Kind -eq 'Package' -and $Setting.DesiredState -eq 'Update installed tool' -and
+            -not (Find-InstalledTool @($Setting.Entries)[0])) {
+            [void]$problems.Add('the tool is not installed; choose Installed to install it first')
+        }
+        if ($Setting.DesiredState -eq $Setting.PreferredState) {
+            if ($Setting.Kind -eq 'ToolPath') {
+                $expected = Get-ExpectedShims
+                foreach ($name in @($expected.Keys)) {
+                    Assert-DingoFileOwnership (Join-Path $script:ShimDirectory "$name.cmd") Shim
+                }
+            } elseif ($Setting.Kind -eq 'Shortcut') {
+                $expected = Get-ExpectedShortcuts
+                $folder = Get-ShortcutSettingFolder $Setting
+                foreach ($name in @($expected.Keys)) {
+                    Assert-DingoFileOwnership (Join-Path $folder ($name + '.lnk')) Shortcut
+                }
             }
         }
         if ($Setting.Requirements.ContainsKey('Editions')) {
@@ -2351,6 +2769,14 @@ if ($Help) {
 }
 
 if ($Version) { [Console]::Out.WriteLine("Dingo $script:DingoVersion"); exit 0 }
+
+if ($RecoveryReport) {
+    $report = @(Get-RecoveryReport (Join-Path $PSScriptRoot 'Logs'))
+    if ($OutputFormat -eq 'Json') { [Console]::Out.WriteLine((ConvertTo-Json -InputObject $report -Depth 6)) }
+    elseif ($report.Count) { [Console]::Out.WriteLine(($report | Format-List | Out-String).TrimEnd()) }
+    else { [Console]::Out.WriteLine('No incomplete scope records found. This does not verify workstation state or installer completion.') }
+    exit 0
+}
 
 if ($ListSettings) {
     $catalog = @($script:Settings | ForEach-Object {
@@ -2559,8 +2985,8 @@ if ($SelfTest) {
     $requiredDebloat = @{
         NewTabPageContentEnabled=0; NewTabPageAllowedBackgroundTypes=3; NewTabPageQuickLinksEnabled=0
         EdgeCollectionsEnabled=0; EdgeShoppingAssistantEnabled=0; ShowMicrosoftRewards=0
-        WalletDonationEnabled=0; MicrosoftEdgeInsiderPromotionEnabled=0; DefaultBrowserSettingsCampaignEnabled=0
-        WebWidgetAllowed=0; UserFeedbackAllowed=0; AlternateErrorPagesEnabled=0
+        MicrosoftEdgeInsiderPromotionEnabled=0; DefaultBrowserSettingsCampaignEnabled=0
+        UserFeedbackAllowed=0; AlternateErrorPagesEnabled=0
         EdgeAssetDeliveryServiceEnabled=0; DiagnosticData=0; ConfigureDoNotTrack=1
         CreateDesktopShortcutDefault=0
     }
@@ -2568,6 +2994,12 @@ if ($SelfTest) {
         $entry = $debloatSetting.Entries | Where-Object Name -eq $valueName | Select-Object -First 1
         if (-not $entry) { throw "The Edge debloat setting is missing '$valueName'." }
         if ([int]$entry.Preferred -ne [int]$requiredDebloat[$valueName]) { throw "'$valueName' has the wrong preferred value." }
+    }
+    foreach ($retiredPolicy in @('WalletDonationEnabled','WebWidgetAllowed')) {
+        $entry = $debloatSetting.Entries | Where-Object Name -eq $retiredPolicy | Select-Object -First 1
+        if (-not $entry -or $entry.Preferred -ne $script:RemoveValue -or $entry.Alternate -ne $script:RemoveValue) {
+            throw "Retired Edge policy '$retiredPolicy' must be removed for either card choice."
+        }
     }
     if (-not ($debloatSetting.Entries | Where-Object { $_.Path -match 'ExtensionInstallBlocklist$' })) {
         throw 'The Edge debloat setting must block the Copilot Discover Chat extension.'
@@ -2579,8 +3011,7 @@ if ($SelfTest) {
     }
     if (-not $debloatSetting.CanChoose) { throw 'The Edge debloat setting must be reversible from the card.' }
 
-    # The advisory machinery stays available for future settings even though no
-    # shipped setting needs it now, so prove it still works with a stand-in.
+    # Check managed-device caveats independently of the update-policy caveat.
     $savedManagedState = $script:DeviceIsManaged
     try {
         $advisoryMock = $searchSetting.PSObject.Copy()
@@ -2594,7 +3025,9 @@ if ($SelfTest) {
         # A tool caveat depends on what this machine has installed, so those are
         # checked separately below rather than asserted to be absent.
         foreach ($shipped in @($script:Settings | Where-Object { -not $_.Requirements.ContainsKey('RequiredTools') -or -not @($_.Requirements['RequiredTools']).Count })) {
-            if (Get-SettingAdvisory $shipped) { throw "Setting '$($shipped.Id)' carries an unexpected caveat." }
+            if ($shipped.Id -eq 'windows-update-continuity') {
+                if ((Get-SettingAdvisory $shipped) -notmatch 'not verified') { throw 'Update configuration must disclose its verification limit.' }
+            } elseif (Get-SettingAdvisory $shipped) { throw "Setting '$($shipped.Id)' carries an unexpected caveat." }
         }
         # A tool that needs another tool must say so when that one is absent, and
         # must stay silent when it is present. Neither may fail preflight.
@@ -2609,7 +3042,7 @@ if ($SelfTest) {
     } finally {
         $script:DeviceIsManaged = $savedManagedState
     }
-    # Tool cards are one-way on purpose: Dingo installs, and never uninstalls.
+    # Tool cards offer an explicit update action, but never uninstall.
     $builtInTools = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
     foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9')) {
         if (@($builtInTools | Where-Object Id -eq $expectedId).Count -ne 1) { throw "The built-in tool catalog is missing '$expectedId'." }
@@ -2618,7 +3051,9 @@ if ($SelfTest) {
     if ($toolSettings.Count -ne @(Get-ToolCatalog).Count) { throw "Every catalog tool must become a setting; found $($toolSettings.Count)." }
     foreach ($toolSetting in $toolSettings) {
         if ($toolSetting.Tab -ne 'Install tools') { throw "Tool '$($toolSetting.Id)' must sit on the Install tools tab." }
-        if ($toolSetting.CanChoose) { throw "Tool '$($toolSetting.Id)' must not offer an uninstall option." }
+        if ($toolSetting.StateOptions.Count -ne 2 -or $toolSetting.StateOptions -notcontains 'Update installed tool' -or $toolSetting.AlternateState) {
+            throw "Tool '$($toolSetting.Id)' must offer install and explicit update, with no uninstall option."
+        }
         if ($toolSetting.DefaultState -ne 'Not installed') { throw "Tool '$($toolSetting.Id)' must report 'Not installed' as the untouched state." }
         if (@($toolSetting.Entries).Count -ne 1) { throw "Tool '$($toolSetting.Id)' must carry exactly one tool definition." }
     }
@@ -2866,7 +3301,7 @@ if ($SelfTest) {
     } finally {
         Remove-Item -LiteralPath $emptyKeyTest -Recurse -Force -ErrorAction SilentlyContinue
     }
-    $toggleCount = @($script:Settings | Where-Object CanChoose).Count
+    $toggleCount = @($script:Settings | Where-Object { $_.CanChoose -and $_.Kind -ne 'Package' }).Count
     if ($toggleCount -lt 20) { throw "Expected at least 20 reversible settings, found $toggleCount." }
     "Self-test passed: $($script:Settings.Count) settings; $toggleCount reversible; $($toolSettings.Count) tools."
     exit 0
@@ -2920,7 +3355,7 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
     }
     try {
         Initialize-Log
-        $selected = @(Resolve-QuickApplySettings $script:Settings $Include $Exclude)
+        $selected = @(New-ApplyPlan @(Resolve-QuickApplySettings $script:Settings $Include $Exclude))
         if (-not $selected) { throw 'The include/exclude filters selected no settings.' }
         foreach ($item in $selected) {
             $item.DesiredState = $item.PreferredState
@@ -2935,7 +3370,8 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
                 [PSCustomObject]@{
                     Id=$item.Id; Name=$item.Name; Kind=$item.Kind; Scope=$item.DisplayScope; RequiresAdmin=$item.RequiresAdmin
                     Available=$check.Available; PreflightMessage=$check.Message
-                    CurrentStatus=$item.CurrentState.Status; CurrentState=$item.CurrentState.DisplayText; Target=$item.PreferredState
+                    CurrentStatus=$item.CurrentState.Status; CurrentState=$item.CurrentState.DisplayText; State=$item.CurrentState; Target=$item.PreferredState
+                    VerificationBasis=(Get-VerificationDescription $item)
                     Advisory=(Get-SettingAdvisory $item)
                 }
             })
@@ -2974,8 +3410,8 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             }).Count -gt 0
             if ($restartExplorer -and -not $NoRestartExplorer) { [void](Restart-DesktopExplorer) }
             $resultRows = @($results | ForEach-Object {
-                $item = $script:Settings | Where-Object Id -eq $_.Id | Select-Object -First 1
-                [PSCustomObject]@{ Id=$_.Id; Outcome=$_.Outcome; CurrentStatus=$item.CurrentState.Status; CurrentState=$item.CurrentState.DisplayText; Message=$_.Message; Components=$_.Components }
+                $item = $selected | Where-Object Id -eq $_.Id | Select-Object -First 1
+                [PSCustomObject]@{ Id=$_.Id; Outcome=$_.Outcome; CurrentStatus=$item.CurrentState.Status; CurrentState=$item.CurrentState.DisplayText; State=$item.CurrentState; VerificationBasis=(Get-VerificationDescription $item); Message=$_.Message; Components=$_.Components }
             })
             $succeeded = @($results | Where-Object Outcome -eq 'Succeeded').Count
             $partial = @($results | Where-Object Outcome -eq 'PartiallyApplied').Count
@@ -3115,14 +3551,15 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
       </TabItem>
     </TabControl>
     <ProgressBar Name="ProgressBar" Grid.Row="3" Height="8" Margin="0,10,0,8" Minimum="0" Maximum="100"/>
-    <DockPanel Grid.Row="4">
-      <TextBlock Name="SummaryText" Text="Reading current settings..." VerticalAlignment="Center" Foreground="#334E68" TextWrapping="Wrap" MaxWidth="850"/>
-      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+    <Grid Grid.Row="4">
+      <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+      <TextBlock Name="SummaryText" Grid.Row="0" Text="Reading current settings..." VerticalAlignment="Center" Foreground="#334E68" TextWrapping="Wrap" Margin="0,0,0,6"/>
+      <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right">
         <TextBlock Name="AdminSummaryText" Visibility="Collapsed" VerticalAlignment="Center" Foreground="#8A4B08" FontWeight="SemiBold" TextWrapping="Wrap" MaxWidth="250" Margin="0,0,14,0"/>
         <Button Name="OpenLogButton" Content="Open log folder"/>
         <Button Name="ApplyButton" Content="Apply checked changes" Background="#0B6EBD" Foreground="White" FontWeight="SemiBold"/>
       </StackPanel>
-    </DockPanel>
+    </Grid>
   </Grid>
 </Window>
 '@
@@ -3135,7 +3572,7 @@ foreach ($name in @('ScopeTabs','UserScopeText','BothScopeText','ToolsScopeText'
 $desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $UserScopeText.Text = "These settings affect only $desktopIdentity. A gold 'Admin approval required' label identifies a protected per-account policy that needs elevation."
 $BothScopeText.Text = "These choices affect $desktopIdentity and the whole computer. Administrator approval is used only for the computer-wide part."
-$ToolsScopeText.Text = "Analyst tools. Dingo checks whether each one is already installed, and installs the missing ones with winget. Dingo never removes a tool. Add more tools by putting a Tools.json file next to Dingo.ps1. Shortcuts and command-line access are on the next tab."
+$ToolsScopeText.Text = "Installed leaves an existing tool unchanged and installs it only if missing. Choose Update installed tool explicitly to update it. Dingo never removes a tool. Add more tools with Tools.json beside Dingo.ps1. Shortcuts and command-line access are on the next tab."
 if ($script:ToolCatalogWarning) {
     $ToolsScopeText.Text = "$($script:ToolCatalogWarning) The built-in tool list is being used instead."
     $ToolsScopeText.Foreground = '#8A2B21'
@@ -3144,6 +3581,14 @@ $script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$Unchec
 
 function Set-ActionButtonsEnabled([bool]$Enabled) {
     foreach ($control in $script:ActionButtons) { $control.IsEnabled = $Enabled }
+    $ScopeTabs.IsEnabled = $Enabled
+    $RestartExplorerCheckBox.IsEnabled = $Enabled
+    foreach ($item in $script:Settings) {
+        if ($item.PSObject.Properties['ApplyControl']) { $item.ApplyControl.IsEnabled = $Enabled }
+        if ($item.PSObject.Properties['ChoiceControls']) {
+            foreach ($choice in $item.ChoiceControls) { $choice.IsEnabled = $Enabled }
+        }
+    }
 }
 
 # ContentRendered starts the initial state scan. Prevent actions from using the
@@ -3244,7 +3689,7 @@ function New-SettingCard($Item) {
         $advisoryBorder.CornerRadius = '4'
         $advisoryBorder.Padding = '8,5'
         $advisoryBorder.Margin = '0,7,8,0'
-        $advisoryText = New-CardText "Has no effect on this VM. $advisory" 11 'SemiBold' '#8A2B21'
+        $advisoryText = New-CardText "Note: $advisory" 11 'SemiBold' '#8A2B21'
         $advisoryText.Margin = '0'
         $advisoryBorder.Child = $advisoryText
         [void]$about.Children.Add($advisoryBorder)
@@ -3381,44 +3826,62 @@ function Update-CurrentStates {
 }
 
 function Complete-ApplyChanges([array]$Selected, [hashtable]$AdministratorResults) {
-    $success = 0; $partial = 0; $failed = 0; $needsExplorer = $false; $needsRestart = $false
-    $applyResults = New-Object System.Collections.ArrayList
-    $ProgressBar.IsIndeterminate = $false
-    for ($i = 0; $i -lt $Selected.Count; $i++) {
-        $item = $Selected[$i]
-        $item.Status = 'Running'; $item.Details = 'Changing this setting...'
-        $SummaryText.Text = "Changing $($i + 1) of $($Selected.Count): $($item.Name)"
-        Refresh-UI
-        $result = Invoke-SettingChange $item $AdministratorResults
-        [void]$applyResults.Add($result)
-        if ($result.Outcome -eq 'Succeeded') {
-            $success++
-            if ($item.RestartExplorer) { $needsExplorer = $true }
-            if ($item.RestartRequired) { $needsRestart = $true }
-        } else {
-            if ($result.Outcome -eq 'PartiallyApplied') {
-                $partial++
-            } else {
-                $failed++
-            }
-            if (@($result.Components | Where-Object Outcome -eq 'Succeeded').Count) {
+    try {
+        $success = 0; $partial = 0; $failed = 0; $needsExplorer = $false; $needsRestart = $false
+        $restartNames = New-Object System.Collections.ArrayList
+        $partialRestartNames = New-Object System.Collections.ArrayList
+        $applyResults = New-Object System.Collections.ArrayList
+        $ProgressBar.IsIndeterminate = $false
+        for ($i = 0; $i -lt $Selected.Count; $i++) {
+            $item = $Selected[$i]
+            $item.Status = 'Running'; $item.Details = 'Changing this setting...'
+            Publish-PlanState $item
+            $SummaryText.Text = "Changing $($i + 1) of $($Selected.Count): $($item.Name)"
+            Refresh-UI
+            $result = Invoke-SettingChange $item $AdministratorResults
+            Publish-PlanState $item
+            [void]$applyResults.Add($result)
+            if ($result.Outcome -eq 'Succeeded') {
+                $success++
                 if ($item.RestartExplorer) { $needsExplorer = $true }
-                if ($item.RestartRequired) { $needsRestart = $true }
+                if ($item.RestartRequired) {
+                    $needsRestart = $true
+                    if (-not $restartNames.Contains([string]$item.Name)) { [void]$restartNames.Add([string]$item.Name) }
+                }
+            } else {
+                if ($result.Outcome -eq 'PartiallyApplied') {
+                    $partial++
+                    if ($item.RestartRequired -and -not $partialRestartNames.Contains([string]$item.Name)) {
+                        [void]$partialRestartNames.Add([string]$item.Name)
+                    }
+                } else {
+                    $failed++
+                }
+                if (@($result.Components | Where-Object Outcome -eq 'Succeeded').Count) {
+                    if ($item.RestartExplorer) { $needsExplorer = $true }
+                    if ($item.RestartRequired) {
+                        $needsRestart = $true
+                        if (-not $restartNames.Contains([string]$item.Name)) { [void]$restartNames.Add([string]$item.Name) }
+                    }
+                }
             }
+            $ProgressBar.Value = [math]::Round((($i + 1) / $Selected.Count) * 100)
+            Refresh-UI
         }
-        $ProgressBar.Value = [math]::Round((($i + 1) / $Selected.Count) * 100)
-        Refresh-UI
-    }
 
-    if ($needsExplorer -and $RestartExplorerCheckBox.IsChecked) {
-        [void](Restart-DesktopExplorer)
+        if ($needsExplorer -and $script:ApplyRestartExplorer) {
+            [void](Restart-DesktopExplorer)
+        }
+        $guidanceNames = if ($partialRestartNames.Count) { @($partialRestartNames) } else { @($restartNames) }
+        $suffix = if ($needsRestart) { ' ' + (Get-RestartInstruction -SettingNames $guidanceNames) } else { '' }
+        $SummaryText.Text = "Finished: $success worked; $partial partially applied; $failed failed.$suffix"
+        $ProgressBar.Value = 100
+        Refresh-UI
+        return ,@($applyResults)
+    } finally {
+        $script:ApplyInProgress = $false
+        Set-ActionButtonsEnabled $true
     }
-    $suffix = if ($needsRestart) { ' Restart or sign out to finish some changes.' } else { '' }
-    $SummaryText.Text = "Finished: $success worked; $partial partially applied; $failed failed.$suffix"
-    $ProgressBar.Value = 100
-    Set-ActionButtonsEnabled $true
-    Refresh-UI
-    return ,@($applyResults)
 }
 
 $AllPreferredButton.Add_Click({
@@ -3445,71 +3908,86 @@ $RefreshButton.Add_Click({ Update-CurrentStates })
 $OpenLogButton.Add_Click({ Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $script:LogFile) })
 
 $ApplyButton.Add_Click({
-    $selected = @($script:Settings | Where-Object Selected)
+    if ($script:ApplyInProgress) { return }
+    $selected = @(New-ApplyPlan @($script:Settings | Where-Object Selected))
     if (-not $selected) {
         [System.Windows.MessageBox]::Show('Nothing is checked. Tick the settings you want Dingo to change.', 'Nothing selected') | Out-Null
         return
     }
-    $preflight = @(Test-PlanPreflight $selected)
-    $blocked = @($preflight | Where-Object { -not $_.Available })
-    if ($blocked) {
-        foreach ($failure in $blocked) {
-            $item = $script:Settings | Where-Object Id -eq $failure.Id | Select-Object -First 1
-            $item.Status = 'Failed'
-            $item.Details = "Preflight failed: $($failure.Message)"
-        }
-        Refresh-UI
-        $message = @($blocked | ForEach-Object { "$($_.Id): $($_.Message)" }) -join [Environment]::NewLine
-        [System.Windows.MessageBox]::Show("Dingo did not make any changes because the preflight check failed:`n`n$message", 'Cannot apply this plan', 'OK', 'Warning') | Out-Null
-        return
-    }
     Set-ActionButtonsEnabled $false
-    Write-Log 'INFO' "Applying $($selected.Count) setting(s) as desktop user $([Security.Principal.WindowsIdentity]::GetCurrent().Name)."
-    $adminItems = @($selected | Where-Object RequiresAdmin)
-    if (-not $adminItems) {
-        Complete-ApplyChanges $selected @{}
-        return
-    }
-    foreach ($item in $adminItems) { $item.Status = 'Running'; $item.Details = 'Waiting for the administrator step...' }
-    $SummaryText.Text = 'Starting the administrator step...'
-    $ProgressBar.IsIndeterminate = $true
-    Refresh-UI
-
-    $operation = Start-AdministratorChanges $selected
-    if (-not $operation.Process) {
-        Complete-ApplyChanges $selected (Complete-AdministratorChanges $operation)
-        return
-    }
-
-    $pollTimer = New-Object Windows.Threading.DispatcherTimer
-    $pollTimer.Interval = [TimeSpan]::FromMilliseconds(500)
-    $operation | Add-Member -NotePropertyName Timer -NotePropertyValue $pollTimer
-    $script:PendingApply = $operation
-    $pollTimer.Add_Tick({
-        param($sender,$eventArgs)
-        $pending = $script:PendingApply
-        if (-not $pending) { $sender.Stop(); return }
-        if (-not $pending.Process.HasExited) {
-            $elapsedTime = (Get-Date) - $pending.Started
-            $elapsed = '{0}:{1:00}' -f [math]::Floor($elapsedTime.TotalMinutes),$elapsedTime.Seconds
-            $SummaryText.Text = "Administrator step is running ($elapsed elapsed). Windows language downloads can take several minutes."
+    $script:ApplyInProgress = $true
+    $script:ApplyRestartExplorer = [bool]$RestartExplorerCheckBox.IsChecked
+    try {
+        $preflight = @(Test-PlanPreflight $selected)
+        $blocked = @($preflight | Where-Object { -not $_.Available })
+        if ($blocked) {
+            foreach ($failure in $blocked) {
+                $item = $script:Settings | Where-Object Id -eq $failure.Id | Select-Object -First 1
+                $item.Status = 'Failed'
+                $item.Details = "Preflight failed: $($failure.Message)"
+            }
+            Refresh-UI
+            $message = @($blocked | ForEach-Object { "$($_.Id): $($_.Message)" }) -join [Environment]::NewLine
+            [System.Windows.MessageBox]::Show("Dingo did not make any changes because the preflight check failed:`n`n$message", 'Cannot apply this plan', 'OK', 'Warning') | Out-Null
+            $script:ApplyInProgress = $false
+            Set-ActionButtonsEnabled $true
             return
         }
-        $sender.Stop()
-        $administratorResults = Complete-AdministratorChanges $pending
-        $selectedItems = $pending.Selected
-        $script:PendingApply = $null
-        Complete-ApplyChanges $selectedItems $administratorResults
-    })
-    $pollTimer.Start()
+        Set-ActionButtonsEnabled $false
+        Write-Log 'INFO' "Applying $($selected.Count) setting(s) as desktop user $([Security.Principal.WindowsIdentity]::GetCurrent().Name)."
+        $adminItems = @($selected | Where-Object RequiresAdmin)
+        if (-not $adminItems) {
+            Complete-ApplyChanges $selected @{}
+            return
+        }
+        foreach ($item in $adminItems) {
+            $item.Status = 'Running'; $item.Details = 'Waiting for the administrator step...'
+            Publish-PlanState $item
+        }
+        $SummaryText.Text = 'Starting the administrator step...'
+        $ProgressBar.IsIndeterminate = $true
+        Refresh-UI
+
+        $operation = Start-AdministratorChanges $selected
+        if (-not $operation.Process) {
+            Complete-ApplyChanges $selected (Complete-AdministratorChanges $operation)
+            return
+        }
+
+        $pollTimer = New-Object Windows.Threading.DispatcherTimer
+        $pollTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+        $operation | Add-Member -NotePropertyName Timer -NotePropertyValue $pollTimer
+        $script:PendingApply = $operation
+        $pollTimer.Add_Tick({
+            param($sender,$eventArgs)
+            $pending = $script:PendingApply
+            if (-not $pending) { $sender.Stop(); return }
+            if (-not $pending.Process.HasExited) {
+                $elapsedTime = (Get-Date) - $pending.Started
+                $elapsed = '{0}:{1:00}' -f [math]::Floor($elapsedTime.TotalMinutes),$elapsedTime.Seconds
+                $SummaryText.Text = "Administrator step is running ($elapsed elapsed). Windows language downloads can take several minutes."
+                return
+            }
+            $sender.Stop()
+            $administratorResults = Complete-AdministratorChanges $pending
+            $selectedItems = $pending.Selected
+            $script:PendingApply = $null
+            Complete-ApplyChanges $selectedItems $administratorResults
+        })
+        $pollTimer.Start()
+    } catch {
+        $script:ApplyInProgress = $false
+        Set-ActionButtonsEnabled $true
+        [System.Windows.MessageBox]::Show($_.Exception.Message, 'Dingo could not complete the plan', 'OK', 'Error') | Out-Null
+    }
 })
 
 $window.Add_ContentRendered({ Update-CurrentStates })
 $window.Add_Closing({
     param($sender,$eventArgs)
-    if (-not $script:PendingApply) { return }
+    if (-not $script:ApplyInProgress) { return }
     $eventArgs.Cancel = $true
-    $message = if ($script:PendingApply.Process -and -not $script:PendingApply.Process.HasExited) {
+    $message = if ($script:PendingApply -and $script:PendingApply.Process -and -not $script:PendingApply.Process.HasExited) {
         'An administrator-required operation is still running. Keep Dingo open until it finishes so it can verify every change and clean up its temporary files.'
     } else {
         'Dingo is collecting and verifying the administrator results. Please wait for the finished summary before closing the window.'

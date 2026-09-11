@@ -1,0 +1,24 @@
+{
+  "tools": [
+    {
+      "id": "tool-p4-f05-interruption",
+      "name": "P4-F05 interrupted installer fixture",
+      "category": "Phase 4 fixtures",
+      "description": "Harmless waiting process used only to verify interruption journaling and process-tree cleanup.",
+      "install": {
+        "kind": "script",
+        "scope": "user",
+        "url": "https://raw.githubusercontent.com/Bloggzy/Dingo/feature/v0.6.5-review-and-phase4-testing/Tests/Phase4/Fixtures/P4-F04-Wait.ps1",
+        "sha256": "6B301336B24F7B6734E6BF1936FFADF7C27BEB6E10FF75E72A291906D78CD4EA",
+        "dest": "C:/Temp/Dingo-P4-F05",
+        "timeoutMinutes": 5
+      },
+      "detect": [
+        {
+          "kind": "file",
+          "path": "C:/Temp/Dingo-P4-F05-installed.marker"
+        }
+      ]
+    }
+  ]
+}

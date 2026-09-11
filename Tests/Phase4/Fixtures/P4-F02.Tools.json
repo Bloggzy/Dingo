@@ -1,0 +1,24 @@
+{
+  "tools": [
+    {
+      "id": "tool-p4-f02-network",
+      "name": "P4-F02 network failure fixture",
+      "category": "Phase 4 fixtures",
+      "description": "Harmless missing-tool fixture used only to verify an explicit, bounded download failure.",
+      "install": {
+        "kind": "script",
+        "scope": "user",
+        "url": "https://raw.githubusercontent.com/Bloggzy/Dingo/main/README.md",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "dest": "C:/Temp/Dingo-P4-F02",
+        "timeoutMinutes": 1
+      },
+      "detect": [
+        {
+          "kind": "file",
+          "path": "C:/Temp/Dingo-P4-F02-installed.marker"
+        }
+      ]
+    }
+  ]
+}
