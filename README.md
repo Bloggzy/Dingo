@@ -4,7 +4,7 @@ Dingo quickly prepares a fresh Windows 11 installation for use as a DFIR analyst
 
 It is a self-contained, state-aware PowerShell/WPF utility that lets you review each change before applying it.
 
-![Dingo main window showing selectable Windows 11 preference cards](Assets/Dingo-main-screen-sm.png)
+![Dingo main window showing selectable Windows 11 preference cards](Assets/Dingo-main-screen-redacted.png)
 
 ## Run it
 
