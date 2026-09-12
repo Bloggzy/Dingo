@@ -1,8 +1,16 @@
 # Dingo
 
-A self-contained, state-aware PowerShell/WPF utility for applying a repeatable set of Windows 11 VM preferences.
+Dingo quickly prepares a fresh Windows 11 installation for use as a DFIR analyst workstation. It applies a consistent set of analyst-friendly preferences, including UTC, ISO-style date and 24-hour time formats, useful File Explorer options, and removal or suppression of distractions such as Widgets and Bing results in Start. It can also install common tools, create shortcuts and command-line launchers, and configure useful file associations.
+
+It is a self-contained, state-aware PowerShell/WPF utility that lets you review each change before applying it.
+
+![Dingo main window showing selectable Windows 11 preference cards](Assets/Dingo-main-screen-sm.png)
 
 ## Run it
+
+Dingo can be used as an interactive **GUI application** or as a **command-line (CLI) tool** for previews, repeatable setup, and automation. Both modes use the same settings, safety checks, administrator hand-off, verification, results, and logs.
+
+### GUI application
 
 1. Copy the entire Dingo folder to the VM.
 2. Double-click Start-Dingo.cmd.
@@ -14,11 +22,13 @@ A self-contained, state-aware PowerShell/WPF utility for applying a repeatable s
 
 No installation or PowerShell modules are required. Windows PowerShell 5.1 is included with Windows 11.
 
-A console window appears for about a second while PowerShell starts, then hides itself once the Dingo window is open. It comes back if Dingo exits with an error, so the message and the pause prompt are always readable. A command-line run keeps its console, because that is where its output goes.
+A console window appears for about a second while PowerShell starts, then hides itself once the Dingo window is open. It comes back if Dingo exits with an error, so the message and the pause prompt are always readable.
 
-## Quick apply without the GUI
+### Command line (CLI)
 
-Use the same launcher with `-ApplyPreferred` to apply all 39 preferred settings without opening the selection window:
+Run Dingo from Command Prompt or PowerShell to preview changes, apply a complete or filtered configuration, inspect the setting catalog, or integrate it into a repeatable setup process. A CLI run keeps its console open because that is where its output is written.
+
+Use the launcher with `-ApplyPreferred` to apply all 39 preferred settings without opening the GUI:
 
 ```bat
 Start-Dingo.cmd -ApplyPreferred
