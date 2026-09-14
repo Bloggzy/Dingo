@@ -105,7 +105,10 @@ try {
         $SectionTabs = [pscustomobject]@{IsEnabled=$true}
         $RestartExplorerCheckBox = [pscustomobject]@{IsEnabled=$true}
         Set-ActionButtonsEnabled $false
-        Assert (-not $SectionTabs.IsEnabled -and -not $RestartExplorerCheckBox.IsEnabled -and -not $script:ActionButtons[0].IsEnabled) 'Some plan controls remain enabled.'
+        Assert (-not $RestartExplorerCheckBox.IsEnabled -and -not $script:ActionButtons[0].IsEnabled) 'Some plan controls remain enabled.'
+        # The sections stay live so a run can be watched: a locked tab control
+        # also blocks scrolling and tab switching, which hid the cards finishing.
+        Assert ($SectionTabs.IsEnabled) 'The sections are locked, so a running plan cannot be watched.'
         Set-ActionButtonsEnabled $true
         Assert ($SectionTabs.IsEnabled -and $RestartExplorerCheckBox.IsEnabled -and $script:ActionButtons[0].IsEnabled) 'Controls did not recover.'
     }
@@ -246,7 +249,7 @@ try {
     Test-Case 'GUI completion publishes snapshot results and uses captured restart preference' {
         $SectionTabs = [pscustomobject]@{IsEnabled=$false}
         $RestartExplorerCheckBox = [pscustomobject]@{IsEnabled=$false;IsChecked=$false}
-        $SummaryText = [pscustomobject]@{Text=''}
+        $SummaryText = [pscustomobject]@{Text='';Foreground='#334E68';FontWeight='Normal'}
         $ProgressBar = [pscustomobject]@{Value=0;IsIndeterminate=$true}
         $script:ActionButtons = @([pscustomobject]@{IsEnabled=$false})
         $script:ApplyInProgress = $true
@@ -265,7 +268,7 @@ try {
         [void](Complete-ApplyChanges $plan @{})
         Assert ($card.Status -eq 'Succeeded' -and $card.DesiredState -eq $card.AlternateState) 'GUI failed to publish results without changing choices.'
         Assert ($script:RestartCalls -eq 1) 'Completion reread the mutable restart checkbox.'
-        Assert (-not $script:ApplyInProgress -and $SectionTabs.IsEnabled -and $RestartExplorerCheckBox.IsEnabled) 'GUI remained locked after completion.'
+        Assert (-not $script:ApplyInProgress -and $script:ActionButtons[0].IsEnabled -and $RestartExplorerCheckBox.IsEnabled) 'GUI remained locked after completion.'
     }
     Test-Case 'Restart guidance names the setting and tells the user how to refresh' {
         $message = Get-RestartInstruction -SettingNames @('Australian English')
@@ -276,7 +279,7 @@ try {
     Test-Case 'GUI completion shows actionable guidance for a partially applied restart setting' {
         $SectionTabs = [pscustomobject]@{IsEnabled=$false}
         $RestartExplorerCheckBox = [pscustomobject]@{IsEnabled=$false;IsChecked=$false}
-        $SummaryText = [pscustomobject]@{Text=''}
+        $SummaryText = [pscustomobject]@{Text='';Foreground='#334E68';FontWeight='Normal'}
         $ProgressBar = [pscustomobject]@{Value=0;IsIndeterminate=$true}
         $script:ActionButtons = @([pscustomobject]@{IsEnabled=$false})
         $script:ApplyInProgress = $true
@@ -301,7 +304,7 @@ try {
     Test-Case 'Unexpected completion failure releases the busy lock' {
         $SectionTabs = [pscustomobject]@{IsEnabled=$false}
         $RestartExplorerCheckBox = [pscustomobject]@{IsEnabled=$false;IsChecked=$false}
-        $SummaryText = [pscustomobject]@{Text=''}
+        $SummaryText = [pscustomobject]@{Text='';Foreground='#334E68';FontWeight='Normal'}
         $ProgressBar = [pscustomobject]@{Value=0;IsIndeterminate=$true}
         $script:ActionButtons = @([pscustomobject]@{IsEnabled=$false})
         $script:ApplyInProgress = $true
@@ -309,7 +312,7 @@ try {
         function Invoke-SettingChange { throw 'Simulated completion failure' }
         $plan = @(New-ApplyPlan @(($script:Settings | Where-Object Id -eq 'task-view')))
         Assert-Throws { Complete-ApplyChanges $plan @{} } 'Simulated completion failure'
-        Assert (-not $script:ApplyInProgress -and $SectionTabs.IsEnabled -and $RestartExplorerCheckBox.IsEnabled) 'Failure left plan controls locked.'
+        Assert (-not $script:ApplyInProgress -and $script:ActionButtons[0].IsEnabled -and $RestartExplorerCheckBox.IsEnabled) 'Failure left plan controls locked.'
     }
     Test-Case 'Actual WPF cards use accessible selection toggles and inherit the busy lock' {
         Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
@@ -336,6 +339,7 @@ try {
             }
             $script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$UncheckButton,$RefreshButton)
             Set-ActionButtonsEnabled $false
+            Assert ($SectionTabs.IsEnabled) 'The real sections are locked during apply, so the cards cannot be watched.'
             foreach ($item in $script:Settings) {
                 Assert ($item.ApplyControl -is [Windows.Controls.Primitives.ToggleButton]) 'A card does not use a selection toggle.'
                 Assert ($null -eq $item.ApplyControl.Content) 'A selection toggle has visible label content.'
@@ -510,7 +514,7 @@ try {
             $savedSettings = $script:Settings
             $script:WorkerProgressPath = Join-Path $dir 'progress.json'
             $resultPath = Join-Path $dir 'result.json'
-            $SummaryText = [pscustomobject]@{Text=''}
+            $SummaryText = [pscustomobject]@{Text='';Foreground='#334E68';FontWeight='Normal'}
             $ProgressBar = [pscustomobject]@{Value=0;IsIndeterminate=$true}
             $script:Settings = @(
                 [pscustomobject]@{Id='a';Details='';DetailsControl=[pscustomobject]@{Text=''}}
@@ -898,6 +902,48 @@ try {
             Clear-DisplayPackCache
         }
     }
+    Test-Case 'A setting that is not finished says so loudly, not only in small print' {
+        # The sentence at the foot of the window was missed. The same words now
+        # also come up as a box, and the sentence itself is coloured.
+        $SummaryText = [pscustomobject]@{Text='';Foreground='#334E68';FontWeight='Normal'}
+        $ProgressBar = [pscustomobject]@{Value=0;IsIndeterminate=$true}
+        $RestartExplorerCheckBox = [pscustomobject]@{IsEnabled=$false;IsChecked=$false}
+        $script:ActionButtons = @([pscustomobject]@{IsEnabled=$false})
+        $script:ApplyInProgress = $true
+        $script:ApplyRestartExplorer = $false
+        $script:Notices = New-Object System.Collections.ArrayList
+        function Refresh-UI {}
+        function Show-RestartNotice { param([string]$Message) [void]$script:Notices.Add([string]$Message); $true }
+        function Invoke-SettingChange($Item, $AdministratorResults) {
+            $Item.Status = 'Partially applied'
+            $Item.CurrentState = New-StateResult Partial 'Partly configured'
+            return New-ApplyResult $Item.Id @(
+                (New-OperationComponent 'Language write' Succeeded 'accepted'),
+                (New-OperationComponent 'Final verification' Failed 'pending sign-in')
+            ) 'pending sign-in' $false $true
+        }
+        $plan = @(New-ApplyPlan @(($script:Settings | Where-Object Id -eq 'language-au')))
+        [void](Complete-ApplyChanges $plan @{})
+        Assert (@($script:Notices).Count -eq 1) 'A setting left unfinished raised no notice.'
+        Assert ($script:Notices[0] -match 'sign out and back in') 'The notice does not say what to do.'
+        Assert ($script:Notices[0] -match 'Display language') 'The notice does not name the setting.'
+        Assert ($SummaryText.Foreground -eq '#8A2B21' -and $SummaryText.FontWeight -eq 'Bold') 'The unfinished result is not marked out from an ordinary one.'
+        # An ordinary run raises nothing and stays plain.
+        $script:Notices.Clear()
+        $script:ApplyInProgress = $true
+        function Invoke-SettingChange($Item, $AdministratorResults) {
+            $Item.Status = 'Succeeded'
+            $Item.CurrentState = New-StateResult Preferred $Item.PreferredState
+            return New-ApplyResult $Item.Id @((New-OperationComponent User Succeeded 'test')) 'test' $true
+        }
+        $plan = @(New-ApplyPlan @(($script:Settings | Where-Object Id -eq 'task-view')))
+        [void](Complete-ApplyChanges $plan @{})
+        Assert (@($script:Notices).Count -eq 0) 'An ordinary run interrupted the person with a box.'
+        Assert ($SummaryText.Foreground -eq '#334E68' -and $SummaryText.FontWeight -eq 'Normal') 'An ordinary result is still marked as a warning.'
+    }
+    Test-Case 'No window means no box, so nothing can block a run without a screen' {
+        Assert ((Show-RestartNotice 'anything') -eq $false) 'A box was offered with no window to own it.'
+    }
     Test-Case 'An unknown word is refused and the sections are named' {
         Assert-Throws { Resolve-QuickApplySettings $script:Settings @('tweeks') @() } "tweeks"
         Assert-Throws { Resolve-QuickApplySettings $script:Settings @('tweeks') @() } "'tweaks' and 'tools'"
@@ -922,7 +968,7 @@ try {
             Assert ($calls.Count -eq 1) "Expected one $Name click handler, found $($calls.Count)."
             $calls[0].Arguments[0].ScriptBlock.GetScriptBlock()
         }
-        $SummaryText = [pscustomobject]@{Text=''}
+        $SummaryText = [pscustomobject]@{Text='';Foreground='#334E68';FontWeight='Normal'}
         function Refresh-UI {}
         $tweakCount = @($script:Settings | Where-Object { $_.Section -eq 'Tweaks' }).Count
         foreach ($handlerName in @('AllPreferredButton','NeededButton')) {

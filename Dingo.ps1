@@ -56,7 +56,7 @@ $script:PendingApply = $null
 $script:ApplyInProgress = $false
 $script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.7.3'
+$script:DingoVersion = '0.7.4'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -995,6 +995,30 @@ function Get-RestartInstruction([string[]]$SettingNames) {
         return "These settings need you to sign out and back in, or restart Windows, before they can finish applying: $($names -join ', '). Then click Read settings again."
     }
     'Sign out and back in, or restart Windows, to finish applying the selected settings. Then click Read settings again.'
+}
+
+function Show-RestartNotice([string]$Message) {
+    # The sentence at the foot of the window is easy to miss, and a setting
+    # that is not finished looks finished. So the same words are also put in
+    # front of the person as a box they must dismiss. There is no window
+    # during a test run, and no box is shown then.
+    if (-not (Get-Variable -Name DingoWindow -Scope Script -ErrorAction SilentlyContinue)) { return $false }
+    if (-not $script:DingoWindow) { return $false }
+    try {
+        [void][Windows.MessageBox]::Show($script:DingoWindow, $Message, 'Sign out to finish applying', 'OK', 'Exclamation')
+        return $true
+    } catch {
+        Write-Log 'WARN' "Could not show the restart notice: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Set-SummaryEmphasis($Control, [bool]$Strong) {
+    # Plain grey for ordinary results, and the warning colour when something
+    # is still waiting on the person.
+    if (-not $Control -or -not $Control.PSObject.Properties['Foreground']) { return }
+    $Control.Foreground = if ($Strong) { '#8A2B21' } else { '#334E68' }
+    $Control.FontWeight = if ($Strong) { 'Bold' } else { 'Normal' }
 }
 
 function Get-ToolDetection($Tool) {
@@ -4274,6 +4298,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
+$script:DingoWindow = $window
 foreach ($name in @('IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
@@ -4296,8 +4321,11 @@ function Show-StopButton([bool]$Visible) {
 }
 
 function Set-ActionButtonsEnabled([bool]$Enabled) {
+    # Everything that starts work or changes a choice is locked while a plan
+    # runs. The sections themselves are not: disabling the tab control froze
+    # scrolling and tab switching too, so a card finishing on another tab could
+    # not be seen. Reading is allowed, changing is not.
     foreach ($control in $script:ActionButtons) { $control.IsEnabled = $Enabled }
-    $SectionTabs.IsEnabled = $Enabled
     $RestartExplorerCheckBox.IsEnabled = $Enabled
     foreach ($item in $script:Settings) {
         if ($item.PSObject.Properties['ApplyControl']) { $item.ApplyControl.IsEnabled = $Enabled }
@@ -4744,6 +4772,7 @@ function Update-CurrentStates {
             [void]$sectionParts.Add("$($sectionName): $sectionReady of $($sectionItems.Count) $wording")
         }
         $SummaryText.Text = "$($sectionParts -join '. '). Nothing changes until you click Apply selected changes."
+        Set-SummaryEmphasis $SummaryText $false
         if ($unreadable) { $SummaryText.Text += " $unreadable setting$(if ($unreadable -eq 1) { '' } else { 's' }) could not be evaluated and will not be auto-selected." }
         Write-Log 'INFO' "State refresh complete: $preferred of $count preferred ($($sectionParts -join '; '))."
     } finally {
@@ -4800,10 +4829,13 @@ function Complete-ApplyChanges([array]$Selected, [hashtable]$AdministratorResult
             [void](Restart-DesktopExplorer)
         }
         $guidanceNames = if ($partialRestartNames.Count) { @($partialRestartNames) } else { @($restartNames) }
-        $suffix = if ($needsRestart) { ' ' + (Get-RestartInstruction -SettingNames $guidanceNames) } else { '' }
+        $restartMessage = if ($needsRestart) { Get-RestartInstruction -SettingNames $guidanceNames } else { '' }
+        $suffix = if ($restartMessage) { ' ' + $restartMessage } else { '' }
         $SummaryText.Text = "Finished: $success worked; $partial partially applied; $failed failed.$suffix"
+        Set-SummaryEmphasis $SummaryText ([bool]$restartMessage)
         $ProgressBar.Value = 100
         Refresh-UI
+        if ($restartMessage) { [void](Show-RestartNotice $restartMessage) }
         return ,@($applyResults)
     } finally {
         $script:ApplyInProgress = $false
