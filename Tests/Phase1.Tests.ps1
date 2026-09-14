@@ -347,6 +347,19 @@ try {
                 foreach ($radio in $item.ChoiceControls) { Assert (-not $radio.IsEnabled) 'A card choice is enabled during apply.' }
             }
             Set-ActionButtonsEnabled $true
+            # The note box exists on every card even when there is nothing to say.
+            # Building it only when a caveat applies is what made a note that
+            # appeared later impossible, because there was nothing to fill in.
+            foreach ($card in $script:Settings) {
+                Assert ([bool]$card.AdvisoryControl) "Card '$($card.Id)' has no note box to fill in."
+                Assert ($card.AdvisoryControl.Parent.Visibility -eq 'Collapsed') "Card '$($card.Id)' shows an empty note box."
+            }
+            $language = $script:Settings | Where-Object Id -eq 'language-au'
+            $picker = @($language.ChoiceControls)[0]
+            Assert ($picker -is [Windows.Controls.ComboBox]) 'The language card does not offer a drop-down.'
+            $picker.SelectedItem = 'Spanish (es-ES)'
+            Assert ($language.DesiredState -eq 'Spanish (es-ES)') 'The drop-down did not change the chosen language.'
+            $picker.SelectedItem = 'British English (en-GB)'
             $tool = $script:Settings | Where-Object Id -eq 'tool-eztools'
             $update = $tool.ChoiceControls | Where-Object { $_.Tag.Value -eq 'Update installed tool' }
             Assert ($update -and $update.IsEnabled) 'Explicit update radio is absent or disabled.'
@@ -848,6 +861,41 @@ try {
             $script:Settings = $savedSettings
             Clear-DisplayPackCache
             Get-Job | Remove-Job -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-Case 'A card note appears and disappears as the choice changes' {
+        # The caveat depends on the chosen language, so it has to be recomputed
+        # rather than frozen at the moment the card was first drawn.
+        $box = [pscustomobject]@{ Visibility='Collapsed' }
+        $card = ($script:Settings | Where-Object Id -eq 'language-au').PSObject.Copy()
+        $card | Add-Member -NotePropertyName AdvisoryControl -NotePropertyValue ([pscustomobject]@{ Text=''; Parent=$box }) -Force
+        try {
+            # A pack that is here: nothing to warn about.
+            function Get-DisplayLanguagePackSource { param([string]$Language) 'en-GB' }
+            Clear-DisplayPackCache
+            $card.DesiredState = 'British English (en-GB)'
+            Update-CardAdvisory $card
+            Assert ($box.Visibility -eq 'Collapsed') 'A language whose pack is installed still shows a note.'
+            Assert ($card.AdvisoryControl.Text -eq '') 'An empty note box still holds text.'
+            # Switch to one with no pack: the note must appear.
+            function Get-DisplayLanguagePackSource { param([string]$Language) if ($Language -eq 'en-GB') { 'en-GB' } else { '' } }
+            Clear-DisplayPackCache
+            $card.DesiredState = 'Spanish (es-ES)'
+            Update-CardAdvisory $card
+            Assert ($box.Visibility -eq 'Visible') 'Choosing a language that needs a download did not raise the note.'
+            Assert ($card.AdvisoryControl.Text -match 'Spanish \(es-ES\)') "The note does not name the chosen language: '$($card.AdvisoryControl.Text)'."
+            Assert ($card.AdvisoryControl.Text -match 'hold up the whole run') 'The note does not warn that the run is held up.'
+            Assert ($card.AdvisoryControl.Text -match '^Note: ') 'The note is not labelled as one.'
+            # And back again.
+            $card.DesiredState = 'British English (en-GB)'
+            Update-CardAdvisory $card
+            Assert ($box.Visibility -eq 'Collapsed') 'Switching back to an installed language left the note showing.'
+            # A card with no note box at all must be left alone, not throw.
+            $bare = ($script:Settings | Where-Object Id -eq 'hidden-files').PSObject.Copy()
+            Update-CardAdvisory $bare
+            Assert ($true) 'Updating a card with no note box must not throw.'
+        } finally {
+            Clear-DisplayPackCache
         }
     }
     Test-Case 'An unknown word is refused and the sections are named' {

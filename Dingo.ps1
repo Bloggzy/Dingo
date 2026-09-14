@@ -56,7 +56,7 @@ $script:PendingApply = $null
 $script:ApplyInProgress = $false
 $script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.7.2'
+$script:DingoVersion = '0.7.3'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -4458,6 +4458,15 @@ function Update-SelectionSummary {
     }
 }
 
+function Update-CardAdvisory($Item) {
+    # The caveat depends on the choice, so it is recomputed rather than frozen
+    # at the moment the card was drawn.
+    if (-not $Item.PSObject.Properties['AdvisoryControl'] -or -not $Item.AdvisoryControl) { return }
+    $note = Get-SettingAdvisory $Item
+    $Item.AdvisoryControl.Text = if ($note) { "Note: $note" } else { '' }
+    $Item.AdvisoryControl.Parent.Visibility = if ($note) { 'Visible' } else { 'Collapsed' }
+}
+
 function New-SettingCard($Item) {
     $border = New-Object Windows.Controls.Border
     $border.Background = 'White'
@@ -4511,20 +4520,20 @@ function New-SettingCard($Item) {
     # Show a caveat that applying the setting cannot resolve, so the card never
     # implies a result Windows or the target application will not honour.
     $advisory = Get-SettingAdvisory $Item
-    $advisoryText = $null
-    if ($advisory) {
-        $advisoryBorder = New-Object Windows.Controls.Border
-        $advisoryBorder.Background = '#FFF1F0'
-        $advisoryBorder.BorderBrush = '#F3B3AE'
-        $advisoryBorder.BorderThickness = '1'
-        $advisoryBorder.CornerRadius = '4'
-        $advisoryBorder.Padding = '8,5'
-        $advisoryBorder.Margin = '0,7,8,0'
-        $advisoryText = New-CardText "Note: $advisory" 11 'SemiBold' '#8A2B21'
-        $advisoryText.Margin = '0'
-        $advisoryBorder.Child = $advisoryText
-        [void]$about.Children.Add($advisoryBorder)
-    }
+    # Built whether or not there is a caveat right now, and hidden when there is
+    # none. A note that only exists when the card is first drawn could never
+    # appear later, and a card with a list of choices can earn one at any time.
+    $advisoryBorder = New-Object Windows.Controls.Border
+    $advisoryBorder.Background = '#FFF1F0'
+    $advisoryBorder.BorderBrush = '#F3B3AE'
+    $advisoryBorder.BorderThickness = '1'
+    $advisoryBorder.CornerRadius = '4'
+    $advisoryBorder.Padding = '8,5'
+    $advisoryBorder.Margin = '0,7,8,0'
+    $advisoryText = New-CardText '' 11 'SemiBold' '#8A2B21'
+    $advisoryText.Margin = '0'
+    $advisoryBorder.Child = $advisoryText
+    [void]$about.Children.Add($advisoryBorder)
     Add-CardColumn $grid $about 1
 
     $state = New-Object Windows.Controls.StackPanel
@@ -4557,6 +4566,8 @@ function New-SettingCard($Item) {
             $sender.Tag.Setting.DesiredState = [string]$sender.SelectedItem
             $sender.Tag.Setting.Selected = $true
             $sender.Tag.ApplyCheck.IsChecked = $true
+            # Shown the moment the choice is made, not only at the next refresh.
+            Update-CardAdvisory $sender.Tag.Setting
         })
         [void]$choices.Children.Add($combo)
         [void]$choices.Children.Add((New-CardText "Dingo prefers $($Item.PreferredState)." 11 'Normal' '#627D98'))
@@ -4573,6 +4584,7 @@ function New-SettingCard($Item) {
                 $sender.Tag.Setting.DesiredState = $sender.Tag.Value
                 $sender.Tag.Setting.Selected = $true
                 $sender.Tag.ApplyCheck.IsChecked = $true
+                Update-CardAdvisory $sender.Tag.Setting
             })
             [void]$choices.Children.Add($radio)
             [void]$choiceControls.Add($radio)
@@ -4599,6 +4611,7 @@ function New-SettingCard($Item) {
     $Item | Add-Member -NotePropertyName ChoiceControls -NotePropertyValue $choiceControls -Force
     $Item | Add-Member -NotePropertyName AdminBadgeControl -NotePropertyValue $adminBadge -Force
     $Item | Add-Member -NotePropertyName AdvisoryControl -NotePropertyValue $advisoryText -Force
+    Update-CardAdvisory $Item
     return $border
 }
 
@@ -4691,11 +4704,7 @@ function Refresh-UI {
         $item.DetailsControl.Text = $item.Details
         # The note follows the drop-down: pick a language whose pack is already
         # here and the download warning goes away by itself.
-        if ($item.PSObject.Properties['AdvisoryControl'] -and $item.AdvisoryControl) {
-            $note = Get-SettingAdvisory $item
-            $item.AdvisoryControl.Text = if ($note) { "Note: $note" } else { '' }
-            $item.AdvisoryControl.Parent.Visibility = if ($note) { 'Visible' } else { 'Collapsed' }
-        }
+        Update-CardAdvisory $item
         foreach ($choice in $item.ChoiceControls) {
             if ($choice -is [Windows.Controls.ComboBox]) {
                 if ([string]$choice.SelectedItem -ne $item.DesiredState) { $choice.SelectedItem = [string]$item.DesiredState }
