@@ -44,7 +44,7 @@ $script:PendingApply = $null
 $script:ApplyInProgress = $false
 $script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.6.9'
+$script:DingoVersion = '0.7.0'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -414,6 +414,15 @@ function New-Entry {
     [PSCustomObject]@{ Scope=$Scope; Path=$Path; Name=$Name; Preferred=$Preferred; Alternate=$Alternate; Type=$Type }
 }
 
+function Get-SettingSection([string]$TabName) {
+    # Dingo does two different jobs. Tweaks change how Windows behaves for an
+    # account or the computer. Tools put analyst software on the machine and
+    # wire it up. They are grouped apart so neither the GUI buttons nor a bare
+    # command line ever sweeps one of them up with the other.
+    if ($TabName -in @('Install tools','Tool shortcuts','File associations')) { return 'Tools' }
+    return 'Tweaks'
+}
+
 function New-Setting {
     param(
         [string]$Id,
@@ -453,10 +462,11 @@ function New-Setting {
     }
     # Cards are grouped by who a setting affects unless it declares its own tab.
     $tabName = if ([string]::IsNullOrWhiteSpace($Tab)) { $displayScope } else { $Tab }
+    $sectionName = Get-SettingSection $tabName
     [PSCustomObject]@{
         Selected=$false; Id=$Id; Category=$Category; Name=$Name; Description=$Description
         PreferredState=$PreferredState; AlternateState=$AlternateState; DesiredState=$PreferredState
-        DefaultState=$defaultState; DisplayScope=$displayScope; Tab=$tabName
+        DefaultState=$defaultState; DisplayScope=$displayScope; Tab=$tabName; Section=$sectionName
         StateOptions=$options; CanChoose=($options.Count -gt 1); CurrentState=(New-StateResult 'Unknown' 'Reading...')
         Status='Ready'; Details=''; LastApplyResult=$null; Kind=$Kind; Entries=$Entries; RequiresAdmin=$needsElevation
         RestartExplorer=$RestartExplorer; RestartRequired=$RestartRequired; Requirements=$requirementCopy
@@ -2565,10 +2575,30 @@ function Resolve-QuickApplySettings {
         param([string[]]$Values)
         @($Values | ForEach-Object { @([string]$_ -split ',') } | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique)
     }
+    # 'tweaks' and 'tools' stand for every ID in that section. They keep a
+    # command line short as the tool list grows, and they let the default
+    # apply reach for the tweaks alone without naming each one.
+    $groups = @{}
+    foreach ($setting in $AllSettings) {
+        $groupKey = ([string]$setting.Section).ToLowerInvariant()
+        if (-not $groups.ContainsKey($groupKey)) { $groups[$groupKey] = New-Object System.Collections.ArrayList }
+        [void]$groups[$groupKey].Add(([string]$setting.Id).ToLowerInvariant())
+    }
+    # A section word that was also a setting ID would be read two ways, so the
+    # catalog is refused rather than guessed at.
+    foreach ($groupKey in $groups.Keys) {
+        if ($known.ContainsKey($groupKey)) { throw "Setting ID '$groupKey' clashes with the section name of the same spelling. Rename it in Tools.json." }
+    }
+    $expand = {
+        param([string[]]$Keys)
+        @($Keys | ForEach-Object { if ($groups.ContainsKey($_)) { @($groups[$_]) } else { $_ } } | Select-Object -Unique)
+    }
     $includeKeys = @(& $normalise $IncludeIds)
     $excludeKeys = @(& $normalise $ExcludeIds)
-    $unknown = @($includeKeys + $excludeKeys | Where-Object { -not $known.ContainsKey($_) } | Select-Object -Unique)
-    if ($unknown) { throw "Unknown setting ID$(if ($unknown.Count -eq 1) { '' } else { 's' }): $($unknown -join ', ')." }
+    $unknown = @($includeKeys + $excludeKeys | Where-Object { -not $known.ContainsKey($_) -and -not $groups.ContainsKey($_) } | Select-Object -Unique)
+    if ($unknown) { throw "Unknown setting ID or section$(if ($unknown.Count -eq 1) { '' } else { 's' }): $($unknown -join ', '). Sections are 'tweaks' and 'tools'." }
+    $includeKeys = @(& $expand $includeKeys)
+    $excludeKeys = @(& $expand $excludeKeys)
     $selected = if ($includeKeys) {
         @($AllSettings | Where-Object { ([string]$_.Id).ToLowerInvariant() -in $includeKeys })
     } else {
@@ -2603,8 +2633,22 @@ GUI:
   Start-Dingo.cmd
 
 Quick apply:
-  Start-Dingo.cmd -WhatIf [-Include id1,id2] [-Exclude id3] [-OutputFormat Text|Json]
-  Start-Dingo.cmd -ApplyPreferred [-Include id1,id2] [-Exclude id3] [-NoRestartExplorer] [-OutputFormat Text|Json]
+  Start-Dingo.cmd -WhatIf [-Include what] [-Exclude what] [-OutputFormat Text|Json]
+  Start-Dingo.cmd -ApplyPreferred [-Include what] [-Exclude what] [-NoRestartExplorer] [-OutputFormat Text|Json]
+
+  Without -Include, only the Tweaks section is applied. Tool cards are left alone,
+  and the run reports how many were skipped.
+
+What to include or exclude:
+  A section word, a setting ID, or a comma-separated list of either.
+  Sections are 'tweaks' (account and computer settings) and 'tools'
+  (installs, shortcuts, and file associations).
+
+  -Include tweaks              the default: settings only, no installs
+  -Include tools               installs, shortcuts, and file associations
+  -Include tweaks,tools        everything
+  -Include tools -Exclude tool-7zip    a section, less one card
+  -Include iso-time,hidden-files       named cards only
 
 Discovery:
   Start-Dingo.cmd -ListSettings [-OutputFormat Text|Json]
@@ -2613,7 +2657,7 @@ Discovery:
   Start-Dingo.cmd -Help
 
 Tools:
-  Analyst tools appear on the Tools tab and use IDs that start with 'tool-'.
+  Analyst tools sit in the Tools section and use IDs that start with 'tool-'.
   Dingo installs them with winget and never uninstalls them.
   Add your own by placing a Tools.json file next to Dingo.ps1. See the README.
 
@@ -2780,7 +2824,7 @@ if ($RecoveryReport) {
 
 if ($ListSettings) {
     $catalog = @($script:Settings | ForEach-Object {
-        [PSCustomObject]@{ Id=$_.Id; Name=$_.Name; Category=$_.Category; Kind=$_.Kind; Scope=$_.DisplayScope; RequiresAdmin=$_.RequiresAdmin; PreferredState=$_.PreferredState; Requirements=$_.Requirements }
+        [PSCustomObject]@{ Id=$_.Id; Section=$_.Section; Name=$_.Name; Category=$_.Category; Kind=$_.Kind; Scope=$_.DisplayScope; RequiresAdmin=$_.RequiresAdmin; PreferredState=$_.PreferredState; Requirements=$_.Requirements }
     })
     if ($OutputFormat -eq 'Json') { [Console]::Out.WriteLine((ConvertTo-Json -InputObject $catalog -Depth 5)) }
     else { [Console]::Out.WriteLine(($catalog | Format-Table -AutoSize | Out-String -Width 220).TrimEnd()) }
@@ -2829,7 +2873,12 @@ if ($SelfTest) {
     if ($selfTestAst.Extent.Text -notmatch 'CmdletBinding\s*\(\s*PositionalBinding\s*=\s*\$false\s*\)' -or $selfTestAst.Extent.Text -notmatch 'ValueFromRemainingArguments\s*=\s*\$true') {
         throw 'Command-line parsing must reject stray positional and unknown arguments through the Dingo help path.'
     }
-    if ((Get-DingoHelpText) -notmatch '-ApplyPreferred' -or (Get-DingoHelpText) -notmatch '-ListSettings') { throw 'The command-line help text is incomplete.' }
+    $helpText = Get-DingoHelpText
+    foreach ($helpTopic in @('-ApplyPreferred','-ListSettings','-Include tweaks','-Include tools','-Include tweaks,tools')) {
+        if ($helpText -notmatch [regex]::Escape($helpTopic)) { throw "The command-line help text does not cover '$helpTopic'." }
+    }
+    # The default is a trap if it is undocumented, so the help must state it.
+    if ($helpText -notmatch 'Without -Include') { throw 'The command-line help text does not state what a bare apply does.' }
     $launcherAst = $selfTestAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Start-AdministratorChanges' },$true)
     $launcherStart = if ($launcherAst) { $launcherAst.Find({ param($node) $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Start-Process' },$true) } else { $null }
     if (-not $launcherStart) { throw 'The asynchronous elevated-worker launcher does not start a process.' }
@@ -3355,8 +3404,29 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
     }
     try {
         Initialize-Log
-        $selected = @(New-ApplyPlan @(Resolve-QuickApplySettings $script:Settings $Include $Exclude))
+        # Dingo started life as a set of tweaks, and that is what a bare command
+        # line still does. Installing software is a bigger act than changing a
+        # registry value, so the tool cards are reached only when they are asked
+        # for by name or by the 'tools' section word.
+        $effectiveInclude = if ($Include) { $Include } else { @('tweaks') }
+        $selected = @(New-ApplyPlan @(Resolve-QuickApplySettings $script:Settings $effectiveInclude $Exclude))
         if (-not $selected) { throw 'The include/exclude filters selected no settings.' }
+        # A quiet behaviour change is a trap, so a run that used the default says
+        # out loud which cards it left alone and how to ask for them.
+        $skipped = $null
+        if (-not $Include) {
+            $skippedIds = @($script:Settings | Where-Object { $_.Section -eq 'Tools' } | ForEach-Object { [string]$_.Id })
+            if ($skippedIds.Count) {
+                $skipped = [PSCustomObject]@{
+                    Section = 'Tools'
+                    Count = $skippedIds.Count
+                    Ids = $skippedIds
+                    Reason = 'No -Include was given, so only the Tweaks section ran.'
+                    Hint = 'Use -Include tools for the tool cards, or -Include tweaks,tools for both.'
+                }
+            }
+        }
+        $skippedNotice = if ($skipped) { "$($skipped.Count) tool card(s) were left alone. $($skipped.Reason) $($skipped.Hint)" } else { '' }
         foreach ($item in $selected) {
             $item.DesiredState = $item.PreferredState
             $item.CurrentState = Get-SettingState $item
@@ -3378,10 +3448,11 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             $exitCode = if ($blocked) { 2 } else { 0 }
             if ($OutputFormat -eq 'Json') {
                 [Console]::Out.WriteLine((ConvertTo-Json -InputObject ([PSCustomObject]@{
-                    Version=$script:DingoVersion; Mode='WhatIf'; Success=(-not [bool]$blocked); ExitCode=$exitCode; Changed=$false; Elevated=$elevatedDryRun; Plan=$plan
+                    Version=$script:DingoVersion; Mode='WhatIf'; Success=(-not [bool]$blocked); ExitCode=$exitCode; Changed=$false; Elevated=$elevatedDryRun; Skipped=$skipped; Plan=$plan
                 }) -Depth 7))
             } else {
                 Write-CliStatus "Dingo dry run: $($selected.Count) preferred setting(s) would be applied. No changes were made."
+                if ($skippedNotice) { Write-CliStatus $skippedNotice }
                 [Console]::Out.WriteLine(($plan | Format-Table Id,Name,Kind,Scope,RequiresAdmin,Available,CurrentStatus,CurrentState,Target -AutoSize | Out-String -Width 240).TrimEnd())
                 foreach ($advised in @($plan | Where-Object Advisory)) { [Console]::Out.WriteLine("[$($advised.Id)] Caveat: $($advised.Advisory)") }
                 foreach ($failure in $blocked) { [Console]::Error.WriteLine("[$($failure.Id)] Preflight failed: $($failure.Message)") }
@@ -3390,7 +3461,9 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
         } else {
             if ($blocked) { throw "Preflight failed: $(@($blocked | ForEach-Object { "[$($_.Id)] $($_.Message)" }) -join '; ')" }
             Write-CliStatus "Dingo quick apply: applying $($selected.Count) preferred setting(s)."
+            if ($skippedNotice) { Write-CliStatus $skippedNotice }
             Write-Log 'INFO' "Quick apply started for $($selected.Count) setting(s)."
+            if ($skippedNotice) { Write-Log 'INFO' $skippedNotice }
             $administratorResults = @{}
             if ($selected | Where-Object RequiresAdmin) {
                 Write-CliStatus 'Administrator approval is required for part of this plan.'
@@ -3419,7 +3492,7 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             if ($partial -or $failed) { $exitCode = 1 }
             if ($OutputFormat -eq 'Json') {
                 [Console]::Out.WriteLine((ConvertTo-Json -InputObject ([PSCustomObject]@{
-                    Version=$script:DingoVersion; Mode='ApplyPreferred'; Success=($exitCode -eq 0); ExitCode=$exitCode
+                    Version=$script:DingoVersion; Mode='ApplyPreferred'; Success=($exitCode -eq 0); ExitCode=$exitCode; Skipped=$skipped
                     Summary=[PSCustomObject]@{Succeeded=$succeeded;PartiallyApplied=$partial;Failed=$failed}
                     RestartRequired=[bool](@($results | Where-Object RestartRequired).Count); LogPath=$script:LogFile; Results=$resultRows
                 }) -Depth 9))
@@ -3501,82 +3574,112 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
-    <StackPanel Grid.Row="0" Margin="0,0,0,12">
-      <TextBlock Text="Dingo - Windows 11 Preferences" FontSize="25" FontWeight="SemiBold" Foreground="#17212B"/>
-      <TextBlock Text="Pick a tab, read what Windows uses now, choose what you want, then select the settings to change and click Apply selected changes." Foreground="#52606D" FontSize="14" Margin="0,4,0,0"/>
-    </StackPanel>
-    <WrapPanel Grid.Row="1" Margin="0,0,0,10">
-      <Button Name="AllPreferredButton" Content="Choose all my preferred settings" Background="#E5F2FF"/>
-      <Button Name="NeededButton" Content="Select only settings that need changing"/>
-      <Button Name="UncheckButton" Content="Clear all selections"/>
-      <Button Name="RefreshButton" Content="Read settings again"/>
-      <CheckBox Name="RestartExplorerCheckBox" Content="Restart File Explorer when finished" IsChecked="True" VerticalAlignment="Center" Margin="12,0,0,0"/>
-    </WrapPanel>
-    <TabControl Name="ScopeTabs" Grid.Row="2" FontSize="14">
-      <TabItem Header="My account">
+    <Grid Grid.Row="0" Margin="0,0,0,12">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+      <StackPanel Grid.Column="0">
+        <TextBlock Text="Dingo - Windows 11 Preferences" FontSize="25" FontWeight="SemiBold" Foreground="#17212B"/>
+        <TextBlock Name="IntroText" Text="Tweaks changes Windows settings. Tools installs analyst software and wires it up. Options is about Dingo itself. Nothing changes until you click Apply selected changes." Foreground="#52606D" FontSize="14" TextWrapping="Wrap" Margin="0,4,0,0"/>
+      </StackPanel>
+      <TextBlock Name="VersionText" Grid.Column="1" Text="" Foreground="#52606D" FontSize="13" VerticalAlignment="Top" HorizontalAlignment="Right" Margin="16,6,0,0"/>
+    </Grid>
+    <TabControl Name="SectionTabs" Grid.Row="2" FontSize="14">
+      <TabItem Header="Tweaks">
         <Grid>
           <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-          <Border Background="#EAF4FF" Padding="12" Margin="8">
-            <TextBlock Name="UserScopeText" Text="These settings affect only your signed-in Windows account. Most run directly as you; Windows may request administrator approval for a protected policy, but Dingo still targets your account." TextWrapping="Wrap"/>
-          </Border>
-          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-            <StackPanel Name="UserSettingsPanel" Margin="8,0,8,8"/>
-          </ScrollViewer>
+          <WrapPanel Grid.Row="0" Margin="8,10,8,0">
+            <Button Name="AllPreferredButton" Content="Choose all my preferred settings" Background="#E5F2FF"/>
+            <Button Name="NeededButton" Content="Select only settings that need changing"/>
+            <TextBlock Text="These two buttons act on the Tweaks section only." VerticalAlignment="Center" Foreground="#52606D" Margin="12,0,0,0"/>
+          </WrapPanel>
+        <TabControl Name="TweakTabs" Grid.Row="1" BorderThickness="0" Margin="0,6,0,0" FontSize="14">
+          <TabItem Header="My account">
+            <Grid>
+              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+              <Border Background="#EAF4FF" Padding="12" Margin="8">
+                <TextBlock Name="UserScopeText" Text="These settings affect only your signed-in Windows account. Most run directly as you; Windows may request administrator approval for a protected policy, but Dingo still targets your account." TextWrapping="Wrap"/>
+              </Border>
+              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Name="UserSettingsPanel" Margin="8,0,8,8"/>
+              </ScrollViewer>
+            </Grid>
+          </TabItem>
+          <TabItem Header="Whole computer">
+            <Grid>
+              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+              <Border Background="#FFF4DF" Padding="12" Margin="8">
+                <TextBlock Text="These settings affect everyone who uses this computer. Windows will ask for an administrator account when you apply them." TextWrapping="Wrap"/>
+              </Border>
+              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Name="SystemSettingsPanel" Margin="8,0,8,8"/>
+              </ScrollViewer>
+            </Grid>
+          </TabItem>
+          <TabItem Header="My account + whole computer">
+            <Grid>
+              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+              <Border Background="#F2EBFF" Padding="12" Margin="8">
+                <TextBlock Name="BothScopeText" Text="These choices have two parts: one for your account and one for the whole computer. Administrator approval is needed for the computer-wide part." TextWrapping="Wrap"/>
+              </Border>
+              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Name="BothSettingsPanel" Margin="8,0,8,8"/>
+              </ScrollViewer>
+            </Grid>
+          </TabItem>
+        </TabControl>
         </Grid>
       </TabItem>
-      <TabItem Header="Whole computer">
-        <Grid>
-          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-          <Border Background="#FFF4DF" Padding="12" Margin="8">
-            <TextBlock Text="These settings affect everyone who uses this computer. Windows will ask for an administrator account when you apply them." TextWrapping="Wrap"/>
-          </Border>
-          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-            <StackPanel Name="SystemSettingsPanel" Margin="8,0,8,8"/>
-          </ScrollViewer>
-        </Grid>
+      <TabItem Header="Tools">
+        <TabControl Name="ToolTabs" BorderThickness="0" Margin="0,6,0,0" FontSize="14">
+          <TabItem Header="Install tools">
+            <Grid>
+              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+              <Border Background="#E8F6EE" Padding="12" Margin="8">
+                <TextBlock Name="ToolsScopeText" Text="Analyst tools. Dingo checks whether each one is already installed, and installs the missing ones with winget. Dingo never removes a tool." TextWrapping="Wrap"/>
+              </Border>
+              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Name="ToolSettingsPanel" Margin="8,0,8,8"/>
+              </ScrollViewer>
+            </Grid>
+          </TabItem>
+          <TabItem Header="Tool shortcuts">
+            <Grid>
+              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+              <Border Background="#E8F6EE" Padding="12" Margin="8">
+                <TextBlock Name="ShortcutsScopeText" Text="Ways to reach the tools you installed: Start menu and Desktop shortcuts, and launchers that let you run the command-line tools from any folder." TextWrapping="Wrap"/>
+              </Border>
+              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Name="ShortcutSettingsPanel" Margin="8,0,8,8"/>
+              </ScrollViewer>
+            </Grid>
+          </TabItem>
+          <TabItem Header="File associations">
+            <Grid>
+              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+              <Border Background="#E8F6EE" Padding="12" Margin="8">
+                <TextBlock Name="AssociationScopeText" Text="Which program opens which file type. These are your account's choices, so no administrator approval is needed." TextWrapping="Wrap"/>
+              </Border>
+              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Name="AssociationSettingsPanel" Margin="8,0,8,8"/>
+              </ScrollViewer>
+            </Grid>
+          </TabItem>
+        </TabControl>
       </TabItem>
-      <TabItem Header="My account + whole computer">
+      <TabItem Header="Options">
         <Grid>
           <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-          <Border Background="#F2EBFF" Padding="12" Margin="8">
-            <TextBlock Name="BothScopeText" Text="These choices have two parts: one for your account and one for the whole computer. Administrator approval is needed for the computer-wide part." TextWrapping="Wrap"/>
+          <Border Background="#EEF1F4" Padding="12" Margin="8">
+            <TextBlock Text="How Dingo behaves when it runs. These are not Windows settings, and nothing here is changed on your computer." TextWrapping="Wrap"/>
           </Border>
-          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-            <StackPanel Name="BothSettingsPanel" Margin="8,0,8,8"/>
-          </ScrollViewer>
-        </Grid>
-      </TabItem>
-      <TabItem Header="Install tools">
-        <Grid>
-          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-          <Border Background="#E8F6EE" Padding="12" Margin="8">
-            <TextBlock Name="ToolsScopeText" Text="Analyst tools. Dingo checks whether each one is already installed, and installs the missing ones with winget. Dingo never removes a tool." TextWrapping="Wrap"/>
-          </Border>
-          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-            <StackPanel Name="ToolSettingsPanel" Margin="8,0,8,8"/>
-          </ScrollViewer>
-        </Grid>
-      </TabItem>
-      <TabItem Header="Tool shortcuts">
-        <Grid>
-          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-          <Border Background="#E8F6EE" Padding="12" Margin="8">
-            <TextBlock Name="ShortcutsScopeText" Text="Ways to reach the tools you installed: Start menu and Desktop shortcuts, and launchers that let you run the command-line tools from any folder." TextWrapping="Wrap"/>
-          </Border>
-          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-            <StackPanel Name="ShortcutSettingsPanel" Margin="8,0,8,8"/>
-          </ScrollViewer>
-        </Grid>
-      </TabItem>
-      <TabItem Header="File associations">
-        <Grid>
-          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-          <Border Background="#E8F6EE" Padding="12" Margin="8">
-            <TextBlock Name="AssociationScopeText" Text="Which program opens which file type. These are your account's choices, so no administrator approval is needed." TextWrapping="Wrap"/>
-          </Border>
-          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-            <StackPanel Name="AssociationSettingsPanel" Margin="8,0,8,8"/>
-          </ScrollViewer>
+          <StackPanel Grid.Row="1" Margin="20,8,20,8">
+            <TextBlock Text="When applying changes" FontWeight="SemiBold" Foreground="#17212B" Margin="0,8,0,6"/>
+            <CheckBox Name="RestartExplorerCheckBox" Content="Restart File Explorer when finished" IsChecked="True"/>
+            <TextBlock Text="Some File Explorer and taskbar changes only appear after Explorer restarts. Dingo restarts it only when a change it applied needs it." TextWrapping="Wrap" Foreground="#52606D" Margin="24,4,0,0"/>
+            <TextBlock Text="Logs" FontWeight="SemiBold" Foreground="#17212B" Margin="0,20,0,6"/>
+            <TextBlock Text="Dingo writes what it read and what it changed to a log file for this run." TextWrapping="Wrap" Foreground="#52606D" Margin="0,0,0,6"/>
+            <TextBlock Name="LogPathText" Text="" TextWrapping="Wrap" Foreground="#52606D" FontFamily="Consolas" Margin="0,0,0,8"/>
+            <Button Name="OpenLogButton" Content="Open log folder" HorizontalAlignment="Left" Margin="0"/>
+          </StackPanel>
         </Grid>
       </TabItem>
     </TabControl>
@@ -3586,7 +3689,8 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
       <TextBlock Name="SummaryText" Grid.Row="0" Text="Reading current settings..." VerticalAlignment="Center" Foreground="#334E68" TextWrapping="Wrap" Margin="0,0,0,6"/>
       <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right">
         <TextBlock Name="AdminSummaryText" Visibility="Collapsed" VerticalAlignment="Center" Foreground="#8A4B08" FontWeight="SemiBold" TextWrapping="Wrap" MaxWidth="250" Margin="0,0,14,0"/>
-        <Button Name="OpenLogButton" Content="Open log folder"/>
+        <Button Name="RefreshButton" Content="Read settings again"/>
+        <Button Name="UncheckButton" Content="Clear all selections"/>
         <Button Name="ApplyButton" Content="Apply selected changes" Background="#0B6EBD" Foreground="White" FontWeight="SemiBold"/>
       </StackPanel>
     </Grid>
@@ -3596,7 +3700,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
-foreach ($name in @('ScopeTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','ProgressBar','SummaryText','AdminSummaryText','OpenLogButton','ApplyButton')) {
+foreach ($name in @('IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
 $desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -3607,11 +3711,13 @@ if ($script:ToolCatalogWarning) {
     $ToolsScopeText.Text = "$($script:ToolCatalogWarning) The built-in tool list is being used instead."
     $ToolsScopeText.Foreground = '#8A2B21'
 }
+$VersionText.Text = "Version $($script:DingoVersion)"
+$LogPathText.Text = [string]$script:LogFile
 $script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$UncheckButton,$RefreshButton)
 
 function Set-ActionButtonsEnabled([bool]$Enabled) {
     foreach ($control in $script:ActionButtons) { $control.IsEnabled = $Enabled }
-    $ScopeTabs.IsEnabled = $Enabled
+    $SectionTabs.IsEnabled = $Enabled
     $RestartExplorerCheckBox.IsEnabled = $Enabled
     foreach ($item in $script:Settings) {
         if ($item.PSObject.Properties['ApplyControl']) { $item.ApplyControl.IsEnabled = $Enabled }
@@ -3802,11 +3908,35 @@ if ($UiSelfTest) {
     $adminSettings = @($script:Settings | Where-Object RequiresAdmin)
     if ($adminSettings | Where-Object { -not $_.AdminBadgeControl }) { throw 'Every setting that requires administrator approval must show an admin badge.' }
     if (-not $AdminSummaryText) { throw 'The selected administrator-change summary is unavailable.' }
-    # Every tab must hold cards, so a renamed tab cannot leave an empty one.
-    if ($ScopeTabs.Items.Count -ne @($script:Settings | Group-Object Tab).Count) {
-        throw "Every tab must hold cards: $($ScopeTabs.Items.Count) tabs for $(@($script:Settings | Group-Object Tab).Count) groups of cards."
+    # Tweaks and Tools are separate jobs, and Options is about Dingo itself.
+    if ($SectionTabs.Items.Count -ne 3) { throw "Expected the Tweaks, Tools, and Options sections, found $($SectionTabs.Items.Count) section(s)." }
+    foreach ($sectionName in @('Tweaks','Tools','Options')) {
+        $sectionTab = @($SectionTabs.Items | Where-Object { $_.Header -eq $sectionName })
+        if ($sectionTab.Count -ne 1) { throw "The '$sectionName' section is missing from the window." }
     }
-    "UI self-test passed: $($script:Settings.Count) setting cards across $($ScopeTabs.Items.Count) tabs."
+    # Every tab must hold cards, so a renamed tab cannot leave an empty one.
+    $innerTabCount = $TweakTabs.Items.Count + $ToolTabs.Items.Count
+    if ($innerTabCount -ne @($script:Settings | Group-Object Tab).Count) {
+        throw "Every tab must hold cards: $innerTabCount tabs for $(@($script:Settings | Group-Object Tab).Count) groups of cards."
+    }
+    # A card must never land in the wrong half of the window.
+    if ($TweakTabs.Items.Count -ne @($script:Settings | Where-Object { $_.Section -eq 'Tweaks' } | Group-Object Tab).Count) {
+        throw 'The Tweaks section does not hold exactly the tweak tabs.'
+    }
+    if ($ToolTabs.Items.Count -ne @($script:Settings | Where-Object { $_.Section -eq 'Tools' } | Group-Object Tab).Count) {
+        throw 'The Tools section does not hold exactly the tool tabs.'
+    }
+    if (-not $RestartExplorerCheckBox) { throw 'The Options section does not hold the File Explorer restart choice.' }
+    if (-not $OpenLogButton) { throw 'The Options section does not hold the log folder button.' }
+    if (-not $LogPathText.Text) { throw 'The Options section does not name the log file.' }
+    # A window showing a stale version is worse than one showing none at all.
+    if ($VersionText.Text -notmatch [regex]::Escape($script:DingoVersion)) {
+        throw "The window shows '$($VersionText.Text)' but Dingo reports version $($script:DingoVersion)."
+    }
+    foreach ($sectionName in @('Tweaks','Tools','Options')) {
+        if ($IntroText.Text -notmatch $sectionName) { throw "The window's opening sentence does not mention the '$sectionName' section." }
+    }
+    "UI self-test passed: $($script:Settings.Count) setting cards across $innerTabCount tabs, plus an Options section."
     $window.Close()
     exit 0
 }
@@ -3855,9 +3985,19 @@ function Update-CurrentStates {
         }
         $preferred = @($script:Settings | Where-Object { $_.CurrentState.Status -eq 'Preferred' }).Count
         $unreadable = @($script:Settings | Where-Object { $_.CurrentState.Status -in @('Error','Unavailable') }).Count
-        $SummaryText.Text = "$preferred of $count settings already use your preferred choice. Nothing changes until you click Apply selected changes."
+        # One number across both halves hides more than it tells: a tweak that
+        # matches a preference and a tool that is installed are different facts.
+        $sectionParts = New-Object System.Collections.ArrayList
+        foreach ($sectionName in @('Tweaks','Tools')) {
+            $sectionItems = @($script:Settings | Where-Object { $_.Section -eq $sectionName })
+            if (-not $sectionItems.Count) { continue }
+            $sectionReady = @($sectionItems | Where-Object { $_.CurrentState.Status -eq 'Preferred' }).Count
+            $wording = if ($sectionName -eq 'Tools') { 'already in place' } else { 'already match your preference' }
+            [void]$sectionParts.Add("$($sectionName): $sectionReady of $($sectionItems.Count) $wording")
+        }
+        $SummaryText.Text = "$($sectionParts -join '. '). Nothing changes until you click Apply selected changes."
         if ($unreadable) { $SummaryText.Text += " $unreadable setting$(if ($unreadable -eq 1) { '' } else { 's' }) could not be evaluated and will not be auto-selected." }
-        Write-Log 'INFO' "State refresh complete: $preferred of $count preferred."
+        Write-Log 'INFO' "State refresh complete: $preferred of $count preferred ($($sectionParts -join '; '))."
     } finally {
         $ProgressBar.Value = 0
         Set-ActionButtonsEnabled $true
@@ -3923,19 +4063,27 @@ function Complete-ApplyChanges([array]$Selected, [hashtable]$AdministratorResult
     }
 }
 
+# These two buttons live in the Tweaks half of the window, so they reach only
+# the tweak cards. A tool card is an install, not a preference, and it is never
+# selected on the strength of a button the person clicked somewhere else. Tool
+# selections already made are left exactly as they are.
+function Get-TweakSettings {
+    @($script:Settings | Where-Object { $_.Section -eq 'Tweaks' })
+}
 $AllPreferredButton.Add_Click({
-    foreach ($item in $script:Settings) { $item.DesiredState = $item.PreferredState; $item.Selected = $true }
+    foreach ($item in (Get-TweakSettings)) { $item.DesiredState = $item.PreferredState; $item.Selected = $true }
     Refresh-UI
-    $SummaryText.Text = 'All settings are selected and set to the choices marked "my preference". Click Apply selected changes when ready.'
+    $SummaryText.Text = 'Every Tweaks setting is selected and set to the choice marked "my preference". Tool selections were left as they are. Click Apply selected changes when ready.'
 })
 $NeededButton.Add_Click({
-    foreach ($item in $script:Settings) {
+    $tweaks = Get-TweakSettings
+    foreach ($item in $tweaks) {
         $item.DesiredState = $item.PreferredState
         $item.Selected = ($item.CurrentState.Status -in @('Alternate','Partial'))
     }
     Refresh-UI
-    $unknown = @($script:Settings | Where-Object { $_.CurrentState.Status -in @('Error','Unavailable','Unknown') }).Count
-    $SummaryText.Text = 'Only settings known not to match your preference are selected.'
+    $unknown = @($tweaks | Where-Object { $_.CurrentState.Status -in @('Error','Unavailable','Unknown') }).Count
+    $SummaryText.Text = 'Only Tweaks settings known not to match your preference are selected. Tool selections were left as they are.'
     if ($unknown) { $SummaryText.Text += " $unknown unreadable or unavailable setting$(if ($unknown -eq 1) { ' was' } else { 's were' }) left unselected." }
 })
 $UncheckButton.Add_Click({

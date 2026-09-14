@@ -4,7 +4,7 @@ Dingo quickly prepares a fresh Windows 11 installation for use as a DFIR analyst
 
 It is a self-contained, state-aware PowerShell/WPF utility that lets you review each change before applying it.
 
-![Dingo main window showing selectable Windows 11 preference cards](Assets/Dingo-main-screen-redacted.png)
+![Dingo main window: the Tweaks section open on the Whole computer tab, showing setting cards and the Tweaks, Tools, and Options sections](Assets/Dingo-main-screen-redacted.png)
 
 ## Run it
 
@@ -15,9 +15,9 @@ Dingo can be used as an interactive **GUI application** or as a **command-line (
 1. Copy the entire Dingo folder to the VM.
 2. Double-click Start-Dingo.cmd.
    Do not use **Run as administrator**. Dingo keeps its main window in your signed-in account and asks for administrator credentials later, only when needed.
-3. Choose the **My account**, **Whole computer**, **My account + whole computer**, **Install tools**, **Tool shortcuts**, or **File associations** tab.
+3. Choose the **Tweaks** section (**My account**, **Whole computer**, **My account + whole computer**) or the **Tools** section (**Install tools**, **Tool shortcuts**, **File associations**). The **Options** section holds Dingo's own choices: the File Explorer restart and the log folder.
 4. Each card explains the normal Windows choice, the current choice, and the available choices in plain language.
-5. Turn on the switches for the cards to change, or use **Choose all my preferred settings**.
+5. Turn on the switches for the cards to change, or use **Choose all my preferred settings**. That button and **Select only settings that need changing** sit in the **Tweaks** section and act on tweak cards only; a tool selection you made by hand is left alone.
 6. Choose **Apply selected changes**. Windows requests administrator approval when the selection includes a whole-computer setting or a protected account policy marked **Admin approval required**.
 
 No installation or PowerShell modules are required. Windows PowerShell 5.1 is included with Windows 11.
@@ -28,7 +28,7 @@ A console window appears for about a second while PowerShell starts, then hides 
 
 Run Dingo from Command Prompt or PowerShell to preview changes, apply a complete or filtered configuration, inspect the setting catalog, or integrate it into a repeatable setup process. A CLI run keeps its console open because that is where its output is written.
 
-Use the launcher with `-ApplyPreferred` to apply all 39 preferred settings without opening the GUI:
+Use the launcher with `-ApplyPreferred` to apply the preferred settings without opening the GUI. With no `-Include`, this applies the **Tweaks** section only: the 27 account and computer settings. Tool cards are left alone, and the run reports how many were skipped.
 
 ```bat
 Start-Dingo.cmd -ApplyPreferred
@@ -42,12 +42,17 @@ Dingo still runs as the signed-in user and displays a Windows administrator prom
 Start-Dingo.cmd -WhatIf
 ```
 
-Limit the plan by stable setting ID, using either repeated values or a comma-separated list:
+Limit the plan with `-Include` and `-Exclude`. Both accept a section word, a stable setting ID, or a comma-separated list of either:
 
 ```bat
+Start-Dingo.cmd -ApplyPreferred -Include tools
+Start-Dingo.cmd -ApplyPreferred -Include tweaks,tools
 Start-Dingo.cmd -ApplyPreferred -Include widgets,taskbar-search
+Start-Dingo.cmd -ApplyPreferred -Include tools -Exclude tool-7zip
 Start-Dingo.cmd -WhatIf -Exclude language-au,windows-update-continuity
 ```
+
+The two section words are `tweaks` (the account and computer settings) and `tools` (installs, shortcuts, and file associations). Each stands for every ID in that section, so a command line stays short as the tool list grows. `-Include tweaks,tools` is the whole catalog.
 
 Add `-NoRestartExplorer` to suppress the automatic File Explorer restart. Exit code `0` means the plan succeeded (or a dry run completed), `1` means at least one setting failed or was only partially applied, `2` means the command or environment was invalid, and `3` means Dingo was already running.
 
@@ -66,7 +71,7 @@ Start-Dingo.cmd -Help
 
 `-h` and `-?` are short aliases for `-Help`.
 
-Current version: **0.6.9**. Phase 4 VM testing corrected wildcard detection in 0.6.3, association write ordering in 0.6.4, cleanup of Explorer's per-user Open With cache in 0.6.5, native Windows association command paths in 0.6.6, and actionable sign-out/restart guidance in 0.6.7-0.6.8. Version 0.6.9 replaces each card's labelled checkbox with a compact unlabelled selection switch while retaining the same batch-selection behavior. Phase 1 is **0.6.0**, Phase 2 is **0.6.1**; patch versions roll over after `.9`.
+Current version: **0.7.0**. Version 0.7.0 splits the catalog into a **Tweaks** section and a **Tools** section, gives the window a third **Options** section for Dingo's own choices, and makes a bare `-ApplyPreferred` apply the Tweaks section only. That last point is a breaking change for existing command lines: use `-Include tweaks,tools` for the previous behavior. Phase 4 VM testing corrected wildcard detection in 0.6.3, association write ordering in 0.6.4, cleanup of Explorer's per-user Open With cache in 0.6.5, native Windows association command paths in 0.6.6, and actionable sign-out/restart guidance in 0.6.7-0.6.8. Version 0.6.9 replaced each card's labelled checkbox with a compact unlabelled selection switch while retaining the same batch-selection behavior. Phase 1 is **0.6.0**, Phase 2 is **0.6.1**; patch versions roll over after `.9`.
 
 ## Behaviour and safety
 
@@ -114,7 +119,7 @@ Current version: **0.6.9**. Phase 4 VM testing corrected wildcard detection in 0
 - A winget install is given 15 minutes before Dingo gives up on it and stops the process. winget's own output is written to the log on both success and failure.
 - **Installed**, including `-ApplyPreferred`, leaves a detected installation unchanged, whatever its version. Detection is repeated in the executing account immediately before installation; winget also receives `--no-upgrade` for this action. **Update installed tool** explicitly invokes the installer for a detected installation. Dingo provides no uninstall action.
 - If winget reports that a package is already present with nothing newer available, Dingo treats that as a success, because the tool is installed either way. Detection normally prevents this from happening at all.
-- `-ApplyPreferred` now installs missing tools as well as changing settings, because "installed" is the preferred state for a tool card. Use `-Exclude` with the `tool-` IDs, or `-Include`, if you want settings only.
+- `-ApplyPreferred` with no `-Include` does **not** install tools. It applies the Tweaks section only, and reports how many tool cards it skipped. Installing software is a larger act than changing a registry value, so it is never the result of a bare command line. Use `-Include tools` for the tool cards, or `-Include tweaks,tools` for both. **This changed in 0.7.0**; before that, a bare `-ApplyPreferred` applied every card.
 - A tool can declare that it needs another tool, with a `requires` list. When the other tool is absent, the card shows an amber caveat saying the tool will not start, and the same text appears as `Advisory` in `-WhatIf -OutputFormat Json`. A caveat never blocks the plan, because that would stop unrelated settings from being applied.
 - Eric Zimmerman's tools are built on .NET 9, and a fresh Windows 11 install does not include it. Without it every tool fails to start with `You must install .NET to run this application`. Dingo therefore offers **.NET 9 Desktop Runtime** as its own card, listed before the tools that need it so a single run installs them in the right order. This was found by testing in Windows Sandbox, which is as bare as a freshly imaged VM.
 - Dingo detects Eric Zimmerman's tools by looking for **Timeline Explorer** and **Registry Explorer**, not for a command-line tool. A partial copy holding only the command-line tools is common, and detecting on those would wrongly report a complete install.
@@ -127,7 +132,7 @@ Current version: **0.6.9**. Phase 4 VM testing corrected wildcard detection in 0
 
 ## Settings included
 
-Thirty-nine settings. Six install tools. Two make shortcuts, one puts the tools on the PATH, and three set file types. The ID in the first column is the stable name used by `-Include` and `-Exclude`. **Scope** is whose settings change, and **Admin** is whether Windows asks for administrator approval. Run `Start-Dingo.cmd -ListSettings` for the same list from the tool itself.
+Thirty-nine settings. Six install tools. Two make shortcuts, one puts the tools on the PATH, and three set file types. The ID in the first column is the stable name used by `-Include` and `-Exclude`, which also accept the section words `tweaks` and `tools`. **Scope** is whose settings change, and **Admin** is whether Windows asks for administrator approval. Run `Start-Dingo.cmd -ListSettings` for the same list from the tool itself.
 
 ### Region and language
 
@@ -188,7 +193,7 @@ Thirty-nine settings. Six install tools. Two make shortcuts, one puts the tools 
 
 ### Tools
 
-Tool cards live on the **Install tools** tab. **Installed** is the preferred action: keep a detected installation or install a missing one. **Update installed tool** is an explicit maintenance action and requires the tool to be detected already. `-ApplyPreferred` and **Choose all my preferred settings** always use **Installed**, never the update action. Neither choice uninstalls a tool.
+Tool cards live on the **Install tools** tab, in the **Tools** section. **Installed** is the preferred action: keep a detected installation or install a missing one. **Update installed tool** is an explicit maintenance action and requires the tool to be detected already. `-ApplyPreferred` and **Choose all my preferred settings** always use **Installed**, never the update action. Neither choice uninstalls a tool.
 
 The **Tool shortcuts** tab holds the three cards that make an installed tool easy to reach: Start menu shortcuts, Desktop shortcuts, and command-line access. The **File associations** tab decides which program opens which file type.
 
