@@ -9,3 +9,7 @@ Dingo-*.zip
 
 # Your own tool catalog. Tools.example.json is the template that is tracked.
 Tools.json
+
+# Working screenshots. Only the redacted copy referenced by the README is
+# tracked, so an unredacted shot cannot be published by a stray 'git add -A'.
+Assets/Dingo-main-screen.png
