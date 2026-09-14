@@ -414,6 +414,15 @@ function New-Entry {
     [PSCustomObject]@{ Scope=$Scope; Path=$Path; Name=$Name; Preferred=$Preferred; Alternate=$Alternate; Type=$Type }
 }
 
+function Get-SettingSection([string]$TabName) {
+    # Dingo does two different jobs. Tweaks change how Windows behaves for an
+    # account or the computer. Tools put analyst software on the machine and
+    # wire it up. They are grouped apart so neither the GUI buttons nor a bare
+    # command line ever sweeps one of them up with the other.
+    if ($TabName -in @('Install tools','Tool shortcuts','File associations')) { return 'Tools' }
+    return 'Tweaks'
+}
+
 function New-Setting {
     param(
         [string]$Id,
@@ -453,10 +462,11 @@ function New-Setting {
     }
     # Cards are grouped by who a setting affects unless it declares its own tab.
     $tabName = if ([string]::IsNullOrWhiteSpace($Tab)) { $displayScope } else { $Tab }
+    $sectionName = Get-SettingSection $tabName
     [PSCustomObject]@{
         Selected=$false; Id=$Id; Category=$Category; Name=$Name; Description=$Description
         PreferredState=$PreferredState; AlternateState=$AlternateState; DesiredState=$PreferredState
-        DefaultState=$defaultState; DisplayScope=$displayScope; Tab=$tabName
+        DefaultState=$defaultState; DisplayScope=$displayScope; Tab=$tabName; Section=$sectionName
         StateOptions=$options; CanChoose=($options.Count -gt 1); CurrentState=(New-StateResult 'Unknown' 'Reading...')
         Status='Ready'; Details=''; LastApplyResult=$null; Kind=$Kind; Entries=$Entries; RequiresAdmin=$needsElevation
         RestartExplorer=$RestartExplorer; RestartRequired=$RestartRequired; Requirements=$requirementCopy
@@ -2565,10 +2575,30 @@ function Resolve-QuickApplySettings {
         param([string[]]$Values)
         @($Values | ForEach-Object { @([string]$_ -split ',') } | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique)
     }
+    # 'tweaks' and 'tools' stand for every ID in that section. They keep a
+    # command line short as the tool list grows, and they let the default
+    # apply reach for the tweaks alone without naming each one.
+    $groups = @{}
+    foreach ($setting in $AllSettings) {
+        $groupKey = ([string]$setting.Section).ToLowerInvariant()
+        if (-not $groups.ContainsKey($groupKey)) { $groups[$groupKey] = New-Object System.Collections.ArrayList }
+        [void]$groups[$groupKey].Add(([string]$setting.Id).ToLowerInvariant())
+    }
+    # A section word that was also a setting ID would be read two ways, so the
+    # catalog is refused rather than guessed at.
+    foreach ($groupKey in $groups.Keys) {
+        if ($known.ContainsKey($groupKey)) { throw "Setting ID '$groupKey' clashes with the section name of the same spelling. Rename it in Tools.json." }
+    }
+    $expand = {
+        param([string[]]$Keys)
+        @($Keys | ForEach-Object { if ($groups.ContainsKey($_)) { @($groups[$_]) } else { $_ } } | Select-Object -Unique)
+    }
     $includeKeys = @(& $normalise $IncludeIds)
     $excludeKeys = @(& $normalise $ExcludeIds)
-    $unknown = @($includeKeys + $excludeKeys | Where-Object { -not $known.ContainsKey($_) } | Select-Object -Unique)
-    if ($unknown) { throw "Unknown setting ID$(if ($unknown.Count -eq 1) { '' } else { 's' }): $($unknown -join ', ')." }
+    $unknown = @($includeKeys + $excludeKeys | Where-Object { -not $known.ContainsKey($_) -and -not $groups.ContainsKey($_) } | Select-Object -Unique)
+    if ($unknown) { throw "Unknown setting ID or section$(if ($unknown.Count -eq 1) { '' } else { 's' }): $($unknown -join ', '). Sections are 'tweaks' and 'tools'." }
+    $includeKeys = @(& $expand $includeKeys)
+    $excludeKeys = @(& $expand $excludeKeys)
     $selected = if ($includeKeys) {
         @($AllSettings | Where-Object { ([string]$_.Id).ToLowerInvariant() -in $includeKeys })
     } else {
@@ -2603,8 +2633,22 @@ GUI:
   Start-Dingo.cmd
 
 Quick apply:
-  Start-Dingo.cmd -WhatIf [-Include id1,id2] [-Exclude id3] [-OutputFormat Text|Json]
-  Start-Dingo.cmd -ApplyPreferred [-Include id1,id2] [-Exclude id3] [-NoRestartExplorer] [-OutputFormat Text|Json]
+  Start-Dingo.cmd -WhatIf [-Include what] [-Exclude what] [-OutputFormat Text|Json]
+  Start-Dingo.cmd -ApplyPreferred [-Include what] [-Exclude what] [-NoRestartExplorer] [-OutputFormat Text|Json]
+
+  Without -Include, only the Tweaks section is applied. Tool cards are left alone,
+  and the run reports how many were skipped.
+
+What to include or exclude:
+  A section word, a setting ID, or a comma-separated list of either.
+  Sections are 'tweaks' (account and computer settings) and 'tools'
+  (installs, shortcuts, and file associations).
+
+  -Include tweaks              the default: settings only, no installs
+  -Include tools               installs, shortcuts, and file associations
+  -Include tweaks,tools        everything
+  -Include tools -Exclude tool-7zip    a section, less one card
+  -Include iso-time,hidden-files       named cards only
 
 Discovery:
   Start-Dingo.cmd -ListSettings [-OutputFormat Text|Json]
@@ -2613,7 +2657,7 @@ Discovery:
   Start-Dingo.cmd -Help
 
 Tools:
-  Analyst tools appear on the Tools tab and use IDs that start with 'tool-'.
+  Analyst tools sit in the Tools section and use IDs that start with 'tool-'.
   Dingo installs them with winget and never uninstalls them.
   Add your own by placing a Tools.json file next to Dingo.ps1. See the README.
 
@@ -2780,7 +2824,7 @@ if ($RecoveryReport) {
 
 if ($ListSettings) {
     $catalog = @($script:Settings | ForEach-Object {
-        [PSCustomObject]@{ Id=$_.Id; Name=$_.Name; Category=$_.Category; Kind=$_.Kind; Scope=$_.DisplayScope; RequiresAdmin=$_.RequiresAdmin; PreferredState=$_.PreferredState; Requirements=$_.Requirements }
+        [PSCustomObject]@{ Id=$_.Id; Section=$_.Section; Name=$_.Name; Category=$_.Category; Kind=$_.Kind; Scope=$_.DisplayScope; RequiresAdmin=$_.RequiresAdmin; PreferredState=$_.PreferredState; Requirements=$_.Requirements }
     })
     if ($OutputFormat -eq 'Json') { [Console]::Out.WriteLine((ConvertTo-Json -InputObject $catalog -Depth 5)) }
     else { [Console]::Out.WriteLine(($catalog | Format-Table -AutoSize | Out-String -Width 220).TrimEnd()) }
@@ -2829,7 +2873,12 @@ if ($SelfTest) {
     if ($selfTestAst.Extent.Text -notmatch 'CmdletBinding\s*\(\s*PositionalBinding\s*=\s*\$false\s*\)' -or $selfTestAst.Extent.Text -notmatch 'ValueFromRemainingArguments\s*=\s*\$true') {
         throw 'Command-line parsing must reject stray positional and unknown arguments through the Dingo help path.'
     }
-    if ((Get-DingoHelpText) -notmatch '-ApplyPreferred' -or (Get-DingoHelpText) -notmatch '-ListSettings') { throw 'The command-line help text is incomplete.' }
+    $helpText = Get-DingoHelpText
+    foreach ($helpTopic in @('-ApplyPreferred','-ListSettings','-Include tweaks','-Include tools','-Include tweaks,tools')) {
+        if ($helpText -notmatch [regex]::Escape($helpTopic)) { throw "The command-line help text does not cover '$helpTopic'." }
+    }
+    # The default is a trap if it is undocumented, so the help must state it.
+    if ($helpText -notmatch 'Without -Include') { throw 'The command-line help text does not state what a bare apply does.' }
     $launcherAst = $selfTestAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Start-AdministratorChanges' },$true)
     $launcherStart = if ($launcherAst) { $launcherAst.Find({ param($node) $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Start-Process' },$true) } else { $null }
     if (-not $launcherStart) { throw 'The asynchronous elevated-worker launcher does not start a process.' }
@@ -3355,8 +3404,29 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
     }
     try {
         Initialize-Log
-        $selected = @(New-ApplyPlan @(Resolve-QuickApplySettings $script:Settings $Include $Exclude))
+        # Dingo started life as a set of tweaks, and that is what a bare command
+        # line still does. Installing software is a bigger act than changing a
+        # registry value, so the tool cards are reached only when they are asked
+        # for by name or by the 'tools' section word.
+        $effectiveInclude = if ($Include) { $Include } else { @('tweaks') }
+        $selected = @(New-ApplyPlan @(Resolve-QuickApplySettings $script:Settings $effectiveInclude $Exclude))
         if (-not $selected) { throw 'The include/exclude filters selected no settings.' }
+        # A quiet behaviour change is a trap, so a run that used the default says
+        # out loud which cards it left alone and how to ask for them.
+        $skipped = $null
+        if (-not $Include) {
+            $skippedIds = @($script:Settings | Where-Object { $_.Section -eq 'Tools' } | ForEach-Object { [string]$_.Id })
+            if ($skippedIds.Count) {
+                $skipped = [PSCustomObject]@{
+                    Section = 'Tools'
+                    Count = $skippedIds.Count
+                    Ids = $skippedIds
+                    Reason = 'No -Include was given, so only the Tweaks section ran.'
+                    Hint = 'Use -Include tools for the tool cards, or -Include tweaks,tools for both.'
+                }
+            }
+        }
+        $skippedNotice = if ($skipped) { "$($skipped.Count) tool card(s) were left alone. $($skipped.Reason) $($skipped.Hint)" } else { '' }
         foreach ($item in $selected) {
             $item.DesiredState = $item.PreferredState
             $item.CurrentState = Get-SettingState $item
@@ -3378,10 +3448,11 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             $exitCode = if ($blocked) { 2 } else { 0 }
             if ($OutputFormat -eq 'Json') {
                 [Console]::Out.WriteLine((ConvertTo-Json -InputObject ([PSCustomObject]@{
-                    Version=$script:DingoVersion; Mode='WhatIf'; Success=(-not [bool]$blocked); ExitCode=$exitCode; Changed=$false; Elevated=$elevatedDryRun; Plan=$plan
+                    Version=$script:DingoVersion; Mode='WhatIf'; Success=(-not [bool]$blocked); ExitCode=$exitCode; Changed=$false; Elevated=$elevatedDryRun; Skipped=$skipped; Plan=$plan
                 }) -Depth 7))
             } else {
                 Write-CliStatus "Dingo dry run: $($selected.Count) preferred setting(s) would be applied. No changes were made."
+                if ($skippedNotice) { Write-CliStatus $skippedNotice }
                 [Console]::Out.WriteLine(($plan | Format-Table Id,Name,Kind,Scope,RequiresAdmin,Available,CurrentStatus,CurrentState,Target -AutoSize | Out-String -Width 240).TrimEnd())
                 foreach ($advised in @($plan | Where-Object Advisory)) { [Console]::Out.WriteLine("[$($advised.Id)] Caveat: $($advised.Advisory)") }
                 foreach ($failure in $blocked) { [Console]::Error.WriteLine("[$($failure.Id)] Preflight failed: $($failure.Message)") }
@@ -3390,7 +3461,9 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
         } else {
             if ($blocked) { throw "Preflight failed: $(@($blocked | ForEach-Object { "[$($_.Id)] $($_.Message)" }) -join '; ')" }
             Write-CliStatus "Dingo quick apply: applying $($selected.Count) preferred setting(s)."
+            if ($skippedNotice) { Write-CliStatus $skippedNotice }
             Write-Log 'INFO' "Quick apply started for $($selected.Count) setting(s)."
+            if ($skippedNotice) { Write-Log 'INFO' $skippedNotice }
             $administratorResults = @{}
             if ($selected | Where-Object RequiresAdmin) {
                 Write-CliStatus 'Administrator approval is required for part of this plan.'
@@ -3419,7 +3492,7 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             if ($partial -or $failed) { $exitCode = 1 }
             if ($OutputFormat -eq 'Json') {
                 [Console]::Out.WriteLine((ConvertTo-Json -InputObject ([PSCustomObject]@{
-                    Version=$script:DingoVersion; Mode='ApplyPreferred'; Success=($exitCode -eq 0); ExitCode=$exitCode
+                    Version=$script:DingoVersion; Mode='ApplyPreferred'; Success=($exitCode -eq 0); ExitCode=$exitCode; Skipped=$skipped
                     Summary=[PSCustomObject]@{Succeeded=$succeeded;PartiallyApplied=$partial;Failed=$failed}
                     RestartRequired=[bool](@($results | Where-Object RestartRequired).Count); LogPath=$script:LogFile; Results=$resultRows
                 }) -Depth 9))
