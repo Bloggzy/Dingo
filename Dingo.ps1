@@ -26,6 +26,7 @@ param(
     [switch]$ElevationBroker,
     [switch]$WpfHost,
     [switch]$FinalizeInternationalSettings,
+    [string]$FinalizeFormatState,
     [string]$PlanPath,
     [string]$ResultPath,
     [string]$WorkerLogPath,
@@ -44,7 +45,7 @@ $script:PendingApply = $null
 $script:ApplyInProgress = $false
 $script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.7.0'
+$script:DingoVersion = '0.7.1'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -355,6 +356,10 @@ function New-StateResultForSetting($Setting, [string]$DisplayText, [string]$Deta
         'Preferred'
     } elseif ($Setting.CanChoose -and $DisplayText -eq $Setting.AlternateState) {
         'Alternate'
+    } elseif ($Setting.CanChoose -and $Setting.StateOptions -contains $DisplayText) {
+        # A card that offers a list rather than a pair still reports a state it
+        # offers as a real choice, not as a half-finished one.
+        'Alternate'
     } else {
         'Partial'
     }
@@ -402,6 +407,100 @@ function New-ApplyResult {
     }
 }
 
+# The locale choices the region and language cards offer. The first key of each table is the
+# preferred one, so the window, the command line, and the README all agree.
+# They are built inside a function, because the test suites load Dingo one
+# function at a time and never run a bare assignment at the top of the file.
+function Get-DateTimeFormatChoices {
+    # The date and time formats offered on the card. Every choice sets the same
+    # seven Windows values, so a half-applied mixture can never be reported as
+    # one of them. iDate is 0 for month first, 1 for day first, 2 for year
+    # first. iTime is 1 for a 24-hour clock. iTLZero keeps the leading zero.
+    if (-not (Get-Variable -Name DateTimeFormatChoices -Scope Script -ErrorAction SilentlyContinue)) { $script:DateTimeFormatChoices = [ordered]@{
+    'ISO-style / 24-hour (yyyy-MM-dd HH:mm)' = @{ sShortDate='yyyy-MM-dd'; sShortTime='HH:mm'; sTimeFormat='HH:mm:ss'; sDate='-'; iDate='2'; iTime='1'; iTLZero='1' }
+    'Day first / 24-hour (dd/MM/yyyy HH:mm)' = @{ sShortDate='dd/MM/yyyy'; sShortTime='HH:mm'; sTimeFormat='HH:mm:ss'; sDate='/'; iDate='1'; iTime='1'; iTLZero='1' }
+    'Day first / 12-hour (dd/MM/yyyy h:mm tt)' = @{ sShortDate='dd/MM/yyyy'; sShortTime='h:mm tt'; sTimeFormat='h:mm:ss tt'; sDate='/'; iDate='1'; iTime='0'; iTLZero='0' }
+    'Day first, dots / 24-hour (dd.MM.yyyy HH:mm)' = @{ sShortDate='dd.MM.yyyy'; sShortTime='HH:mm'; sTimeFormat='HH:mm:ss'; sDate='.'; iDate='1'; iTime='1'; iTLZero='1' }
+    'Month first / 24-hour (MM/dd/yyyy HH:mm)' = @{ sShortDate='MM/dd/yyyy'; sShortTime='HH:mm'; sTimeFormat='HH:mm:ss'; sDate='/'; iDate='0'; iTime='1'; iTLZero='1' }
+    'Month first / 12-hour (MM/dd/yyyy h:mm tt)' = @{ sShortDate='MM/dd/yyyy'; sShortTime='h:mm tt'; sTimeFormat='h:mm:ss tt'; sDate='/'; iDate='0'; iTime='0'; iTLZero='0' }
+    } }
+    return $script:DateTimeFormatChoices
+}
+
+function Get-MaxRadioChoices {
+    # More choices than this on one card become a drop-down list, because a
+    # column of radio buttons that long does not fit the card.
+    return 3
+}
+
+function Get-LanguageChoiceTable {
+    if (-not (Get-Variable -Name LanguageChoices -Scope Script -ErrorAction SilentlyContinue)) { $script:LanguageChoices = [ordered]@{
+    # Tag is what Windows is asked for. Packs is the display-language download
+    # the tag needs, best first. Windows localises some English variants only
+    # through a parent pack, so those name the parent as a fallback and Dingo
+    # installs the first pack Windows actually offers.
+    'British English (en-GB)'      = @{ Tag='en-GB'; Packs=@('en-GB') }
+    'Australian English (en-AU)'   = @{ Tag='en-AU'; Packs=@('en-AU','en-GB') }
+    'American English (en-US)'     = @{ Tag='en-US'; Packs=@('en-US') }
+    'Canadian English (en-CA)'     = @{ Tag='en-CA'; Packs=@('en-CA','en-US','en-GB') }
+    'New Zealand English (en-NZ)'  = @{ Tag='en-NZ'; Packs=@('en-NZ','en-GB') }
+    'Irish English (en-IE)'        = @{ Tag='en-IE'; Packs=@('en-IE','en-GB') }
+    'Indian English (en-IN)'       = @{ Tag='en-IN'; Packs=@('en-IN','en-GB') }
+    'South African English (en-ZA)'= @{ Tag='en-ZA'; Packs=@('en-ZA','en-GB') }
+    'German (de-DE)'               = @{ Tag='de-DE'; Packs=@('de-DE') }
+    'French (fr-FR)'               = @{ Tag='fr-FR'; Packs=@('fr-FR') }
+    'Spanish (es-ES)'              = @{ Tag='es-ES'; Packs=@('es-ES') }
+    'Italian (it-IT)'              = @{ Tag='it-IT'; Packs=@('it-IT') }
+    'Dutch (nl-NL)'                = @{ Tag='nl-NL'; Packs=@('nl-NL') }
+    'Japanese (ja-JP)'             = @{ Tag='ja-JP'; Packs=@('ja-JP') }
+    } }
+    return $script:LanguageChoices
+}
+
+function Get-RegionChoiceTable {
+    if (-not (Get-Variable -Name RegionChoices -Scope Script -ErrorAction SilentlyContinue)) { $script:RegionChoices = [ordered]@{
+    # GeoId is the Windows country number behind Set-WinHomeLocation.
+    'Australia (en-AU)'      = @{ Culture='en-AU'; GeoId=12  }
+    'United Kingdom (en-GB)' = @{ Culture='en-GB'; GeoId=242 }
+    'United States (en-US)'  = @{ Culture='en-US'; GeoId=244 }
+    'Canada (en-CA)'         = @{ Culture='en-CA'; GeoId=39  }
+    'New Zealand (en-NZ)'    = @{ Culture='en-NZ'; GeoId=183 }
+    'Ireland (en-IE)'        = @{ Culture='en-IE'; GeoId=68  }
+    'Singapore (en-SG)'      = @{ Culture='en-SG'; GeoId=215 }
+    'India (en-IN)'          = @{ Culture='en-IN'; GeoId=113 }
+    'South Africa (en-ZA)'   = @{ Culture='en-ZA'; GeoId=209 }
+    'Germany (de-DE)'        = @{ Culture='de-DE'; GeoId=94  }
+    'France (fr-FR)'         = @{ Culture='fr-FR'; GeoId=84  }
+    'Spain (es-ES)'          = @{ Culture='es-ES'; GeoId=217 }
+    'Netherlands (nl-NL)'    = @{ Culture='nl-NL'; GeoId=176 }
+    'Japan (ja-JP)'          = @{ Culture='ja-JP'; GeoId=122 }
+    } }
+    return $script:RegionChoices
+}
+
+function Get-LocaleChoice([System.Collections.Specialized.OrderedDictionary]$Table, [string]$Label) {
+    if (-not $Table.Contains($Label)) { throw "'$Label' is not a choice Dingo offers." }
+    return $Table[$Label]
+}
+
+function Get-TimeZoneChoices {
+    # The real list from this copy of Windows, so a chosen id is always one
+    # Set-TimeZone accepts. UTC leads because it is the preferred choice.
+    $ids = New-Object System.Collections.ArrayList
+    [void]$ids.Add('UTC')
+    try {
+        foreach ($zone in @(Get-TimeZone -ListAvailable -ErrorAction Stop | Sort-Object Id)) {
+            if ($zone.Id -ne 'UTC') { [void]$ids.Add([string]$zone.Id) }
+        }
+    } catch {
+        Write-Log 'WARN' "Could not list the Windows time zones, so only a short built-in list is offered: $($_.Exception.Message)"
+        foreach ($id in @('AUS Eastern Standard Time','AUS Central Standard Time','W. Australia Standard Time','Tasmania Standard Time','New Zealand Standard Time','GMT Standard Time','W. Europe Standard Time','Eastern Standard Time','Central Standard Time','Mountain Standard Time','Pacific Standard Time','Singapore Standard Time','India Standard Time','Tokyo Standard Time')) {
+            [void]$ids.Add($id)
+        }
+    }
+    return @($ids)
+}
+
 function New-Entry {
     param(
         [ValidateSet('User','Machine','ElevatedUser')][string]$Scope,
@@ -409,9 +508,23 @@ function New-Entry {
         [string]$Name,
         $Preferred,
         $Alternate = '__REMOVE_VALUE__',
-        [ValidateSet('DWord','QWord','String')][string]$Type = 'DWord'
+        [ValidateSet('DWord','QWord','String')][string]$Type = 'DWord',
+        [hashtable]$States = $null
     )
-    [PSCustomObject]@{ Scope=$Scope; Path=$Path; Name=$Name; Preferred=$Preferred; Alternate=$Alternate; Type=$Type }
+    # States gives one value per named choice. A card that offers only a pair
+    # leaves it empty and keeps using Preferred and Alternate.
+    $stateMap = $null
+    if ($States) {
+        $stateMap = @{}
+        foreach ($key in $States.Keys) { $stateMap[[string]$key] = $States[$key] }
+    }
+    [PSCustomObject]@{ Scope=$Scope; Path=$Path; Name=$Name; Preferred=$Preferred; Alternate=$Alternate; Type=$Type; States=$stateMap }
+}
+
+function Get-EntryWantedValue($Entry, [string]$DesiredState, $Setting) {
+    if ($Entry.States -and $Entry.States.ContainsKey($DesiredState)) { return $Entry.States[$DesiredState] }
+    if ($DesiredState -eq $Setting.PreferredState) { return $Entry.Preferred }
+    return $Entry.Alternate
 }
 
 function Get-SettingSection([string]$TabName) {
@@ -437,11 +550,17 @@ function New-Setting {
         [bool]$RestartRequired = $false,
         [hashtable]$Requirements = @{},
         [string]$Tab = '',
-        [string]$DefaultStateText = ''
+        [string]$DefaultStateText = '',
+        [string[]]$StateChoices = @()
     )
     $options = New-Object System.Collections.ArrayList
     [void]$options.Add($PreferredState)
     if (-not [string]::IsNullOrWhiteSpace($AlternateState)) { [void]$options.Add($AlternateState) }
+    # A card can offer a long list instead of a pair. The preferred choice always
+    # stays first, so the list order never changes what Dingo recommends.
+    foreach ($choice in $StateChoices) {
+        if (-not [string]::IsNullOrWhiteSpace($choice) -and $options -notcontains $choice) { [void]$options.Add([string]$choice) }
+    }
     if ($Kind -eq 'Package') { [void]$options.Add('Update installed tool') }
     $handler = Get-SettingHandler $Kind
     $scopes = @(& $handler.GetScopes $Entries)
@@ -1684,18 +1803,18 @@ function Get-Settings {
     $windowsUpdateAU = "$windowsUpdate\AU"
     $settings = New-Object System.Collections.ArrayList
 
-    [void]$settings.Add((New-Setting 'timezone-utc' 'Region & language' 'Time zone' 'Preferred time zone is UTC.' 'UTC' $null 'TimeZone' @() $false $false))
-    [void]$settings.Add((New-Setting 'region-australia' 'Region & language' 'Region and formats' 'Preferred region and culture are Australia / en-AU.' 'Australia (en-AU)' $null 'Region'))
-    [void]$settings.Add((New-Setting 'language-au' 'Region & language' 'Australian English' 'Selects English (Australia) for the Windows interface, input, spelling, and system locale. Windows supplies its interface through the underlying en-GB display resources.' 'Australian UI + locale (en-AU)' $null 'Language' @() $false $true))
-    [void]$settings.Add((New-Setting 'iso-time' 'Region & language' 'Date and time format' 'Preferred formats are yyyy-MM-dd, HH:mm, and HH:mm:ss.' 'ISO-style / 24-hour' $null 'Registry' @(
-        (New-Entry User 'Control Panel\International' 'sShortDate' 'yyyy-MM-dd' $script:RemoveValue String),
-        (New-Entry User 'Control Panel\International' 'sShortTime' 'HH:mm' $script:RemoveValue String),
-        (New-Entry User 'Control Panel\International' 'sTimeFormat' 'HH:mm:ss' $script:RemoveValue String),
-        (New-Entry User 'Control Panel\International' 'sDate' '-' $script:RemoveValue String),
-        (New-Entry User 'Control Panel\International' 'iDate' '2' $script:RemoveValue String),
-        (New-Entry User 'Control Panel\International' 'iTime' '1' $script:RemoveValue String),
-        (New-Entry User 'Control Panel\International' 'iTLZero' '1' $script:RemoveValue String)
-    )))
+    [void]$settings.Add((New-Setting 'timezone-utc' 'Region & language' 'Time zone' 'The clock this computer runs on. UTC is preferred, because a timeline read in UTC needs no conversion.' 'UTC' $null 'TimeZone' @() $false $false -StateChoices (Get-TimeZoneChoices)))
+    [void]$settings.Add((New-Setting 'region-australia' 'Region & language' 'Region and formats' 'The country and number, currency, and date formats Windows uses for this account. Australia is preferred.' 'Australia (en-AU)' $null 'Region' @() $false $false -StateChoices (@((Get-RegionChoiceTable).Keys))))
+    [void]$settings.Add((New-Setting 'language-au' 'Region & language' 'Display language' 'The language of the Windows interface, keyboard, and spelling, and the system locale. British English is preferred. Some choices, such as Australian English, are supplied through another language pack, because Windows ships no separate interface for them.' 'British English (en-GB)' $null 'Language' @() $false $true -StateChoices (@((Get-LanguageChoiceTable).Keys))))
+    # Every date and time choice sets the same seven values, so each entry
+    # carries one value per choice instead of a single preferred value.
+    $dateTimeFormats = Get-DateTimeFormatChoices
+    $dateTimeEntries = @(foreach ($valueName in @('sShortDate','sShortTime','sTimeFormat','sDate','iDate','iTime','iTLZero')) {
+        $states = @{}
+        foreach ($label in @($dateTimeFormats.Keys)) { $states[$label] = [string]$dateTimeFormats[$label][$valueName] }
+        New-Entry User 'Control Panel\International' $valueName $states[@($dateTimeFormats.Keys)[0]] $script:RemoveValue String -States $states
+    })
+    [void]$settings.Add((New-Setting 'iso-time' 'Region & language' 'Date and time format' 'How this account writes dates and times. ISO-style is preferred, because yyyy-MM-dd sorts correctly and is never read the wrong way round.' 'ISO-style / 24-hour (yyyy-MM-dd HH:mm)' $null 'Registry' $dateTimeEntries -StateChoices (@($dateTimeFormats.Keys))))
 
     [void]$settings.Add((New-Setting 'taskbar-search' 'Taskbar' 'Search box' 'Hide or show the taskbar Search box.' 'Hidden' 'Shown' 'Registry' @(
         (New-Entry User 'Software\Microsoft\Windows\CurrentVersion\Search' 'SearchboxTaskbarMode' 0 2)
@@ -1912,7 +2031,7 @@ function Test-EntryValue($Entry, $Expected) {
 
 function Set-EntryValue($Entry, $DesiredState, $Setting) {
     if ($Entry.Scope -in @('Machine','ElevatedUser') -and -not (Test-IsAdministrator)) { throw 'This registry setting requires elevation.' }
-    $wanted = if ($DesiredState -eq $Setting.PreferredState) { $Entry.Preferred } else { $Entry.Alternate }
+    $wanted = Get-EntryWantedValue $Entry $DesiredState $Setting
     $path = Get-EntryPath $Entry
     if ($wanted -eq $script:RemoveValue) {
         $current = Get-EntryValue $Entry
@@ -2129,11 +2248,11 @@ function Unpin-CopilotFromTaskbar {
 }
 
 function Get-RegistrySettingState($Setting) {
-    $preferred = @($Setting.Entries | Where-Object { -not (Test-EntryValue $_ $_.Preferred) }).Count -eq 0
-    if ($preferred) { return New-StateResult 'Preferred' $Setting.PreferredState }
-    if ($Setting.CanChoose) {
-        $alternate = @($Setting.Entries | Where-Object { -not (Test-EntryValue $_ $_.Alternate) }).Count -eq 0
-        if ($alternate) { return New-StateResult 'Alternate' $Setting.AlternateState }
+    # Each offered choice is tried in turn, so a card with a list of choices
+    # reports the one that is actually in place rather than only a pair.
+    foreach ($state in @($Setting.StateOptions)) {
+        $mismatched = @($Setting.Entries | Where-Object { -not (Test-EntryValue $_ (Get-EntryWantedValue $_ $state $Setting)) }).Count
+        if ($mismatched -eq 0) { return New-StateResultForSetting $Setting $state }
     }
     if ($Setting.Id -eq 'iso-time') {
         $shortDate = (Get-EntryValue ($Setting.Entries | Where-Object Name -eq 'sShortDate')).Value
@@ -2147,18 +2266,29 @@ function Get-IsoTimeSetting {
     return $script:Settings | Where-Object Id -eq 'iso-time' | Select-Object -First 1
 }
 
-function Test-IsoTimeFormat {
+function Get-ConfiguredDateTimeFormatState {
+    # The date/time choice that is in place right now, or an empty string when
+    # the formats are something Dingo does not offer.
     $setting = Get-IsoTimeSetting
-    return $setting -and (@($setting.Entries | Where-Object { -not (Test-EntryValue $_ $_.Preferred) }).Count -eq 0)
+    if (-not $setting) { return '' }
+    foreach ($state in @($setting.StateOptions)) {
+        if (@($setting.Entries | Where-Object { -not (Test-EntryValue $_ (Get-EntryWantedValue $_ $state $setting)) }).Count -eq 0) { return [string]$state }
+    }
+    return ''
 }
 
-function Register-InternationalSettingsFinalizer {
+function Register-InternationalSettingsFinalizer([string]$FormatState = '') {
+    $setting = Get-IsoTimeSetting
+    # The finalizer runs in a new process after sign-in, so the chosen format is
+    # carried on its command line rather than assumed to be the preferred one.
+    $state = if ($FormatState) { $FormatState } elseif ($setting) { [string]$setting.PreferredState } else { '' }
+    if ($setting -and $state -notin @($setting.StateOptions)) { throw "'$state' is not a date and time format Dingo offers." }
     $runOncePath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
     if (-not (Test-Path -LiteralPath $runOncePath)) { New-Item -Path $runOncePath -Force | Out-Null }
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -FinalizeInternationalSettings -WorkerLogPath "{1}"' -f $PSCommandPath,$script:LogFile
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -FinalizeInternationalSettings -FinalizeFormatState "{1}" -WorkerLogPath "{2}"' -f $PSCommandPath,$state,$script:LogFile
     $command = '"{0}" {1}' -f (Join-Path $PSHOME 'powershell.exe'),$arguments
     New-ItemProperty -LiteralPath $runOncePath -Name 'DingoFinalizeInternationalSettings' -Value $command -PropertyType String -Force | Out-Null
-    Write-Log 'INFO' 'Registered a one-time sign-in finalizer so Windows language initialization cannot replace the ISO date/time formats.'
+    Write-Log 'INFO' "Registered a one-time sign-in finalizer so Windows language initialization cannot replace the '$state' date and time formats."
 }
 
 function Send-InternationalSettingChange {
@@ -2178,9 +2308,42 @@ namespace Dingo {
     [void][Dingo.NativeMethods]::SendMessageTimeout([IntPtr]0xffff,0x001A,[IntPtr]::Zero,'intl',2,5000,[ref]$result)
 }
 
+function Expand-InstalledLanguageResult($Result) {
+    # Get-InstalledLanguage hands back one list object rather than one object
+    # per language, and the pipeline does not unroll it. Flatten it here, or a
+    # later property read silently answers for every language at once.
+    # foreach walks the list directly: @() around a generic list throws
+    # 'Argument types do not match' on Windows PowerShell 5.1.
+    $entries = New-Object System.Collections.ArrayList
+    if ($null -eq $Result) { return $entries.ToArray() }
+    foreach ($item in $Result) {
+        if ($null -eq $item) { continue }
+        if ($item -isnot [string] -and $item -is [System.Collections.IEnumerable]) {
+            foreach ($inner in $item) { if ($null -ne $inner) { [void]$entries.Add($inner) } }
+        } else {
+            [void]$entries.Add($item)
+        }
+    }
+    return $entries.ToArray()
+}
+
+function Get-DisplayLanguagePackSource([string]$Language) {
+    # Asked for a variant it does not localise, Windows answers with the parent
+    # language that actually carries the resources: a request for en-NZ comes
+    # back with en-GB beside it. So the answer is the language id that owns a
+    # real pack, not the one that was asked for. An entry with no id, no pack,
+    # or a pack of 'None' is no answer, and an empty string means not installed.
+    $entries = @(Expand-InstalledLanguageResult (Get-InstalledLanguage -Language $Language -ErrorAction Stop))
+    foreach ($entry in $entries) {
+        $id = [string](Get-JsonField $entry 'LanguageId' '')
+        $packs = [string](Get-JsonField $entry 'LanguagePacks' '')
+        if ($id -and $packs -and $packs -ne 'None') { return $id }
+    }
+    return ''
+}
+
 function Test-DisplayLanguagePackInstalled([string]$Language) {
-    $installed = @(Get-InstalledLanguage -Language $Language -ErrorAction Stop)
-    return [bool]($installed | Where-Object { $_.LanguagePacks -and [string]$_.LanguagePacks -ne 'None' })
+    return [bool](Get-DisplayLanguagePackSource $Language)
 }
 
 function Install-DisplayLanguagePack([string]$Language, [int]$TimeoutSeconds = 900) {
@@ -2213,6 +2376,59 @@ function Install-DisplayLanguagePack([string]$Language, [int]$TimeoutSeconds = 9
     }
 }
 
+function Get-AvailableDisplayLanguagePacks {
+    # Windows names every display pack Language.UI.Client~~~<tag>~<version>.
+    # Reading the list needs elevation, so a read that fails returns nothing
+    # and the caller falls back to simply trying each pack in turn.
+    try {
+        return @(Get-WindowsCapability -Online -Name 'Language.UI.Client*' -ErrorAction Stop |
+            ForEach-Object { [regex]::Match([string]$_.Name,'^Language\.UI\.Client~~~([^~]+)~').Groups[1].Value } |
+            Where-Object { $_ } | Select-Object -Unique)
+    } catch {
+        Write-Log 'WARN' "Could not list the Windows display-language packs, so each candidate pack is tried in turn: $($_.Exception.Message)"
+        return @()
+    }
+}
+
+function Install-RequiredDisplayLanguagePack([string[]]$Candidates) {
+    # Returns the language whose display pack ends up carrying the interface. A
+    # choice may name more than one candidate, because Windows localises some
+    # English variants only through a parent pack. Nothing already present is
+    # downloaded again.
+    if (-not @($Candidates).Count) { throw 'No display-language pack was named for this choice.' }
+    foreach ($candidate in $Candidates) {
+        $source = Get-DisplayLanguagePackSource $candidate
+        if ($source) {
+            $how = if ($source -eq $candidate) { "The $candidate Windows display pack is already installed" } else { "Windows already serves $candidate from the installed $source display pack" }
+            Write-Log 'INFO' "$how; nothing to download."
+            return $source
+        }
+    }
+    $available = @(Get-AvailableDisplayLanguagePacks)
+    # The array subexpression wraps the whole choice: an empty result inside an
+    # if branch is an empty pipeline, and the if would otherwise yield $null.
+    $tryList = @(if ($available.Count) { $Candidates | Where-Object { $available -contains $_ } } else { $Candidates })
+    if (-not $tryList.Count) {
+        throw "Windows offers no display pack for $($Candidates -join ' or '). Check Windows Update connectivity, or choose another display language."
+    }
+    $failures = New-Object System.Collections.ArrayList
+    foreach ($candidate in $tryList) {
+        try {
+            Install-DisplayLanguagePack $candidate
+            $source = Get-DisplayLanguagePackSource $candidate
+            if ($source) {
+                Write-Log 'INFO' "Installed the $candidate Windows display pack and verified that $source now carries it."
+                return $source
+            }
+            [void]$failures.Add("$candidate reported success but Windows does not list its pack")
+        } catch {
+            [void]$failures.Add("$candidate : $($_.Exception.Message)")
+        }
+        Write-Log 'WARN' "The $candidate Windows display pack did not install; trying the next pack for this language."
+    }
+    throw "No Windows display pack could be installed for this language: $($failures -join '; ')."
+}
+
 function Get-RegistryKindState($Setting) {
     $state = Get-RegistrySettingState $Setting
     if ($Setting.Id -eq 'windows-copilot' -and $state.Status -eq 'Preferred' -and (Test-CopilotTaskbarPinned)) {
@@ -2229,8 +2445,34 @@ function Get-TimeZoneKindState($Setting) { New-StateResultForSetting $Setting (G
 function Get-RegionKindState($Setting) {
     $locale = try { (Get-ItemProperty -LiteralPath 'HKCU:\Control Panel\International' -Name LocaleName).LocaleName } catch { (Get-Culture).Name }
     $geo = try { [int](Get-WinHomeLocation).GeoId } catch { -1 }
-    $display = if ($locale -eq 'en-AU' -and $geo -eq 12) { 'Australia (en-AU)' } else { "$locale (GeoId $geo)" }
+    $display = "$locale (GeoId $geo)"
+    $table = Get-RegionChoiceTable
+    foreach ($label in @($table.Keys)) {
+        $choice = $table[$label]
+        if ($locale -eq $choice.Culture -and $geo -eq [int]$choice.GeoId) { $display = $label; break }
+    }
     New-StateResultForSetting $Setting $display
+}
+
+function Test-LanguageChoiceInPlace($Choice, $Tags, [string]$SystemPreferred, [string]$SystemLocale, [string]$Override, [string]$UiLanguage) {
+    # A choice is in place only when the pack is present, the user list leads
+    # with it, the system locale matches, and the interface already shows it or
+    # is committed to show it after the next sign-in.
+    $accepted = @(@(@($Choice.Tag) + @($Choice.Packs)) | Select-Object -Unique)
+    $displayPack = $UiLanguage -in $accepted
+    if (-not $displayPack) {
+        foreach ($pack in @($Choice.Packs)) {
+            try { if (Test-DisplayLanguagePackInstalled $pack) { $displayPack = $true; break } }
+            catch { Write-Log 'WARN' "Could not query the $pack display pack while reading language state: $($_.Exception.Message)" }
+        }
+    }
+    $userReady = @($Tags).Count -gt 0 -and @($Tags)[0] -eq $Choice.Tag
+    $committedUi = -not $Override -and $SystemPreferred -in $accepted -and $UiLanguage -in $accepted
+    $displayReady = $displayPack -and (($Override -eq $Choice.Tag) -or ($UiLanguage -eq $Choice.Tag) -or $committedUi)
+    [PSCustomObject]@{
+        DisplayPack=$displayPack; UserReady=$userReady; DisplayReady=$displayReady
+        InPlace=($SystemLocale -eq $Choice.Tag -and $userReady -and $displayReady)
+    }
 }
 
 function Get-LanguageKindState($Setting) {
@@ -2239,21 +2481,23 @@ function Get-LanguageKindState($Setting) {
     $systemLocale = try { (Get-WinSystemLocale).Name } catch { '' }
     $override = try { (Get-WinUILanguageOverride).Name } catch { '' }
     $uiLanguage = try { (Get-UICulture).Name } catch { '' }
-    $displayPack = $uiLanguage -in @('en-AU','en-GB')
-    if (-not $displayPack) {
-        try { $displayPack = Test-DisplayLanguagePackInstalled 'en-GB' }
-        catch { Write-Log 'WARN' "Could not query the en-GB display pack while reading language state: $($_.Exception.Message)"; $displayPack = $false }
+    $table = Get-LanguageChoiceTable
+    foreach ($label in @($table.Keys)) {
+        $check = Test-LanguageChoiceInPlace $table[$label] $tags $systemPreferred $systemLocale $override $uiLanguage
+        if ($check.InPlace) { return New-StateResultForSetting $Setting $label }
     }
-    $userReady = $tags.Count -gt 0 -and $tags[0] -eq 'en-AU'
-    $committedAustralianUi = -not $override -and $systemPreferred -in @('en-AU','en-GB') -and $uiLanguage -in @('en-AU','en-GB')
-    $displayReady = $displayPack -and (($override -eq 'en-AU') -or ($uiLanguage -eq 'en-AU') -or $committedAustralianUi)
-    if ($systemLocale -eq 'en-AU' -and $userReady -and $displayReady) { return New-StateResult 'Preferred' 'Australian UI + locale (en-AU)' }
+    # Nothing on offer is fully in place, so say what is missing against the
+    # choice that is selected on the card.
+    $wantedLabel = if ($table.Contains($Setting.DesiredState)) { $Setting.DesiredState } else { $Setting.PreferredState }
+    $wanted = $table[$wantedLabel]
+    $accepted = @(@(@($wanted.Tag) + @($wanted.Packs)) | Select-Object -Unique)
+    $check = Test-LanguageChoiceInPlace $wanted $tags $systemPreferred $systemLocale $override $uiLanguage
     $parts = New-Object System.Collections.ArrayList
-    if (-not $displayPack) { [void]$parts.Add('en-GB display pack not installed') }
-    if ($systemPreferred -notin @('en-AU','en-GB') -and $override -ne 'en-AU') { [void]$parts.Add("system UI is $systemPreferred") }
-    if ($systemLocale -ne 'en-AU') { [void]$parts.Add("system locale is $systemLocale") }
-    if (-not $userReady) { [void]$parts.Add("user languages: $(if ($tags) { $tags -join ', ' } else { 'none' })") }
-    if ($displayPack -and $override -ne 'en-AU' -and $uiLanguage -ne 'en-AU') { [void]$parts.Add("user UI is $uiLanguage") }
+    if (-not $check.DisplayPack) { [void]$parts.Add("no display pack installed for $(@($wanted.Packs) -join ' or ')") }
+    if ($systemPreferred -notin $accepted -and $override -ne $wanted.Tag) { [void]$parts.Add("system UI is $systemPreferred") }
+    if ($systemLocale -ne $wanted.Tag) { [void]$parts.Add("system locale is $systemLocale") }
+    if (-not $check.UserReady) { [void]$parts.Add("user languages: $(if ($tags) { $tags -join ', ' } else { 'none' })") }
+    if ($check.DisplayPack -and $override -ne $wanted.Tag -and $uiLanguage -ne $wanted.Tag) { [void]$parts.Add("user UI is $uiLanguage") }
     New-StateResult 'Partial' ('Partly configured: ' + ($parts -join '; '))
 }
 
@@ -2269,7 +2513,7 @@ function Set-RegistryKindPart($Setting, [string]$DesiredState, [string]$Scope, $
     $failure = ''
     foreach ($entry in @($Setting.Entries | Where-Object Scope -eq $Scope)) {
         $target = "$(Get-EntryPath $entry)\$($entry.Name)"
-        $wanted = if ($DesiredState -eq $Setting.PreferredState) { $entry.Preferred } else { $entry.Alternate }
+        $wanted = Get-EntryWantedValue $entry $DesiredState $Setting
         $before = Get-EntryValue $entry
         $outcome = 'Skipped'; $message = 'Not attempted after an earlier entry failed.'
         if (-not $failure) {
@@ -2293,40 +2537,54 @@ function Set-RegistryKindPart($Setting, [string]$DesiredState, [string]$Scope, $
         Send-InternationalSettingChange
         $override = try { (Get-WinUILanguageOverride).Name } catch { '' }
         $uiLanguage = try { (Get-UICulture).Name } catch { '' }
-        if ($script:LanguageChangePending -or ($override -and $override -ne $uiLanguage)) { Register-InternationalSettingsFinalizer }
+        if ($script:LanguageChangePending -or ($override -and $override -ne $uiLanguage)) { Register-InternationalSettingsFinalizer $DesiredState }
     }
     if ($Scope -eq 'User' -and $Setting.Id -eq 'windows-copilot' -and $DesiredState -eq $Setting.PreferredState) { Unpin-CopilotFromTaskbar }
 }
 
 function Set-TimeZoneKindPart($Setting, [string]$DesiredState, [string]$Scope) {
-    Set-TimeZone -Id 'UTC'
-    if ((Get-TimeZone).Id -ne 'UTC') { throw 'Time-zone verification failed.' }
+    Set-TimeZone -Id $DesiredState
+    if ((Get-TimeZone).Id -ne $DesiredState) { throw 'Time-zone verification failed.' }
 }
 
 function Set-RegionKindPart($Setting, [string]$DesiredState, [string]$Scope) {
-    Set-Culture -CultureInfo 'en-AU'
-    Set-WinHomeLocation -GeoId 12
+    $choice = Get-LocaleChoice (Get-RegionChoiceTable) $DesiredState
+    Set-Culture -CultureInfo $choice.Culture
+    Set-WinHomeLocation -GeoId ([int]$choice.GeoId)
     $locale = (Get-ItemProperty -LiteralPath 'HKCU:\Control Panel\International' -Name LocaleName).LocaleName
-    if ($locale -ne 'en-AU' -or [int](Get-WinHomeLocation).GeoId -ne 12) { throw 'Region verification failed.' }
+    if ($locale -ne $choice.Culture -or [int](Get-WinHomeLocation).GeoId -ne [int]$choice.GeoId) { throw 'Region verification failed.' }
 }
 
 function Set-LanguageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
+    $choice = Get-LocaleChoice (Get-LanguageChoiceTable) $DesiredState
     if ($Scope -eq 'User') {
-        $list = New-WinUserLanguageList -Language 'en-AU'
+        # The computer-wide part runs first and installs the pack. Check it here
+        # too, so this part can never point the account at a language Windows
+        # has no interface for.
+        $installed = @(@($choice.Packs) | Where-Object { Test-DisplayLanguagePackInstalled $_ })
+        if (-not $installed.Count) {
+            throw "No Windows display pack for $DesiredState is installed, so this account cannot be switched to it yet."
+        }
+        $list = New-WinUserLanguageList -Language $choice.Tag
         Set-WinUserLanguageList -LanguageList $list -Force
-        Set-WinUILanguageOverride -Language 'en-AU'
+        Set-WinUILanguageOverride -Language $choice.Tag
         $tags = @((Get-WinUserLanguageList).LanguageTag)
         $override = (Get-WinUILanguageOverride).Name
-        if ($tags.Count -eq 0 -or $tags[0] -ne 'en-AU' -or $override -ne 'en-AU') { throw 'Australian display-language verification failed.' }
+        if ($tags.Count -eq 0 -or $tags[0] -ne $choice.Tag -or $override -ne $choice.Tag) { throw "$DesiredState display-language verification failed." }
         $script:LanguageChangePending = $true
-        if (Test-IsoTimeFormat) { Register-InternationalSettingsFinalizer }
+        $formatState = Get-ConfiguredDateTimeFormatState
+        if ($formatState) { Register-InternationalSettingsFinalizer $formatState }
     } else {
-        if (-not (Test-DisplayLanguagePackInstalled 'en-GB')) { Install-DisplayLanguagePack 'en-GB' }
-        if (-not (Test-DisplayLanguagePackInstalled 'en-GB')) { throw 'The en-GB Windows display pack was not installed.' }
-        Set-SystemPreferredUILanguage -Language 'en-AU' -PassThru | Out-Null
-        Set-WinSystemLocale -SystemLocale 'en-AU'
-        if ((Get-WinSystemLocale).Name -ne 'en-AU') { throw 'Computer-wide Australian locale verification failed.' }
-        Write-Log 'INFO' 'The en-AU system UI request was accepted using the installed en-GB base resources; Windows applies and reports it after sign-out or restart.'
+        # The display pack is settled before anything asks Windows to use the
+        # language, so a missing pack fails here rather than half-way through.
+        $pack = Install-RequiredDisplayLanguagePack @($choice.Packs)
+        if (-not $pack -or -not (Test-DisplayLanguagePackInstalled $pack)) { throw "No Windows display pack for $DesiredState was installed." }
+        Set-SystemPreferredUILanguage -Language $choice.Tag -PassThru | Out-Null
+        Set-WinSystemLocale -SystemLocale $choice.Tag
+        if ((Get-WinSystemLocale).Name -ne $choice.Tag) { throw "Computer-wide $DesiredState locale verification failed." }
+        if ($choice.Tag -ne $pack) {
+            Write-Log 'INFO' "The $($choice.Tag) system UI request was accepted using the installed $pack base resources; Windows applies and reports it after sign-out or restart."
+        }
     }
 }
 
@@ -2851,9 +3109,11 @@ if ($FinalizeInternationalSettings) {
         # initialising. Apply custom formats afterwards so that commit cannot reset them.
         Start-Sleep -Seconds 3
         $isoSetting = Get-IsoTimeSetting
-        foreach ($entry in $isoSetting.Entries) { Set-EntryValue $entry $isoSetting.PreferredState $isoSetting }
+        $formatState = if ($FinalizeFormatState) { $FinalizeFormatState } else { [string]$isoSetting.PreferredState }
+        if ($formatState -notin @($isoSetting.StateOptions)) { throw "'$formatState' is not a date and time format Dingo offers." }
+        foreach ($entry in $isoSetting.Entries) { Set-EntryValue $entry $formatState $isoSetting }
         Send-InternationalSettingChange
-        Write-Log 'INFO' 'One-time sign-in finalizer reapplied and verified the ISO date/time formats.'
+        Write-Log 'INFO' "One-time sign-in finalizer reapplied and verified the '$formatState' date and time formats."
         exit 0
     } catch {
         Write-Log 'ERROR' "One-time sign-in finalizer failed: $($_.Exception.ToString())"
@@ -3671,7 +3931,8 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
           <Border Background="#EEF1F4" Padding="12" Margin="8">
             <TextBlock Text="How Dingo behaves when it runs. These are not Windows settings, and nothing here is changed on your computer." TextWrapping="Wrap"/>
           </Border>
-          <StackPanel Grid.Row="1" Margin="20,8,20,8">
+          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+          <StackPanel Margin="20,8,20,8">
             <TextBlock Text="When applying changes" FontWeight="SemiBold" Foreground="#17212B" Margin="0,8,0,6"/>
             <CheckBox Name="RestartExplorerCheckBox" Content="Restart File Explorer when finished" IsChecked="True"/>
             <TextBlock Text="Some File Explorer and taskbar changes only appear after Explorer restarts. Dingo restarts it only when a change it applied needs it." TextWrapping="Wrap" Foreground="#52606D" Margin="24,4,0,0"/>
@@ -3680,6 +3941,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
             <TextBlock Name="LogPathText" Text="" TextWrapping="Wrap" Foreground="#52606D" FontFamily="Consolas" Margin="0,0,0,8"/>
             <Button Name="OpenLogButton" Content="Open log folder" HorizontalAlignment="Left" Margin="0"/>
           </StackPanel>
+          </ScrollViewer>
         </Grid>
       </TabItem>
     </TabControl>
@@ -3844,20 +4106,45 @@ function New-SettingCard($Item) {
     $choices = New-Object Windows.Controls.StackPanel
     [void]$choices.Children.Add((New-CardText 'CHOOSE WHAT YOU WANT' 10 'Bold' '#829AB1'))
     $choiceControls = New-Object System.Collections.ArrayList
-    foreach ($option in $Item.StateOptions) {
-        $radio = New-Object Windows.Controls.RadioButton
-        $radio.Content = if ($option -eq $Item.PreferredState) { "$option  (my preference)" } else { [string]$option }
-        $radio.GroupName = "choice-$($Item.Id)"
-        $radio.IsChecked = ($Item.DesiredState -eq $option)
-        $radio.Tag = [PSCustomObject]@{ Setting=$Item; Value=[string]$option; ApplyCheck=$applyCheck }
-        $radio.Add_Checked({
+    if ($Item.StateOptions.Count -gt (Get-MaxRadioChoices)) {
+        # A long list of radio buttons would not fit the card, so offer a
+        # drop-down list instead. The preferred choice still leads the list.
+        $combo = New-Object Windows.Controls.ComboBox
+        $combo.Margin = '0,2,8,0'
+        $combo.MaxWidth = 260
+        $combo.HorizontalAlignment = 'Left'
+        [Windows.Automation.AutomationProperties]::SetName($combo, "Choose what you want for $($Item.Name)")
+        foreach ($option in $Item.StateOptions) {
+            [void]$combo.Items.Add([string]$option)
+        }
+        $combo.SelectedItem = [string]$Item.DesiredState
+        $combo.Tag = [PSCustomObject]@{ Setting=$Item; Value=$null; ApplyCheck=$applyCheck }
+        $combo.Add_SelectionChanged({
             param($sender,$eventArgs)
-            $sender.Tag.Setting.DesiredState = $sender.Tag.Value
+            if ($null -eq $sender.SelectedItem) { return }
+            $sender.Tag.Setting.DesiredState = [string]$sender.SelectedItem
             $sender.Tag.Setting.Selected = $true
             $sender.Tag.ApplyCheck.IsChecked = $true
         })
-        [void]$choices.Children.Add($radio)
-        [void]$choiceControls.Add($radio)
+        [void]$choices.Children.Add($combo)
+        [void]$choices.Children.Add((New-CardText "Dingo prefers $($Item.PreferredState)." 11 'Normal' '#627D98'))
+        [void]$choiceControls.Add($combo)
+    } else {
+        foreach ($option in $Item.StateOptions) {
+            $radio = New-Object Windows.Controls.RadioButton
+            $radio.Content = if ($option -eq $Item.PreferredState) { "$option  (my preference)" } else { [string]$option }
+            $radio.GroupName = "choice-$($Item.Id)"
+            $radio.IsChecked = ($Item.DesiredState -eq $option)
+            $radio.Tag = [PSCustomObject]@{ Setting=$Item; Value=[string]$option; ApplyCheck=$applyCheck }
+            $radio.Add_Checked({
+                param($sender,$eventArgs)
+                $sender.Tag.Setting.DesiredState = $sender.Tag.Value
+                $sender.Tag.Setting.Selected = $true
+                $sender.Tag.ApplyCheck.IsChecked = $true
+            })
+            [void]$choices.Children.Add($radio)
+            [void]$choiceControls.Add($radio)
+        }
     }
     if (-not $Item.CanChoose) {
         [void]$choices.Children.Add((New-CardText 'This item has one recommended target. Turn off its selection switch if you want to leave it alone.' 11 'Normal' '#627D98'))
@@ -3919,6 +4206,13 @@ if ($UiSelfTest) {
     if ($innerTabCount -ne @($script:Settings | Group-Object Tab).Count) {
         throw "Every tab must hold cards: $innerTabCount tabs for $(@($script:Settings | Group-Object Tab).Count) groups of cards."
     }
+    # A card that offers a list must still lead with the choice Dingo prefers.
+    foreach ($listCard in @($script:Settings | Where-Object { $_.StateOptions.Count -gt (Get-MaxRadioChoices) })) {
+        if ($listCard.StateOptions[0] -ne $listCard.PreferredState) { throw "Setting '$($listCard.Id)' does not lead its list with its preferred choice." }
+        if ($listCard.ChoiceControls.Count -ne 1 -or $listCard.ChoiceControls[0] -isnot [Windows.Controls.ComboBox]) {
+            throw "Setting '$($listCard.Id)' offers a long list but does not use a drop-down list."
+        }
+    }
     # A card must never land in the wrong half of the window.
     if ($TweakTabs.Items.Count -ne @($script:Settings | Where-Object { $_.Section -eq 'Tweaks' } | Group-Object Tab).Count) {
         throw 'The Tweaks section does not hold exactly the tweak tabs.'
@@ -3962,8 +4256,12 @@ function Refresh-UI {
             default { '#334E68' }
         }
         $item.DetailsControl.Text = $item.Details
-        foreach ($radio in $item.ChoiceControls) {
-            $radio.IsChecked = ($radio.Tag.Value -eq $item.DesiredState)
+        foreach ($choice in $item.ChoiceControls) {
+            if ($choice -is [Windows.Controls.ComboBox]) {
+                if ([string]$choice.SelectedItem -ne $item.DesiredState) { $choice.SelectedItem = [string]$item.DesiredState }
+            } else {
+                $choice.IsChecked = ($choice.Tag.Value -eq $item.DesiredState)
+            }
         }
     }
     Update-SelectionSummary

@@ -295,7 +295,7 @@ try {
         [void](Complete-ApplyChanges $plan @{})
         Assert ($SummaryText.Text -match '1 partially applied; 0 failed') 'GUI summary lost the partial-result counts.'
         Assert ($SummaryText.Text -match 'Sign out and back in, or restart Windows') 'GUI summary lacks an explicit completion action.'
-        Assert ($SummaryText.Text -match 'Australian English') 'GUI summary does not name the pending setting.'
+        Assert ($SummaryText.Text -match 'Display language') 'GUI summary does not name the pending setting.'
         Assert ($SummaryText.Text -match 'Read settings again') 'GUI summary does not explain how to verify after sign-in.'
     }
     Test-Case 'Unexpected completion failure releases the busy lock' {
@@ -387,6 +387,108 @@ try {
         Assert (@($lessOne | Where-Object Id -eq 'tool-7zip').Count -eq 0) 'An excluded ID survived its section.'
         # Plain IDs behave exactly as they did before section words existed.
         Assert (@(Resolve-QuickApplySettings $script:Settings @('iso-time','hidden-files') @()).Count -eq 2) 'Named IDs no longer select just themselves.'
+    }
+    Test-Case 'A card that offers a list leads with the preferred choice and keeps them distinct' {
+        $listCards = @($script:Settings | Where-Object { $_.StateOptions.Count -gt (Get-MaxRadioChoices) })
+        Assert ($listCards.Count -ge 4) "Expected the language, region, time-zone, and date cards to offer lists; found $($listCards.Count)."
+        foreach ($card in $listCards) {
+            Assert ($card.StateOptions[0] -eq $card.PreferredState) "'$($card.Id)' does not lead its list with its preferred choice."
+            Assert ($card.CanChoose) "'$($card.Id)' offers a list but reports no choice."
+            $unique = @($card.StateOptions | Select-Object -Unique)
+            Assert ($unique.Count -eq $card.StateOptions.Count) "'$($card.Id)' repeats a choice in its list."
+            Assert ($card.DesiredState -eq $card.PreferredState) "'$($card.Id)' does not start on its preferred choice."
+        }
+        foreach ($id in @('timezone-utc','region-australia','language-au','iso-time')) {
+            $card = $script:Settings | Where-Object Id -eq $id
+            Assert ($card.Section -eq 'Tweaks') "'$id' left the Tweaks section."
+            Assert ($card.StateOptions.Count -gt (Get-MaxRadioChoices)) "'$id' no longer offers a list of choices."
+        }
+        Assert (($script:Settings | Where-Object Id -eq 'language-au').PreferredState -eq 'British English (en-GB)') 'The preferred display language is not British English.'
+        Assert (($script:Settings | Where-Object Id -eq 'region-australia').PreferredState -eq 'Australia (en-AU)') 'The preferred region is not Australia.'
+        Assert (($script:Settings | Where-Object Id -eq 'timezone-utc').PreferredState -eq 'UTC') 'The preferred time zone is not UTC.'
+    }
+    Test-Case 'Every date and time choice writes a complete distinct set of values' {
+        $card = $script:Settings | Where-Object Id -eq 'iso-time'
+        Assert ($card.PreferredState -like 'ISO-style*') 'ISO-style is no longer the preferred date and time format.'
+        # A choice that left a value out would blend into the previous choice.
+        foreach ($state in $card.StateOptions) {
+            foreach ($entry in $card.Entries) {
+                Assert ($entry.States -and $entry.States.ContainsKey($state)) "'$($entry.Name)' has no value for the '$state' format."
+                $wanted = Get-EntryWantedValue $entry $state $card
+                Assert (-not [string]::IsNullOrWhiteSpace([string]$wanted)) "'$($entry.Name)' has an empty value for the '$state' format."
+                Assert ($wanted -ne '__REMOVE_VALUE__') "'$($entry.Name)' would be removed for the '$state' format."
+            }
+        }
+        # Two choices that wrote the same values could never be told apart.
+        $fingerprints = @($card.StateOptions | ForEach-Object {
+            $state = $_
+            @($card.Entries | ForEach-Object { "$($_.Name)=$(Get-EntryWantedValue $_ $state $card)" }) -join '|'
+        })
+        Assert (@($fingerprints | Select-Object -Unique).Count -eq $fingerprints.Count) 'Two date and time choices write the same values.'
+        # A card with no per-state map must still use its preferred/alternate pair.
+        $pair = $script:Settings | Where-Object Id -eq 'hidden-files'
+        $entry = @($pair.Entries)[0]
+        Assert ((Get-EntryWantedValue $entry $pair.PreferredState $pair) -eq $entry.Preferred) 'A plain entry lost its preferred value.'
+        Assert ((Get-EntryWantedValue $entry $pair.AlternateState $pair) -eq $entry.Alternate) 'A plain entry lost its alternate value.'
+    }
+    Test-Case 'A display language names a pack chain and reads the language that really carries it' {
+        $table = Get-LanguageChoiceTable
+        foreach ($label in @($table.Keys)) {
+            $choice = $table[$label]
+            Assert ($choice.Tag -match '^[a-z]{2}-[A-Z]{2}$') "'$label' has a malformed language tag '$($choice.Tag)'."
+            Assert (@($choice.Packs).Count -ge 1) "'$label' names no display pack."
+            foreach ($pack in @($choice.Packs)) { Assert ($pack -match '^[a-z]{2}-[A-Z]{2}$') "'$label' names a malformed pack '$pack'." }
+            Assert (@($choice.Packs)[0] -eq $choice.Tag) "'$label' does not try its own pack first."
+            $unique = @(@($choice.Packs) | Select-Object -Unique)
+            Assert ($unique.Count -eq @($choice.Packs).Count) "'$label' repeats a pack in its chain."
+        }
+        # Windows returns one list object, not one object per language, and it
+        # answers a request for a variant with the parent that owns the pack.
+        $windowsStyleList = New-Object 'System.Collections.Generic.List[object]'
+        $windowsStyleList.Add([pscustomobject]@{ LanguageId='en-NZ'; LanguagePacks='None' })
+        $windowsStyleList.Add([pscustomobject]@{ LanguageId='en-GB'; LanguagePacks='LpCab, LXP' })
+        function Get-InstalledLanguage { param([string]$Language) $windowsStyleList }
+        Assert ((Expand-InstalledLanguageResult $windowsStyleList).Count -eq 2) 'The Windows language list was not flattened.'
+        Assert ((Get-DisplayLanguagePackSource 'en-NZ') -eq 'en-GB') 'A variant served by its parent did not report the parent.'
+        Assert (Test-DisplayLanguagePackInstalled 'en-NZ') 'A variant served by its parent was called uninstalled.'
+        # A language with no pack at all must read as absent, not as present.
+        $emptyList = New-Object 'System.Collections.Generic.List[object]'
+        $emptyList.Add([pscustomobject]@{ LanguageId=''; LanguagePacks='' })
+        function Get-InstalledLanguage { param([string]$Language) $emptyList }
+        Assert ((Get-DisplayLanguagePackSource 'de-DE') -eq '') 'An absent display pack was reported as installed.'
+        Assert (-not (Test-DisplayLanguagePackInstalled 'de-DE')) 'An absent display pack passed the installed check.'
+        # A row whose pack says None is not a pack either.
+        $noneList = New-Object 'System.Collections.Generic.List[object]'
+        $noneList.Add([pscustomobject]@{ LanguageId='en-AU'; LanguagePacks='None' })
+        function Get-InstalledLanguage { param([string]$Language) $noneList }
+        Assert ((Get-DisplayLanguagePackSource 'en-AU') -eq '') "A language whose pack is 'None' was reported as installed."
+    }
+    Test-Case 'Dingo installs a missing display pack, skips one it has, and refuses one Windows will not supply' {
+        $script:Installed = New-Object System.Collections.ArrayList
+        function Install-DisplayLanguagePack { param([string]$Language,[int]$TimeoutSeconds=900) [void]$script:Installed.Add($Language) }
+        function Get-AvailableDisplayLanguagePacks { @('en-GB','en-US','de-DE') }
+        # Already served: nothing is downloaded and the real source is returned.
+        function Get-DisplayLanguagePackSource { param([string]$Language) if ($Language -in @('en-NZ','en-GB')) { 'en-GB' } else { '' } }
+        Assert ((Install-RequiredDisplayLanguagePack @('en-NZ','en-GB')) -eq 'en-GB') 'An already-served language did not report its source.'
+        Assert ($script:Installed.Count -eq 0) 'Dingo downloaded a display pack it already had.'
+        # Missing but offered: it is installed, then verified.
+        $script:Installed.Clear()
+        function Get-DisplayLanguagePackSource { param([string]$Language) if ($script:Installed -contains $Language) { $Language } else { '' } }
+        Assert ((Install-RequiredDisplayLanguagePack @('de-DE')) -eq 'de-DE') 'A missing display pack was not installed.'
+        Assert ($script:Installed -contains 'de-DE') 'The missing display pack was never requested.'
+        # Variant not offered: Dingo falls through to the parent pack.
+        $script:Installed.Clear()
+        Assert ((Install-RequiredDisplayLanguagePack @('en-ZA','en-GB')) -eq 'en-GB') 'Dingo did not fall through to the parent pack.'
+        Assert (@($script:Installed) -join ',' -eq 'en-GB') "Dingo tried to install a pack Windows does not offer: $(@($script:Installed) -join ',')."
+        # Nothing offered and nothing installed: refuse with a clear reason.
+        $script:Installed.Clear()
+        Assert-Throws { Install-RequiredDisplayLanguagePack @('zz-ZZ') } 'offers no display pack'
+        Assert ($script:Installed.Count -eq 0) 'Dingo tried to install an unavailable display pack.'
+        # An install that reports success but leaves no pack must still fail.
+        function Get-DisplayLanguagePackSource { param([string]$Language) '' }
+        Assert-Throws { Install-RequiredDisplayLanguagePack @('de-DE') } 'does not list its pack'
+        # A pack named for no language at all is a programming error.
+        Assert-Throws { Install-RequiredDisplayLanguagePack @() } 'No display-language pack was named'
     }
     Test-Case 'An unknown word is refused and the sections are named' {
         Assert-Throws { Resolve-QuickApplySettings $script:Settings @('tweeks') @() } "tweeks"
