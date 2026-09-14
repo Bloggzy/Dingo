@@ -1,6 +1,6 @@
 # Phase 4 results
 
-Status: Complete. Normal-path cases P4-01 through P4-12, failure/recovery cases P4-F01 through P4-F06, the single-instance guard, and the final 0.6.8 end-to-end run have passed. The VM findings produced corrections for wildcard detection, association writes and Explorer cache cleanup, native association paths, retired Edge policies, and actionable unobscured restart guidance. Each correction passed its targeted regression and VM retest.
+Status: Complete for 0.6.8. The 0.7.x releases changed the display language, region, time zone, and date/time format into lists, changed elevation-step reporting, added a stop, and changed restart guidance, so the full matrix is due a re-run. Targeted VM checks for 0.7.1 to 0.7.4 are recorded at the foot of this file. Normal-path cases P4-01 through P4-12, failure/recovery cases P4-F01 through P4-F06, the single-instance guard, and the final 0.6.8 end-to-end run have passed. The VM findings produced corrections for wildcard detection, association writes and Explorer cache cleanup, native association paths, retired Edge policies, and actionable unobscured restart guidance. Each correction passed its targeted regression and VM retest.
 
 - Hypervisor: VMware Workstation 17.6.2 build-24409262
 - Guest: Windows 11 Pro 25H2, expected build 26200.9445
@@ -85,6 +85,24 @@ These are registry/state-reader and operator observations as specified by each c
 
 The 0.6.8 candidate passes all 56 isolated regression checks on Windows PowerShell 5.1 (23 Phase 1, 23 Phase 2, and 10 Phase 3), its embedded 39-setting self-test, its UI self-test, and a clean parser check. The UI coverage verifies the actionable wording, selection of the partial setting, text wrapping, and separate layout rows. Targeted VM runs verified the guidance layout, normalized association registration, effective JSON/TSV/DB launches, machine Edge-policy cleanup, safe refusal of a foreign launcher collision, explicit handling of a disconnected-network tool download, partial EZTools inventory detection, bounded installer/process-tree timeout handling, interruption recovery reporting without replay, and ordered partial-result reporting after a denied registry write.
 
+## Targeted VM checks during 0.7.1 to 0.7.4
+
+Operator checks on the same VM, run against each release as it was published. These are not the Phase 4 matrix; they cover only the behaviour each release changed.
+
+| Check | Version | Result | Observation |
+| --- | --- | --- | --- |
+| Display language step completes | 0.7.2 | Pass | Before 0.7.2 the step always failed. `Set-WinSystemLocale` takes effect only at the next sign-in, and Dingo failed the step for not seeing it at once. 0.7.2 reads the pending LCID at the Nls Language Default value under HKLM instead, and the step reports Partially applied with sign-out guidance. |
+| Old display language leaves the list | 0.7.2 | Pass | After switching to Australian English, American English no longer appeared above it in the account language list. |
+| Stop during an administrator step | 0.7.2 | Pass | Stop ended the run. Settings already applied stayed applied and the usual results were shown. Not re-observed on 0.7.4; the code path did not change. |
+| Card note for a language with no pack | 0.7.3 | Pass | Before 0.7.3 the note box was built only when a caveat applied at the moment the card was drawn, so picking a new language later showed nothing. The note now appears and clears as the drop-down changes. |
+| Quick settings run during a language download | 0.7.3 | Pass | The other selected settings finished while the pack was still downloading, rather than queueing behind it. |
+| Language pack download and install | 0.7.3 | Pass | A first install of a pack took several minutes through Windows Update and completed. A later run with the pack present was quick. |
+| Sections stay usable during a run | 0.7.4 | Pass | Before 0.7.4 the whole tab control was disabled, which froze scrolling and tab switching as well, so cards finishing on another section could not be seen. Tabs and scrolling now work during a run, while the action buttons, restart choice, card switches and card choices stay locked. |
+| Restart guidance is unmissable | 0.7.4 | Pass | The sign-out sentence had been small grey text at the foot of the window and was missed. A dialog headed `Sign out to finish applying` now carries the same sentence and names the setting, and the summary line turns red and bold. Screenshot confirmed. |
+| Post sign-out verification | 0.7.4 | Pass | After signing out and back in, the display language read as applied and the other settings held. |
+
+Still outstanding: the full Phase 4 matrix has not been re-run since 0.6.8. Live installer, UAC, default-app, and effective-policy cases remain unverified for 0.7.x.
+
 ## Resume point
 
-Phase 4 is complete and the 0.6.8 release decision is Pass. Preserve the final VM snapshot and evidence with the release records. Re-run this matrix when changing registry targets, elevation boundaries, installation behavior, associations, recovery handling, or restart guidance.
+Phase 4 is complete and the 0.6.8 release decision is Pass. Preserve the final VM snapshot and evidence with the release records. Re-run this matrix when changing registry targets, elevation boundaries, installation behavior, associations, recovery handling, or restart guidance. That trigger has since been met by 0.7.0 to 0.7.4, so the next Phase 4 session should start with a full re-run against the current release, using the targeted checks above as a record of what has already been seen on the VM.
