@@ -360,6 +360,79 @@ try {
             $reader.Close()
         }
     }
+    Test-Case 'Every setting belongs to exactly one of the two sections' {
+        $sections = @($script:Settings | ForEach-Object { $_.Section } | Select-Object -Unique | Sort-Object)
+        Assert (($sections -join ',') -eq 'Tools,Tweaks') "Unexpected sections: $($sections -join ',')"
+        $toolTabs = @('Install tools','Tool shortcuts','File associations')
+        foreach ($item in $script:Settings) {
+            $expected = if ($item.Tab -in $toolTabs) { 'Tools' } else { 'Tweaks' }
+            Assert ($item.Section -eq $expected) "'$($item.Id)' on tab '$($item.Tab)' is in section '$($item.Section)'."
+        }
+        Assert (@($script:Settings | Where-Object { $_.Section -eq 'Tweaks' }).Count -gt 0) 'No tweaks.'
+        Assert (@($script:Settings | Where-Object { $_.Section -eq 'Tools' }).Count -gt 0) 'No tools.'
+    }
+    Test-Case 'Section words stand for every ID in that section' {
+        foreach ($sectionName in @('Tweaks','Tools')) {
+            $expected = @($script:Settings | Where-Object { $_.Section -eq $sectionName })
+            $chosen = @(Resolve-QuickApplySettings $script:Settings @($sectionName.ToLowerInvariant()) @())
+            Assert ($chosen.Count -eq $expected.Count) "'$sectionName' chose $($chosen.Count) of $($expected.Count) cards."
+            Assert (@($chosen | Where-Object { $_.Section -ne $sectionName }).Count -eq 0) "'$sectionName' reached into the other section."
+        }
+        # Mixed spelling, spacing, and commas are all one list.
+        Assert (@(Resolve-QuickApplySettings $script:Settings @('TWEAKS, Tools') @()).Count -eq $script:Settings.Count) 'Both section words did not select everything.'
+        # A section word and a plain ID work together, in either argument.
+        $withOne = @(Resolve-QuickApplySettings $script:Settings @('tools','iso-time') @())
+        Assert (@($withOne | Where-Object Id -eq 'iso-time').Count -eq 1) 'A named tweak was lost beside a section word.'
+        $lessOne = @(Resolve-QuickApplySettings $script:Settings @('tools') @('tool-7zip'))
+        Assert (@($lessOne | Where-Object Id -eq 'tool-7zip').Count -eq 0) 'An excluded ID survived its section.'
+        # Plain IDs behave exactly as they did before section words existed.
+        Assert (@(Resolve-QuickApplySettings $script:Settings @('iso-time','hidden-files') @()).Count -eq 2) 'Named IDs no longer select just themselves.'
+    }
+    Test-Case 'An unknown word is refused and the sections are named' {
+        Assert-Throws { Resolve-QuickApplySettings $script:Settings @('tweeks') @() } "tweeks"
+        Assert-Throws { Resolve-QuickApplySettings $script:Settings @('tweeks') @() } "'tweaks' and 'tools'"
+    }
+    Test-Case 'A setting ID spelled like a section is refused rather than guessed at' {
+        $tweak = ($script:Settings | Where-Object { $_.Section -eq 'Tweaks' } | Select-Object -First 1).PSObject.Copy()
+        $tool = ($script:Settings | Where-Object { $_.Section -eq 'Tools' } | Select-Object -First 1).PSObject.Copy()
+        $tweak.Id = 'tools'
+        Assert-Throws { Resolve-QuickApplySettings @($tweak,$tool) @() @() } 'clashes'
+    }
+    Test-Case 'The Tweaks buttons never select a tool card' {
+        # Run the real click handlers, not a copy of them, against a stub window.
+        $handlerOf = {
+            param([string]$Name)
+            $calls = $ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
+                $node.Member.Value -eq 'Add_Click' -and
+                $node.Expression -is [Management.Automation.Language.VariableExpressionAst] -and
+                $node.Expression.VariablePath.UserPath -eq $Name
+            }, $true)
+            Assert ($calls.Count -eq 1) "Expected one $Name click handler, found $($calls.Count)."
+            $calls[0].Arguments[0].ScriptBlock.GetScriptBlock()
+        }
+        $SummaryText = [pscustomobject]@{Text=''}
+        function Refresh-UI {}
+        $tweakCount = @($script:Settings | Where-Object { $_.Section -eq 'Tweaks' }).Count
+        foreach ($handlerName in @('AllPreferredButton','NeededButton')) {
+            foreach ($item in $script:Settings) {
+                $item.Selected = $false
+                $item.CurrentState = New-StateResult 'Alternate' 'stub'
+            }
+            # One tool is selected by hand first: a Tweaks button must not touch it.
+            $heldTool = @($script:Settings | Where-Object { $_.Section -eq 'Tools' })[0]
+            $heldTool.Selected = $true
+            & (& $handlerOf $handlerName)
+            $chosenTools = @($script:Settings | Where-Object { $_.Section -eq 'Tools' -and $_.Selected })
+            Assert ($chosenTools.Count -eq 1 -and $chosenTools[0].Id -eq $heldTool.Id) "$handlerName changed a tool selection."
+            Assert (@($script:Settings | Where-Object { $_.Section -eq 'Tweaks' -and $_.Selected }).Count -eq $tweakCount) "$handlerName missed a tweak."
+        }
+        # Clearing is a whole-window action, so it does reach both sections.
+        foreach ($item in $script:Settings) { $item.Selected = $true }
+        & (& $handlerOf 'UncheckButton')
+        Assert (@($script:Settings | Where-Object Selected).Count -eq 0) 'Clear all selections left something selected.'
+    }
     "Passed $script:Passed phase 1 tests on PowerShell $($PSVersionTable.PSVersion)."
 } finally {
     $resolvedScratch = [IO.Path]::GetFullPath($scratch)
