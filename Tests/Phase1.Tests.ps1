@@ -102,12 +102,12 @@ try {
     }
     Test-Case 'Busy controls include cards and restart choice, and re-enable together' {
         $script:ActionButtons = @([pscustomobject]@{IsEnabled=$true})
-        $ScopeTabs = [pscustomobject]@{IsEnabled=$true}
+        $SectionTabs = [pscustomobject]@{IsEnabled=$true}
         $RestartExplorerCheckBox = [pscustomobject]@{IsEnabled=$true}
         Set-ActionButtonsEnabled $false
-        Assert (-not $ScopeTabs.IsEnabled -and -not $RestartExplorerCheckBox.IsEnabled -and -not $script:ActionButtons[0].IsEnabled) 'Some plan controls remain enabled.'
+        Assert (-not $SectionTabs.IsEnabled -and -not $RestartExplorerCheckBox.IsEnabled -and -not $script:ActionButtons[0].IsEnabled) 'Some plan controls remain enabled.'
         Set-ActionButtonsEnabled $true
-        Assert ($ScopeTabs.IsEnabled -and $RestartExplorerCheckBox.IsEnabled -and $script:ActionButtons[0].IsEnabled) 'Controls did not recover.'
+        Assert ($SectionTabs.IsEnabled -and $RestartExplorerCheckBox.IsEnabled -and $script:ActionButtons[0].IsEnabled) 'Controls did not recover.'
     }
     Test-Case 'Foreign same-name launcher survives write refusal byte-for-byte' {
         $script:ShimDirectory = $scratch
@@ -244,7 +244,7 @@ try {
         Assert ($selected.Count -eq 3) 'Selection changed.'
     }
     Test-Case 'GUI completion publishes snapshot results and uses captured restart preference' {
-        $ScopeTabs = [pscustomobject]@{IsEnabled=$false}
+        $SectionTabs = [pscustomobject]@{IsEnabled=$false}
         $RestartExplorerCheckBox = [pscustomobject]@{IsEnabled=$false;IsChecked=$false}
         $SummaryText = [pscustomobject]@{Text=''}
         $ProgressBar = [pscustomobject]@{Value=0;IsIndeterminate=$true}
@@ -265,7 +265,7 @@ try {
         [void](Complete-ApplyChanges $plan @{})
         Assert ($card.Status -eq 'Succeeded' -and $card.DesiredState -eq $card.AlternateState) 'GUI failed to publish results without changing choices.'
         Assert ($script:RestartCalls -eq 1) 'Completion reread the mutable restart checkbox.'
-        Assert (-not $script:ApplyInProgress -and $ScopeTabs.IsEnabled -and $RestartExplorerCheckBox.IsEnabled) 'GUI remained locked after completion.'
+        Assert (-not $script:ApplyInProgress -and $SectionTabs.IsEnabled -and $RestartExplorerCheckBox.IsEnabled) 'GUI remained locked after completion.'
     }
     Test-Case 'Restart guidance names the setting and tells the user how to refresh' {
         $message = Get-RestartInstruction -SettingNames @('Australian English')
@@ -274,7 +274,7 @@ try {
         Assert ($message -match 'Read settings again') 'Restart guidance does not tell the user how to refresh Dingo.'
     }
     Test-Case 'GUI completion shows actionable guidance for a partially applied restart setting' {
-        $ScopeTabs = [pscustomobject]@{IsEnabled=$false}
+        $SectionTabs = [pscustomobject]@{IsEnabled=$false}
         $RestartExplorerCheckBox = [pscustomobject]@{IsEnabled=$false;IsChecked=$false}
         $SummaryText = [pscustomobject]@{Text=''}
         $ProgressBar = [pscustomobject]@{Value=0;IsIndeterminate=$true}
@@ -299,7 +299,7 @@ try {
         Assert ($SummaryText.Text -match 'Read settings again') 'GUI summary does not explain how to verify after sign-in.'
     }
     Test-Case 'Unexpected completion failure releases the busy lock' {
-        $ScopeTabs = [pscustomobject]@{IsEnabled=$false}
+        $SectionTabs = [pscustomobject]@{IsEnabled=$false}
         $RestartExplorerCheckBox = [pscustomobject]@{IsEnabled=$false;IsChecked=$false}
         $SummaryText = [pscustomobject]@{Text=''}
         $ProgressBar = [pscustomobject]@{Value=0;IsIndeterminate=$true}
@@ -309,7 +309,7 @@ try {
         function Invoke-SettingChange { throw 'Simulated completion failure' }
         $plan = @(New-ApplyPlan @(($script:Settings | Where-Object Id -eq 'task-view')))
         Assert-Throws { Complete-ApplyChanges $plan @{} } 'Simulated completion failure'
-        Assert (-not $script:ApplyInProgress -and $ScopeTabs.IsEnabled -and $RestartExplorerCheckBox.IsEnabled) 'Failure left plan controls locked.'
+        Assert (-not $script:ApplyInProgress -and $SectionTabs.IsEnabled -and $RestartExplorerCheckBox.IsEnabled) 'Failure left plan controls locked.'
     }
     Test-Case 'Actual WPF cards use accessible selection toggles and inherit the busy lock' {
         Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
@@ -321,7 +321,7 @@ try {
         $reader = New-Object Xml.XmlNodeReader $xaml
         $window = [Windows.Markup.XamlReader]::Load($reader)
         try {
-            foreach ($name in @('ScopeTabs','RestartExplorerCheckBox','ApplyButton','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','AdminSummaryText','SummaryText')) {
+            foreach ($name in @('SectionTabs','TweakTabs','ToolTabs','RestartExplorerCheckBox','ApplyButton','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','AdminSummaryText','SummaryText')) {
                 Set-Variable -Name $name -Value $window.FindName($name)
             }
             $actionPanel = $ApplyButton.Parent
