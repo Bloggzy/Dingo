@@ -3574,10 +3574,14 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
-    <StackPanel Grid.Row="0" Margin="0,0,0,12">
-      <TextBlock Text="Dingo - Windows 11 Preferences" FontSize="25" FontWeight="SemiBold" Foreground="#17212B"/>
-      <TextBlock Name="IntroText" Text="Tweaks changes Windows settings. Tools installs analyst software and wires it up. Options is about Dingo itself. Nothing changes until you click Apply selected changes." Foreground="#52606D" FontSize="14" TextWrapping="Wrap" Margin="0,4,0,0"/>
-    </StackPanel>
+    <Grid Grid.Row="0" Margin="0,0,0,12">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+      <StackPanel Grid.Column="0">
+        <TextBlock Text="Dingo - Windows 11 Preferences" FontSize="25" FontWeight="SemiBold" Foreground="#17212B"/>
+        <TextBlock Name="IntroText" Text="Tweaks changes Windows settings. Tools installs analyst software and wires it up. Options is about Dingo itself. Nothing changes until you click Apply selected changes." Foreground="#52606D" FontSize="14" TextWrapping="Wrap" Margin="0,4,0,0"/>
+      </StackPanel>
+      <TextBlock Name="VersionText" Grid.Column="1" Text="" Foreground="#52606D" FontSize="13" VerticalAlignment="Top" HorizontalAlignment="Right" Margin="16,6,0,0"/>
+    </Grid>
     <TabControl Name="SectionTabs" Grid.Row="2" FontSize="14">
       <TabItem Header="Tweaks">
         <Grid>
@@ -3696,7 +3700,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
-foreach ($name in @('IntroText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ApplyButton')) {
+foreach ($name in @('IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
 $desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -3707,6 +3711,7 @@ if ($script:ToolCatalogWarning) {
     $ToolsScopeText.Text = "$($script:ToolCatalogWarning) The built-in tool list is being used instead."
     $ToolsScopeText.Foreground = '#8A2B21'
 }
+$VersionText.Text = "Version $($script:DingoVersion)"
 $LogPathText.Text = [string]$script:LogFile
 $script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$UncheckButton,$RefreshButton)
 
@@ -3924,6 +3929,10 @@ if ($UiSelfTest) {
     if (-not $RestartExplorerCheckBox) { throw 'The Options section does not hold the File Explorer restart choice.' }
     if (-not $OpenLogButton) { throw 'The Options section does not hold the log folder button.' }
     if (-not $LogPathText.Text) { throw 'The Options section does not name the log file.' }
+    # A window showing a stale version is worse than one showing none at all.
+    if ($VersionText.Text -notmatch [regex]::Escape($script:DingoVersion)) {
+        throw "The window shows '$($VersionText.Text)' but Dingo reports version $($script:DingoVersion)."
+    }
     foreach ($sectionName in @('Tweaks','Tools','Options')) {
         if ($IntroText.Text -notmatch $sectionName) { throw "The window's opening sentence does not mention the '$sectionName' section." }
     }
