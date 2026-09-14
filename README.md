@@ -71,7 +71,7 @@ Start-Dingo.cmd -Help
 
 `-h` and `-?` are short aliases for `-Help`.
 
-Current version: **0.7.0**. Version 0.7.0 splits the catalog into a **Tweaks** section and a **Tools** section, gives the window a third **Options** section for Dingo's own choices, and makes a bare `-ApplyPreferred` apply the Tweaks section only. That last point is a breaking change for existing command lines: use `-Include tweaks,tools` for the previous behavior. Phase 4 VM testing corrected wildcard detection in 0.6.3, association write ordering in 0.6.4, cleanup of Explorer's per-user Open With cache in 0.6.5, native Windows association command paths in 0.6.6, and actionable sign-out/restart guidance in 0.6.7-0.6.8. Version 0.6.9 replaced each card's labelled checkbox with a compact unlabelled selection switch while retaining the same batch-selection behavior. Phase 1 is **0.6.0**, Phase 2 is **0.6.1**; patch versions roll over after `.9`.
+Current version: **0.7.1**. Version 0.7.1 turns the display language, region, time zone, and date and time format into lists you choose from, shown as a drop-down on the card. The preferred choices are British English, Australia, UTC, and ISO-style dates. All four cards stay in the **Tweaks** section, and a bare `-ApplyPreferred` still applies them. Version 0.7.0 splits the catalog into a **Tweaks** section and a **Tools** section, gives the window a third **Options** section for Dingo's own choices, and makes a bare `-ApplyPreferred` apply the Tweaks section only. That last point is a breaking change for existing command lines: use `-Include tweaks,tools` for the previous behavior. Phase 4 VM testing corrected wildcard detection in 0.6.3, association write ordering in 0.6.4, cleanup of Explorer's per-user Open With cache in 0.6.5, native Windows association command paths in 0.6.6, and actionable sign-out/restart guidance in 0.6.7-0.6.8. Version 0.6.9 replaced each card's labelled checkbox with a compact unlabelled selection switch while retaining the same batch-selection behavior. Phase 1 is **0.6.0**, Phase 2 is **0.6.1**; patch versions roll over after `.9`.
 
 ## Behaviour and safety
 
@@ -136,12 +136,14 @@ Thirty-nine settings. Six install tools. Two make shortcuts, one puts the tools 
 
 ### Region and language
 
+All four cards offer a list to choose from. Dingo prefers British English, Australia, UTC, and ISO-style dates, but each card also offers the other choices. The time-zone list is the real list this copy of Windows supports.
+
 | ID | Setting | Scope | Admin | Preferred |
 | --- | --- | --- | --- | --- |
 | `timezone-utc` | Time zone | System | yes | UTC |
 | `region-australia` | Region and formats | User | no | Australia (en-AU) |
-| `language-au` | Australian English | Both | yes | en-AU interface and locale |
-| `iso-time` | Date and time format | User | no | yyyy-MM-dd, 24-hour |
+| `language-au` | Display language | Both | yes | British English (en-GB) |
+| `iso-time` | Date and time format | User | no | ISO-style, 24-hour (yyyy-MM-dd HH:mm) |
 
 ### Taskbar
 
