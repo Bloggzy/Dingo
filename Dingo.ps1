@@ -30,6 +30,8 @@ param(
     [string]$PlanPath,
     [string]$ResultPath,
     [string]$WorkerLogPath,
+    [string]$ProgressPath,
+    [string]$CancelPath,
     [string]$TargetUserSid,
     [Parameter(ValueFromRemainingArguments=$true)]
     [object[]]$UnexpectedArguments
@@ -38,6 +40,15 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $script:LogFile = $null
+# Where the elevated worker publishes what it is doing. Empty everywhere
+# else, which makes every progress call below a no-op.
+# Named apart from the -ProgressPath parameter on purpose: a script parameter
+# lives in the script scope, so reusing the name here would wipe the value the
+# elevated worker was started with.
+$script:WorkerProgressPath = ''
+# Named apart from the -CancelPath parameter for the same reason.
+$script:WorkerCancelPath = ''
+$script:WorkerStep = $null
 $script:RemoveValue = '__REMOVE_VALUE__'
 $script:LanguageChangePending = $false
 $script:InstanceMutex = $null
@@ -45,7 +56,7 @@ $script:PendingApply = $null
 $script:ApplyInProgress = $false
 $script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.7.1'
+$script:DingoVersion = '0.7.2'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -193,7 +204,40 @@ function Test-DeviceIsManaged {
     return $managed
 }
 
+function Clear-DisplayPackCache {
+    $script:DisplayPackCache = @{}
+}
+
+function Get-CachedDisplayLanguagePackSource([string]$Language) {
+    # Asking Windows costs a couple of seconds, and the card asks again every
+    # time it redraws. The answer only changes when a pack is installed, so it
+    # is cached until the next time settings are read.
+    if (-not (Get-Variable -Name DisplayPackCache -Scope Script -ErrorAction SilentlyContinue)) { Clear-DisplayPackCache }
+    if (-not $script:DisplayPackCache.ContainsKey($Language)) {
+        $script:DisplayPackCache[$Language] = try { Get-DisplayLanguagePackSource $Language } catch { '' }
+    }
+    return [string]$script:DisplayPackCache[$Language]
+}
+
+function Test-SettingNeedsLanguageDownload($Setting) {
+    # True when the chosen display language has no pack on this computer, so
+    # applying it means a Windows Update download rather than a registry write.
+    if ($Setting.Kind -ne 'Language') { return $false }
+    $choice = try { Get-LocaleChoice (Get-LanguageChoiceTable) $Setting.DesiredState } catch { $null }
+    if (-not $choice) { return $false }
+    foreach ($pack in @($choice.Packs)) {
+        if (Get-CachedDisplayLanguagePackSource $pack) { return $false }
+    }
+    return $true
+}
+
 function Get-SettingAdvisory($Setting) {
+    # A language with no display pack on this computer has to be fetched from
+    # Windows Update. That is minutes, not seconds, so say so before the person
+    # clicks Apply rather than leaving them watching a clock.
+    if (Test-SettingNeedsLanguageDownload $Setting) {
+        return "This computer has no display pack for $($Setting.DesiredState), so Windows must download one from Windows Update. That one step usually takes about ten minutes, and can hold up the whole run. Dingo waits fifteen minutes at most, stops sooner if nothing is moving, and every other selected change still runs."
+    }
     if ($Setting.Id -eq 'windows-update-continuity') {
         return 'Registry configuration only: automatic-restart prevention is not verified. This does not cancel pending or user-scheduled restarts, establish effective management policy, or guarantee an uninterrupted processing window. Update notifications, including restart warnings, are suppressed by this selection.'
     }
@@ -2327,6 +2371,29 @@ function Expand-InstalledLanguageResult($Result) {
     return $entries.ToArray()
 }
 
+function Get-PendingSystemLocaleId {
+    # Set-WinSystemLocale records the request here and Windows adopts it only
+    # at the next restart, so this is what a just-written system locale looks
+    # like while the running one is still the old one.
+    try {
+        return ([string](Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' -Name Default -ErrorAction Stop).Default).Trim()
+    } catch {
+        Write-Log 'WARN' "Could not read the pending system locale: $($_.Exception.Message)"
+        return ''
+    }
+}
+
+function Test-SystemLocaleAccepted([string]$Tag) {
+    # Accepted means either Windows is already running it, or Windows has
+    # written it down for the next restart. Demanding the running locale would
+    # fail every first-time change, because none of them apply before a restart.
+    if ((Get-WinSystemLocale).Name -eq $Tag) { return $true }
+    $wanted = try { '{0:X4}' -f ([System.Globalization.CultureInfo]::GetCultureInfo($Tag).LCID) } catch { '' }
+    if (-not $wanted) { return $false }
+    $pending = ([string](Get-PendingSystemLocaleId)).Trim()
+    return [bool]($pending -and $pending.ToUpperInvariant() -eq $wanted)
+}
+
 function Get-DisplayLanguagePackSource([string]$Language) {
     # Asked for a variant it does not localise, Windows answers with the parent
     # language that actually carries the resources: a request for en-NZ comes
@@ -2346,25 +2413,143 @@ function Test-DisplayLanguagePackInstalled([string]$Language) {
     return [bool](Get-DisplayLanguagePackSource $Language)
 }
 
-function Install-DisplayLanguagePack([string]$Language, [int]$TimeoutSeconds = 900) {
-    Write-Log 'INFO' "Installing the supported $Language Windows display-language pack. Timeout is $TimeoutSeconds seconds."
+function Test-WorkerCancelled {
+    # The elevated worker cannot be killed by the window that started it, so
+    # stopping is cooperative: the window drops a file and the worker notices
+    # it between steps and while waiting on a long download.
+    $target = Get-Variable -Name WorkerCancelPath -Scope Script -ErrorAction SilentlyContinue
+    if (-not $target -or -not $target.Value) { return $false }
+    try { return [bool](Test-Path -LiteralPath $target.Value -PathType Leaf) } catch { return $false }
+}
+
+function Get-ServicingActivity {
+    # Install-Language reports no progress of its own, so liveness is read from
+    # what Windows servicing touches while it works: its two logs, the Windows
+    # Update download folder, and the servicing processes. Any change in this
+    # fingerprint means something is still happening. An empty string means
+    # nothing could be read, and the caller must not call that a stall.
+    $parts = New-Object System.Collections.ArrayList
+    $root = if ($env:SystemRoot) { $env:SystemRoot } else { 'C:\Windows' }
+    foreach ($name in @('Logs\DISM\dism.log','Logs\CBS\CBS.log')) {
+        try {
+            $item = Get-Item -LiteralPath (Join-Path $root $name) -Force -ErrorAction Stop
+            [void]$parts.Add("$name=$($item.Length)@$($item.LastWriteTimeUtc.Ticks)")
+        } catch { }
+    }
+    try {
+        # Only the immediate children, which is a few dozen entries and a few
+        # milliseconds. A recursive scan here would cost more than it is worth.
+        $children = @(Get-ChildItem -LiteralPath (Join-Path $root 'SoftwareDistribution\Download') -Force -ErrorAction Stop)
+        $newest = @($children | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1)
+        $stamp = if ($newest.Count) { $newest[0].LastWriteTimeUtc.Ticks } else { 0 }
+        [void]$parts.Add("download=$($children.Count)@$stamp")
+    } catch { }
+    foreach ($name in @('TiWorker','TrustedInstaller')) {
+        try {
+            foreach ($process in @(Get-Process -Name $name -ErrorAction Stop)) {
+                $cpu = try { [math]::Round([double]$process.CPU, 1) } catch { 0 }
+                [void]$parts.Add("$name=$($process.Id)@$cpu")
+            }
+        } catch { }
+    }
+    return ($parts -join ';')
+}
+
+function Get-JobProgressReport($Job) {
+    # A background job keeps every progress record the command wrote, so the
+    # newest one is what the installer is doing right now. Signal changes
+    # whenever anything at all moves, which is how a stall is detected.
+    $percent = -1
+    $status = ''
+    $count = 0
+    try {
+        $records = @($Job.ChildJobs[0].Progress)
+        $count = $records.Count
+        if ($count) {
+            $last = $records[$count - 1]
+            $percent = [int]$last.PercentComplete
+            $status = [string]$last.StatusDescription
+        }
+    } catch {
+        # A job that has not started yet has no progress stream to read.
+    }
+    [PSCustomObject]@{ Percent=$percent; Status=$status; Count=$count; Signal="$count|$percent|$status" }
+}
+
+function Install-DisplayLanguagePack([string]$Language, [int]$TimeoutSeconds = 900, [int]$StallSeconds = 300) {
+    Write-Log 'INFO' "Installing the supported $Language Windows display-language pack. Timeout is $TimeoutSeconds seconds; a stall of $StallSeconds seconds ends it sooner."
+    Write-WorkerProgress 'Downloading' "Asking Windows Update for the $Language language pack"
     # Dingo needs only the UI resources. Avoid hot-adding handwriting, OCR,
     # speech, and other text services while this WPF process is running.
-    $job = Install-Language -Language $Language -ExcludeFeatures -AsJob -ErrorAction Stop
+    $job = Get-PrestartedPackJob $Language
+    if ($job) {
+        Write-Log 'INFO' "Taking over the $Language display-language download that was already running in the background."
+    } else {
+        $job = Install-Language -Language $Language -ExcludeFeatures -AsJob -ErrorAction Stop
+    }
     try {
         $timer = [Diagnostics.Stopwatch]::StartNew()
         $nextHeartbeat = 30
         $completed = $null
+        $lastSignal = ''
+        $lastChange = [TimeSpan]::Zero
+        $seenProgress = $false
+        $report = $null
         while (-not $completed -and $timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
             $completed = Wait-Job -Job $job -Timeout 5
+            if (-not $completed -and (Test-WorkerCancelled)) {
+                Stop-Job -Job $job -ErrorAction SilentlyContinue
+                throw "Stopped at your request while Windows was installing the $Language display pack. Windows may finish the download on its own in the background."
+            }
+            $report = Get-JobProgressReport $job
+            $activity = Get-ServicingActivity
+            # Either signal moving counts as work. The cmdlet publishes no
+            # progress records of its own, so most of the time it is the second.
+            $signal = "$($report.Signal)|$activity"
+            if ($signal -ne $lastSignal) {
+                $lastSignal = $signal
+                $lastChange = $timer.Elapsed
+            }
+            if ($report.Count -or $activity) { $seenProgress = $true }
+            $stalled = $timer.Elapsed - $lastChange
             if (-not $completed -and $timer.Elapsed.TotalSeconds -ge $nextHeartbeat) {
-                Write-Log 'INFO' "Still installing $Language display-language pack ($([math]::Floor($timer.Elapsed.TotalMinutes))m $($timer.Elapsed.Seconds)s elapsed; job state $($job.State))."
+                $where = if ($report.Count) { "$($report.Percent)% - $($report.Status)" } elseif ($activity) { "no percentage reported; Windows servicing last moved $([int]$stalled.TotalSeconds)s ago" } else { 'nothing readable about what Windows is doing' }
+                Write-Log 'INFO' "Still installing $Language display-language pack ($([math]::Floor($timer.Elapsed.TotalMinutes))m $($timer.Elapsed.Seconds)s elapsed; $where; job state $($job.State))."
                 $nextHeartbeat += 30
+            }
+            # Published every tick, not only on the heartbeat, so the window shows
+            # a figure that is visibly still moving.
+            $remaining = [math]::Max(0, [int]($TimeoutSeconds - $timer.Elapsed.TotalSeconds))
+            $detail = if ($report.Count) {
+                "Windows reports $($report.Percent)% done on the $Language language pack$(if ($report.Status) { " - $($report.Status)" })"
+            } elseif ($activity) {
+                # Windows gives no percentage for this, so say plainly that it is
+                # working rather than invent a figure.
+                "Windows is downloading and installing the $Language language pack. It gives no percentage for this, so Dingo watches Windows Update instead"
+            } else {
+                "Waiting for Windows Update to start on the $Language language pack"
+            }
+            # Say it has stopped moving well before giving up, so the person sees
+            # it coming rather than being surprised by a sudden failure.
+            $quietWarning = if ($StallSeconds -gt 0) { [math]::Min(60, [math]::Max(3, $StallSeconds / 3)) } else { 60 }
+            if ($stalled.TotalSeconds -ge $quietWarning) {
+                $detail += ". Nothing has moved for $([math]::Floor($stalled.TotalMinutes))m $($stalled.Seconds)s"
+            } elseif (-not $report.Count -and $activity) {
+                $detail += ". Last sign of activity $([int]$stalled.TotalSeconds)s ago"
+            }
+            Write-WorkerProgress 'Downloading' "$detail. Dingo waits $([math]::Floor($remaining / 60))m $($remaining % 60)s more at most"
+            # Sitting out a full timeout while nothing moves helps nobody, so a
+            # stall ends the step early and the rest of the plan carries on.
+            if (-not $completed -and $seenProgress -and $StallSeconds -gt 0 -and $stalled.TotalSeconds -ge $StallSeconds) {
+                Stop-Job -Job $job -ErrorAction SilentlyContinue
+                $stuckAt = if ($report.Count) { "It sat at $($report.Percent)%" } else { 'Neither Windows Update nor the servicing logs changed' }
+                throw "Windows Update stopped making progress on the $Language display pack. $stuckAt for $([math]::Floor($stalled.TotalMinutes))m $($stalled.Seconds)s, so Dingo gave up rather than wait out the full $([math]::Round($TimeoutSeconds / 60))-minute limit. Check Windows Update connectivity and try again."
             }
         }
         if (-not $completed) {
             Stop-Job -Job $job -ErrorAction SilentlyContinue
-            throw "Windows did not finish installing the $Language display pack within $([math]::Round($TimeoutSeconds / 60)) minutes. Check Windows Update connectivity and try again."
+            $where = if ($report -and $report.Count) { " It reached $($report.Percent)%." } else { ' Windows reports no percentage for a language pack, so Dingo cannot say how far it got.' }
+            throw "Windows did not finish installing the $Language display pack within $([math]::Round($TimeoutSeconds / 60)) minutes.$where Check Windows Update connectivity and try again."
         }
         Receive-Job -Job $job -ErrorAction Stop | Out-Null
         if ($job.State -ne 'Completed') {
@@ -2390,12 +2575,63 @@ function Get-AvailableDisplayLanguagePacks {
     }
 }
 
+function Select-DisplayLanguagePackToInstall([string[]]$Candidates) {
+    # The pack Windows would actually be asked for, or an empty string when
+    # nothing needs downloading or nothing can be downloaded.
+    foreach ($candidate in $Candidates) {
+        if (Get-DisplayLanguagePackSource $candidate) { return '' }
+    }
+    $available = @(Get-AvailableDisplayLanguagePacks)
+    $tryList = @(if ($available.Count) { $Candidates | Where-Object { $available -contains $_ } } else { $Candidates })
+    if (-not $tryList.Count) { return '' }
+    return [string]$tryList[0]
+}
+
+function Start-DisplayLanguagePackPrefetch([string[]]$Candidates) {
+    # A language pack is minutes of downloading while every other setting is
+    # milliseconds of registry work. Starting it here lets the rest of the plan
+    # run while Windows fetches it, instead of queueing behind it.
+    if (-not (Get-Variable -Name PackJobs -Scope Script -ErrorAction SilentlyContinue)) { $script:PackJobs = @{} }
+    $pack = try { Select-DisplayLanguagePackToInstall $Candidates } catch { '' }
+    if (-not $pack -or $script:PackJobs.ContainsKey($pack)) { return '' }
+    try {
+        $script:PackJobs[$pack] = Install-Language -Language $pack -ExcludeFeatures -AsJob -ErrorAction Stop
+        Write-Log 'INFO' "Started the $pack display-language download in the background so the rest of the plan need not wait for it."
+        return $pack
+    } catch {
+        Write-Log 'WARN' "Could not start the $pack display-language download early: $($_.Exception.Message)"
+        return ''
+    }
+}
+
+function Get-PrestartedPackJob([string]$Language) {
+    # Handed over once: whoever takes it owns waiting on it and cleaning it up.
+    if (-not (Get-Variable -Name PackJobs -Scope Script -ErrorAction SilentlyContinue)) { return $null }
+    if (-not $script:PackJobs.ContainsKey($Language)) { return $null }
+    $job = $script:PackJobs[$Language]
+    [void]$script:PackJobs.Remove($Language)
+    return $job
+}
+
+function Stop-PrestartedPackJobs {
+    if (-not (Get-Variable -Name PackJobs -Scope Script -ErrorAction SilentlyContinue)) { return }
+    foreach ($key in @($script:PackJobs.Keys)) {
+        try {
+            Stop-Job -Job $script:PackJobs[$key] -ErrorAction SilentlyContinue
+            Remove-Job -Job $script:PackJobs[$key] -Force -ErrorAction SilentlyContinue
+            Write-Log 'WARN' "Dropped the unused $key display-language download."
+        } catch { }
+    }
+    $script:PackJobs = @{}
+}
+
 function Install-RequiredDisplayLanguagePack([string[]]$Candidates) {
     # Returns the language whose display pack ends up carrying the interface. A
     # choice may name more than one candidate, because Windows localises some
     # English variants only through a parent pack. Nothing already present is
     # downloaded again.
     if (-not @($Candidates).Count) { throw 'No display-language pack was named for this choice.' }
+    Write-WorkerProgress 'Working' 'Checking which Windows language packs are already installed'
     foreach ($candidate in $Candidates) {
         $source = Get-DisplayLanguagePackSource $candidate
         if ($source) {
@@ -2404,6 +2640,7 @@ function Install-RequiredDisplayLanguagePack([string[]]$Candidates) {
             return $source
         }
     }
+    Write-WorkerProgress 'Working' 'Asking Windows which language packs it can supply'
     $available = @(Get-AvailableDisplayLanguagePacks)
     # The array subexpression wraps the whole choice: an empty result inside an
     # if branch is an empty pipeline, and the if would otherwise yield $null.
@@ -2581,7 +2818,10 @@ function Set-LanguageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
         if (-not $pack -or -not (Test-DisplayLanguagePackInstalled $pack)) { throw "No Windows display pack for $DesiredState was installed." }
         Set-SystemPreferredUILanguage -Language $choice.Tag -PassThru | Out-Null
         Set-WinSystemLocale -SystemLocale $choice.Tag
-        if ((Get-WinSystemLocale).Name -ne $choice.Tag) { throw "Computer-wide $DesiredState locale verification failed." }
+        if (-not (Test-SystemLocaleAccepted $choice.Tag)) { throw "Computer-wide $DesiredState locale verification failed." }
+        if ((Get-WinSystemLocale).Name -ne $choice.Tag) {
+            Write-Log 'INFO' "Windows recorded $($choice.Tag) as the system locale and will start using it after the next restart."
+        }
         if ($choice.Tag -ne $pack) {
             Write-Log 'INFO' "The $($choice.Tag) system UI request was accepted using the installed $pack base resources; Windows applies and reports it after sign-out or restart."
         }
@@ -2660,6 +2900,32 @@ function Invoke-SettingPartResults($Setting, $DesiredState, $Scope) {
     return @($entries)
 }
 
+function Write-WorkerProgress([string]$Phase, [string]$Detail = '') {
+    # The elevated worker runs in its own process, so the window can only see
+    # what is written down. A failed write never stops the actual work.
+    # Read with Get-Variable: the test suites load Dingo one function at a time
+    # and never run a bare assignment at the top of the file.
+    $target = Get-Variable -Name WorkerProgressPath -Scope Script -ErrorAction SilentlyContinue
+    $step = Get-Variable -Name WorkerStep -Scope Script -ErrorAction SilentlyContinue
+    if (-not $target -or -not $target.Value -or -not $step -or -not $step.Value) { return }
+    try {
+        $script:WorkerStep.Phase = $Phase
+        $script:WorkerStep.Detail = $Detail
+        $script:WorkerStep.Updated = (Get-Date).ToString('o')
+        Write-Utf8FileAtomically $script:WorkerProgressPath (ConvertTo-Json -InputObject $script:WorkerStep -Depth 4)
+    } catch {
+        Write-Log 'DEBUG' "Could not publish worker progress: $($_.Exception.Message)"
+    }
+}
+
+function Set-WorkerProgressStep([int]$Index, [int]$Total, [string]$Id, [string]$Name, [string]$Phase, [string]$Detail = '') {
+    $script:WorkerStep = [PSCustomObject]@{
+        Index=$Index; Total=$Total; Id=$Id; Name=$Name; Phase=$Phase; Detail=$Detail
+        StepStarted=(Get-Date).ToString('o'); Updated=(Get-Date).ToString('o')
+    }
+    Write-WorkerProgress $Phase $Detail
+}
+
 function Write-WorkerResults([System.Collections.IEnumerable]$Results, [string]$Path) {
     $items = @($Results)
     $json = if ($items.Count) { ConvertTo-Json -InputObject $items -Depth 8 } else { '[]' }
@@ -2684,10 +2950,47 @@ function Publish-PlanState($Item) {
     foreach ($name in @('Status','Details','CurrentState','LastApplyResult')) { $card.$name = $Item.$name }
 }
 
-function Invoke-AdministratorPlan([array]$Plan, [array]$AllSettings, [string]$CheckpointPath = '') {
-    $results = New-Object System.Collections.ArrayList
+function Split-SlowPlanRequests([array]$Plan, [array]$AllSettings) {
+    # A setting that needs a Windows Update download is minutes long. Moving it
+    # behind the quick ones means everything else is finished and reported while
+    # it runs, instead of waiting its turn behind it.
+    $quick = New-Object System.Collections.ArrayList
+    $slow = New-Object System.Collections.ArrayList
     foreach ($request in $Plan) {
         $setting = $AllSettings | Where-Object Id -eq $request.Id | Select-Object -First 1
+        $isSlow = $false
+        if ($setting) {
+            $probe = $setting.PSObject.Copy()
+            $probe.DesiredState = [string]$request.DesiredState
+            $isSlow = try { Test-SettingNeedsLanguageDownload $probe } catch { $false }
+        }
+        if ($isSlow) { [void]$slow.Add($request) } else { [void]$quick.Add($request) }
+    }
+    [PSCustomObject]@{ Quick=@($quick); Slow=@($slow) }
+}
+
+function Invoke-AdministratorPlan([array]$Plan, [array]$AllSettings, [string]$CheckpointPath = '') {
+    $results = New-Object System.Collections.ArrayList
+    $split = Split-SlowPlanRequests $Plan $AllSettings
+    $ordered = @(@($split.Quick) + @($split.Slow))
+    foreach ($slowRequest in @($split.Slow)) {
+        $setting = $AllSettings | Where-Object Id -eq $slowRequest.Id | Select-Object -First 1
+        if (-not $setting -or $setting.Kind -ne 'Language') { continue }
+        $choice = try { Get-LocaleChoice (Get-LanguageChoiceTable) ([string]$slowRequest.DesiredState) } catch { $null }
+        if ($choice) { [void](Start-DisplayLanguagePackPrefetch @($choice.Packs)) }
+    }
+    $total = @($ordered).Count
+    $index = 0
+    foreach ($request in $ordered) {
+        $index++
+        # Checked between settings, so a stop never lands halfway through one.
+        if (Test-WorkerCancelled) {
+            Write-Log 'WARN' "Administrator worker stopped at the user's request before [$($request.Id)]; $($results.Count) of $total setting(s) were done."
+            Stop-PrestartedPackJobs
+            break
+        }
+        $setting = $AllSettings | Where-Object Id -eq $request.Id | Select-Object -First 1
+        Set-WorkerProgressStep $index $total ([string]$request.Id) $(if ($setting) { [string]$setting.Name } else { [string]$request.Id }) 'Working' 'Reading the current setting'
         if (-not $setting) {
             $unknown = New-ApplyResult ([string]$request.Id) @((New-OperationComponent 'Administrator plan' 'Failed' 'Unknown setting ID.')) 'Unknown setting ID.'
             [void]$results.Add($unknown)
@@ -2707,7 +3010,10 @@ function Invoke-AdministratorPlan([array]$Plan, [array]$AllSettings, [string]$Ch
         [void]$results.Add($result)
         Write-Log $(if ($result.Success) { 'INFO' } else { 'ERROR' }) "ADMINISTRATOR $($result.Outcome.ToUpperInvariant()) [$($setting.Id)] $message"
         if ($CheckpointPath) { Write-WorkerResults $results $CheckpointPath }
+        Write-WorkerProgress 'Finished' $message
     }
+    # Nothing should still be downloading once the plan is over.
+    Stop-PrestartedPackJobs
     return ,$results
 }
 
@@ -2719,17 +3025,19 @@ function Start-AdministratorChanges([array]$Selected) {
     $token = [Guid]::NewGuid().ToString('N')
     $planPath = Join-Path $env:TEMP "Dingo-plan-$token.json"
     $resultPath = Join-Path $env:TEMP "Dingo-result-$token.json"
+    $progressPath = Join-Path $env:TEMP "Dingo-progress-$token.json"
+    $cancelPath = Join-Path $env:TEMP "Dingo-cancel-$token.flag"
     try {
         Write-Utf8FileAtomically $planPath (ConvertTo-Json -InputObject $requests -Depth 6)
         Write-Utf8FileAtomically $resultPath '[]'
         $desktopSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        $argumentText = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}" -ElevationBroker -PlanPath "{1}" -ResultPath "{2}" -WorkerLogPath "{3}" -TargetUserSid "{4}"' -f $PSCommandPath,$planPath,$resultPath,$script:LogFile,$desktopSid
+        $argumentText = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}" -ElevationBroker -PlanPath "{1}" -ResultPath "{2}" -WorkerLogPath "{3}" -TargetUserSid "{4}" -ProgressPath "{5}" -CancelPath "{6}"' -f $PSCommandPath,$planPath,$resultPath,$script:LogFile,$desktopSid,$progressPath,$cancelPath
         $process = Start-Process -FilePath (Get-PowerShellHostPath) -ArgumentList $argumentText -WindowStyle Hidden -PassThru -ErrorAction Stop
         if (-not $process) { throw 'Windows returned no process handle for the elevation broker.' }
-        return [PSCustomObject]@{ Process=$process; PlanPath=$planPath; ResultPath=$resultPath; Selected=$Selected; Started=Get-Date; StartError=$null }
+        return [PSCustomObject]@{ Process=$process; PlanPath=$planPath; ResultPath=$resultPath; ProgressPath=$progressPath; CancelPath=$cancelPath; Selected=$Selected; Started=Get-Date; StartError=$null }
     } catch {
-        Remove-Item -LiteralPath $planPath,$resultPath -Force -ErrorAction SilentlyContinue
-        return [PSCustomObject]@{ Process=$null; PlanPath=$null; ResultPath=$null; Selected=$Selected; Started=Get-Date; StartError="The elevation broker could not start: $($_.Exception.Message)" }
+        Remove-Item -LiteralPath $planPath,$resultPath,$progressPath,$cancelPath -Force -ErrorAction SilentlyContinue
+        return [PSCustomObject]@{ Process=$null; PlanPath=$null; ResultPath=$null; ProgressPath=$null; CancelPath=$null; Selected=$Selected; Started=Get-Date; StartError="The elevation broker could not start: $($_.Exception.Message)" }
     }
 }
 
@@ -2756,7 +3064,7 @@ function Complete-AdministratorChanges($Operation) {
         $message = "Could not read the administrator result: $($_.Exception.Message)"
         $map['*'] = New-ApplyResult '*' @((New-OperationComponent 'Administrator result' 'Failed' $message)) $message
     } finally {
-        Remove-Item -LiteralPath $Operation.PlanPath,$Operation.ResultPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Operation.PlanPath,$Operation.ResultPath,$Operation.ProgressPath,$Operation.CancelPath -Force -ErrorAction SilentlyContinue
     }
     return $map
 }
@@ -3091,7 +3399,7 @@ if ($ListSettings) {
 
 if ($ElevationBroker) {
     try {
-        $workerArguments = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}" -MachineWorker -PlanPath "{1}" -ResultPath "{2}" -WorkerLogPath "{3}" -TargetUserSid "{4}"' -f $PSCommandPath,$PlanPath,$ResultPath,$WorkerLogPath,$TargetUserSid
+        $workerArguments = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}" -MachineWorker -PlanPath "{1}" -ResultPath "{2}" -WorkerLogPath "{3}" -TargetUserSid "{4}" -ProgressPath "{5}" -CancelPath "{6}"' -f $PSCommandPath,$PlanPath,$ResultPath,$WorkerLogPath,$TargetUserSid,$ProgressPath,$CancelPath
         $workerProcess = Start-Process -FilePath (Get-PowerShellHostPath) -ArgumentList $workerArguments -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
         if (-not $workerProcess) { throw 'Windows returned no process handle after administrator approval.' }
         exit $workerProcess.ExitCode
@@ -3626,12 +3934,15 @@ if ($StateSelfTest) {
 
 if ($MachineWorker) {
     $script:LogFile = $WorkerLogPath
+    $script:WorkerProgressPath = $ProgressPath
+    $script:WorkerCancelPath = $CancelPath
     try {
         Write-Log 'INFO' "Administrator worker started as $([Security.Principal.WindowsIdentity]::GetCurrent().Name) for desktop SID $TargetUserSid."
         if (-not (Test-IsAdministrator)) { throw 'The machine worker was not elevated.' }
         if ($TargetUserSid -notmatch '^S-\d(?:-\d+)+$') { throw 'The desktop user SID supplied to the administrator step is invalid.' }
         $plan = @(ConvertFrom-JsonList (Get-Content -LiteralPath $PlanPath -Raw))
         Write-Log 'INFO' "Administrator worker received $($plan.Count) setting(s)."
+        Set-WorkerProgressStep 0 @($plan).Count '' '' 'Starting' 'Administrator approval accepted'
         $results = Invoke-AdministratorPlan $plan $script:Settings $ResultPath
         Write-WorkerResults $results $ResultPath
         exit 0
@@ -3951,6 +4262,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
       <TextBlock Name="SummaryText" Grid.Row="0" Text="Reading current settings..." VerticalAlignment="Center" Foreground="#334E68" TextWrapping="Wrap" Margin="0,0,0,6"/>
       <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right">
         <TextBlock Name="AdminSummaryText" Visibility="Collapsed" VerticalAlignment="Center" Foreground="#8A4B08" FontWeight="SemiBold" TextWrapping="Wrap" MaxWidth="250" Margin="0,0,14,0"/>
+        <Button Name="StopButton" Content="Stop" Visibility="Collapsed" Background="#FCE9E7" Foreground="#8A2B21" FontWeight="SemiBold"/>
         <Button Name="RefreshButton" Content="Read settings again"/>
         <Button Name="UncheckButton" Content="Clear all selections"/>
         <Button Name="ApplyButton" Content="Apply selected changes" Background="#0B6EBD" Foreground="White" FontWeight="SemiBold"/>
@@ -3962,7 +4274,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
-foreach ($name in @('IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ApplyButton')) {
+foreach ($name in @('IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
 $desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -3976,6 +4288,12 @@ if ($script:ToolCatalogWarning) {
 $VersionText.Text = "Version $($script:DingoVersion)"
 $LogPathText.Text = [string]$script:LogFile
 $script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$UncheckButton,$RefreshButton)
+
+function Show-StopButton([bool]$Visible) {
+    $StopButton.Visibility = if ($Visible) { 'Visible' } else { 'Collapsed' }
+    $StopButton.IsEnabled = $Visible
+    $StopButton.Content = 'Stop'
+}
 
 function Set-ActionButtonsEnabled([bool]$Enabled) {
     foreach ($control in $script:ActionButtons) { $control.IsEnabled = $Enabled }
@@ -4008,6 +4326,119 @@ function New-CardText {
 function Add-CardColumn($Grid, $Control, [int]$Column) {
     [Windows.Controls.Grid]::SetColumn($Control, $Column)
     [void]$Grid.Children.Add($Control)
+}
+
+function Format-Duration([TimeSpan]$Span) {
+    if ($Span.TotalSeconds -lt 0) { return '0:00' }
+    '{0}:{1:00}' -f [math]::Floor($Span.TotalMinutes),$Span.Seconds
+}
+
+function Read-WorkerProgressFile([string]$Path) {
+    # Read failures are normal: the worker replaces this file about twice a
+    # second. The caller keeps showing the last good reading instead.
+    if (-not $Path) { return $null }
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+        return ConvertFrom-Json $raw
+    } catch { return $null }
+}
+
+function Read-WorkerFinishedIds([string]$Path) {
+    # The worker rewrites its result file after every setting, so the window can
+    # tell which cards are already done long before the process exits.
+    if (-not $Path) { return @() }
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+        return @(@(ConvertFrom-JsonList $raw) | ForEach-Object { [string]$_.Id } | Where-Object { $_ })
+    } catch { return @() }
+}
+
+function Request-AdministratorStop($Pending) {
+    # Two ways to stop, because only one of them is available at a time. Before
+    # the Windows approval prompt is answered there is no elevated process yet,
+    # so the broker can simply be closed. Afterwards the worker runs elevated
+    # and this window cannot kill it, so it is asked to stop instead.
+    if (-not $Pending) { return $false }
+    $asked = $false
+    if ($Pending.CancelPath) {
+        try {
+            Write-Utf8FileAtomically $Pending.CancelPath 'stop'
+            $asked = $true
+        } catch {
+            Write-Log 'WARN' "Could not write the stop request: $($_.Exception.Message)"
+        }
+    }
+    $started = $Pending.PSObject.Properties['LastProgress'] -and $Pending.LastProgress
+    if (-not $started -and $Pending.Process -and -not $Pending.Process.HasExited) {
+        # Nothing has been applied yet, so closing the broker cancels the whole
+        # thing cleanly, prompt and all.
+        try { $Pending.Process.Kill() } catch { Write-Log 'WARN' "Could not close the elevation broker: $($_.Exception.Message)" }
+        $asked = $true
+    }
+    Write-Log 'WARN' 'The user asked Dingo to stop the administrator step.'
+    return $asked
+}
+
+function Update-AdministratorProgress($Pending) {
+    $totalElapsed = Format-Duration ((Get-Date) - $Pending.Started)
+    $progress = Read-WorkerProgressFile $Pending.ProgressPath
+    if ($progress) {
+        $Pending | Add-Member -NotePropertyName LastProgress -NotePropertyValue $progress -Force
+    } elseif ($Pending.PSObject.Properties['LastProgress']) {
+        # The worker replaces this file about twice a second, so a read can land
+        # mid-write. Keep showing the last good reading rather than pretending
+        # the worker has not started.
+        $progress = $Pending.LastProgress
+    }
+    if (-not $progress) {
+        # Nothing has ever been published, which almost always means the Windows
+        # approval prompt is still on screen.
+        $ProgressBar.IsIndeterminate = $true
+        $SummaryText.Text = "Waiting for administrator approval ($totalElapsed). Accept the Windows prompt to let Dingo continue."
+        return
+    }
+    $finished = @(Read-WorkerFinishedIds $Pending.ResultPath)
+    $total = [int]$progress.Total
+    $index = [int]$progress.Index
+    $name = [string]$progress.Name
+    $phase = [string]$progress.Phase
+    $detail = [string]$progress.Detail
+    # Each card says where it stands, so a long step never looks like a hang.
+    foreach ($planned in @($Pending.Selected | Where-Object RequiresAdmin)) {
+        $card = $script:Settings | Where-Object Id -eq $planned.Id | Select-Object -First 1
+        if (-not $card -or -not $card.PSObject.Properties['DetailsControl']) { continue }
+        $text = if ($finished -contains [string]$planned.Id) {
+            'Administrator part finished; waiting to verify.'
+        } elseif ([string]$progress.Id -eq [string]$planned.Id) {
+            if ($detail) { $detail } else { 'Working...' }
+        } else {
+            'Waiting for the administrator step...'
+        }
+        $card.Details = $text
+        $card.DetailsControl.Text = $text
+    }
+    if ($total -gt 0 -and $finished.Count -le $total) {
+        $ProgressBar.IsIndeterminate = $false
+        $ProgressBar.Value = [math]::Round(($finished.Count / $total) * 100)
+    }
+    $stepElapsed = ''
+    try {
+        if ($progress.StepStarted) { $stepElapsed = Format-Duration ((Get-Date) - [datetime]::Parse([string]$progress.StepStarted)) }
+    } catch { $stepElapsed = '' }
+    $heading = if ($index -ge 1 -and $total -ge 1 -and $name) {
+        "Administrator step $index of ${total}: $name"
+    } else {
+        'Administrator step starting'
+    }
+    $body = if ($detail) { ' - ' + $detail.TrimEnd('.',' ') + '.' } else { '.' }
+    $clock = if ($stepElapsed) { " $stepElapsed on this step, $totalElapsed in total." } else { " $totalElapsed elapsed." }
+    $done = if ($total -ge 1) { " $($finished.Count) of $total finished." } else { '' }
+    $hint = if ($phase -eq 'Downloading') { ' A language pack comes from Windows Update, so this step is the slow one.' } else { '' }
+    $SummaryText.Text = "$heading$body$clock$done$hint"
 }
 
 function Update-SelectionSummary {
@@ -4080,6 +4511,7 @@ function New-SettingCard($Item) {
     # Show a caveat that applying the setting cannot resolve, so the card never
     # implies a result Windows or the target application will not honour.
     $advisory = Get-SettingAdvisory $Item
+    $advisoryText = $null
     if ($advisory) {
         $advisoryBorder = New-Object Windows.Controls.Border
         $advisoryBorder.Background = '#FFF1F0'
@@ -4166,6 +4598,7 @@ function New-SettingCard($Item) {
     $Item | Add-Member -NotePropertyName DetailsControl -NotePropertyValue $detailsText -Force
     $Item | Add-Member -NotePropertyName ChoiceControls -NotePropertyValue $choiceControls -Force
     $Item | Add-Member -NotePropertyName AdminBadgeControl -NotePropertyValue $adminBadge -Force
+    $Item | Add-Member -NotePropertyName AdvisoryControl -NotePropertyValue $advisoryText -Force
     return $border
 }
 
@@ -4256,6 +4689,13 @@ function Refresh-UI {
             default { '#334E68' }
         }
         $item.DetailsControl.Text = $item.Details
+        # The note follows the drop-down: pick a language whose pack is already
+        # here and the download warning goes away by itself.
+        if ($item.PSObject.Properties['AdvisoryControl'] -and $item.AdvisoryControl) {
+            $note = Get-SettingAdvisory $item
+            $item.AdvisoryControl.Text = if ($note) { "Note: $note" } else { '' }
+            $item.AdvisoryControl.Parent.Visibility = if ($note) { 'Visible' } else { 'Collapsed' }
+        }
         foreach ($choice in $item.ChoiceControls) {
             if ($choice -is [Windows.Controls.ComboBox]) {
                 if ([string]$choice.SelectedItem -ne $item.DesiredState) { $choice.SelectedItem = [string]$item.DesiredState }
@@ -4269,6 +4709,7 @@ function Refresh-UI {
 }
 
 function Update-CurrentStates {
+    Clear-DisplayPackCache
     Set-ActionButtonsEnabled $false
     try {
         $count = $script:Settings.Count
@@ -4429,8 +4870,9 @@ $ApplyButton.Add_Click({
             $item.Status = 'Running'; $item.Details = 'Waiting for the administrator step...'
             Publish-PlanState $item
         }
-        $SummaryText.Text = 'Starting the administrator step...'
+        $SummaryText.Text = 'Waiting for administrator approval. Accept the Windows prompt to let Dingo continue.'
         $ProgressBar.IsIndeterminate = $true
+        Show-StopButton $true
         Refresh-UI
 
         $operation = Start-AdministratorChanges $selected
@@ -4448,12 +4890,11 @@ $ApplyButton.Add_Click({
             $pending = $script:PendingApply
             if (-not $pending) { $sender.Stop(); return }
             if (-not $pending.Process.HasExited) {
-                $elapsedTime = (Get-Date) - $pending.Started
-                $elapsed = '{0}:{1:00}' -f [math]::Floor($elapsedTime.TotalMinutes),$elapsedTime.Seconds
-                $SummaryText.Text = "Administrator step is running ($elapsed elapsed). Windows language downloads can take several minutes."
+                Update-AdministratorProgress $pending
                 return
             }
             $sender.Stop()
+            Show-StopButton $false
             $administratorResults = Complete-AdministratorChanges $pending
             $selectedItems = $pending.Selected
             $script:PendingApply = $null
@@ -4467,17 +4908,48 @@ $ApplyButton.Add_Click({
     }
 })
 
+$StopButton.Add_Click({
+    $pending = $script:PendingApply
+    if (-not $pending) { return }
+    $answer = [System.Windows.MessageBox]::Show(
+        "Stop the administrator step?" + [Environment]::NewLine + [Environment]::NewLine +
+        "Changes already applied stay applied. Dingo finishes the setting it is on, skips the rest, and then shows you the results." + [Environment]::NewLine + [Environment]::NewLine +
+        "A Windows language download cannot be called back, so Windows may finish it on its own.",
+        'Stop Dingo', 'YesNo', 'Question')
+    if ($answer -ne 'Yes') { return }
+    $StopButton.IsEnabled = $false
+    $StopButton.Content = 'Stopping...'
+    if (Request-AdministratorStop $pending) {
+        $SummaryText.Text = 'Stopping. Dingo is finishing the setting it is on, then it will show you the results.'
+    } else {
+        $SummaryText.Text = 'Dingo could not pass on the stop request. It will show the results as soon as the administrator step ends.'
+    }
+})
+
 $window.Add_ContentRendered({ Update-CurrentStates })
 $window.Add_Closing({
     param($sender,$eventArgs)
     if (-not $script:ApplyInProgress) { return }
     $eventArgs.Cancel = $true
-    $message = if ($script:PendingApply -and $script:PendingApply.Process -and -not $script:PendingApply.Process.HasExited) {
-        'An administrator-required operation is still running. Keep Dingo open until it finishes so it can verify every change and clean up its temporary files.'
-    } else {
-        'Dingo is collecting and verifying the administrator results. Please wait for the finished summary before closing the window.'
+    $running = $script:PendingApply -and $script:PendingApply.Process -and -not $script:PendingApply.Process.HasExited
+    if (-not $running) {
+        [System.Windows.MessageBox]::Show(
+            'Dingo is collecting and verifying the administrator results. Please wait for the finished summary before closing the window.',
+            'Dingo is still working', 'OK', 'Information') | Out-Null
+        return
     }
-    [System.Windows.MessageBox]::Show($message, 'Dingo is still working', 'OK', 'Information') | Out-Null
+    # Closing is a request to stop, so offer the stop rather than only refusing.
+    $answer = [System.Windows.MessageBox]::Show(
+        "An administrator step is still running, so Dingo cannot close yet." + [Environment]::NewLine + [Environment]::NewLine +
+        "Stop it now? Changes already applied stay applied. Dingo finishes the setting it is on, shows you the results, and then you can close it." + [Environment]::NewLine + [Environment]::NewLine +
+        "Choose No to keep waiting.",
+        'Dingo is still working', 'YesNo', 'Question')
+    if ($answer -ne 'Yes') { return }
+    $StopButton.IsEnabled = $false
+    $StopButton.Content = 'Stopping...'
+    if (Request-AdministratorStop $script:PendingApply) {
+        $SummaryText.Text = 'Stopping. Dingo is finishing the setting it is on, then it will show you the results.'
+    }
 })
 $window.Add_Closed({ Write-Log 'INFO' 'Application closed.' })
 [void]$window.ShowDialog()

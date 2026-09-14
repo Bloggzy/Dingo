@@ -490,6 +490,366 @@ try {
         # A pack named for no language at all is a programming error.
         Assert-Throws { Install-RequiredDisplayLanguagePack @() } 'No display-language pack was named'
     }
+    Test-Case 'The window reports what the administrator step is doing, card by card' {
+        $dir = Join-Path ([IO.Path]::GetTempPath()) ('dingo-progress-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        try {
+            $savedSettings = $script:Settings
+            $script:WorkerProgressPath = Join-Path $dir 'progress.json'
+            $resultPath = Join-Path $dir 'result.json'
+            $SummaryText = [pscustomobject]@{Text=''}
+            $ProgressBar = [pscustomobject]@{Value=0;IsIndeterminate=$true}
+            $script:Settings = @(
+                [pscustomobject]@{Id='a';Details='';DetailsControl=[pscustomobject]@{Text=''}}
+                [pscustomobject]@{Id='b';Details='';DetailsControl=[pscustomobject]@{Text=''}}
+            )
+            $pending = [pscustomobject]@{
+                Started=(Get-Date).AddSeconds(-450); ProgressPath=$script:WorkerProgressPath; ResultPath=$resultPath
+                Selected=@([pscustomobject]@{Id='a';RequiresAdmin=$true},[pscustomobject]@{Id='b';RequiresAdmin=$true})
+            }
+            # Nothing published yet: the approval prompt is still unanswered.
+            Update-AdministratorProgress $pending
+            Assert ($SummaryText.Text -match 'Waiting for administrator approval') 'An unanswered approval prompt is not named.'
+            Assert ($SummaryText.Text -match '7:30') 'The waiting message carries no elapsed time.'
+            Assert ($ProgressBar.IsIndeterminate) 'The progress bar claims progress before the worker started.'
+            # First step running, nothing finished.
+            Set-Content -LiteralPath $resultPath -Value '[]'
+            Set-WorkerProgressStep 1 2 'a' 'First card' 'Working' 'Writing the computer-wide policy'
+            Update-AdministratorProgress $pending
+            Assert ($SummaryText.Text -match 'step 1 of 2: First card') 'The running step is not named.'
+            Assert ($SummaryText.Text -match 'Writing the computer-wide policy') 'The running step does not say what it is doing.'
+            Assert ($SummaryText.Text -match '0 of 2 finished') 'The finished count is missing.'
+            Assert (-not $ProgressBar.IsIndeterminate -and $ProgressBar.Value -eq 0) 'The progress bar did not switch to a real count.'
+            Assert (($script:Settings | Where-Object Id -eq 'a').DetailsControl.Text -eq 'Writing the computer-wide policy') 'The running card does not show its own step.'
+            Assert (($script:Settings | Where-Object Id -eq 'b').DetailsControl.Text -match 'Waiting') 'A card not yet reached does not say so.'
+            # A long download says so, and names the time it is allowed.
+            Set-Content -LiteralPath $resultPath -Value '[{"Id":"a"}]'
+            Set-WorkerProgressStep 2 2 'b' 'Display language' 'Working' 'Reading'
+            $script:WorkerStep.StepStarted = (Get-Date).AddSeconds(-134).ToString('o')
+            Write-WorkerProgress 'Downloading' 'Downloading the en-GB language pack. Windows allows 12m 0s more.'
+            Update-AdministratorProgress $pending
+            Assert ($SummaryText.Text -match 'Windows Update, so this step is the slow one') 'A download does not explain why it is slow.'
+            Assert ($SummaryText.Text -match '2:14 on this step') 'The per-step clock is missing.'
+            Assert ($SummaryText.Text -match '1 of 2 finished') 'The finished count did not advance.'
+            Assert ($ProgressBar.Value -eq 50) "The progress bar reads $($ProgressBar.Value) instead of 50."
+            Assert (($script:Settings | Where-Object Id -eq 'a').DetailsControl.Text -match 'finished') 'A finished card still says it is waiting.'
+            Assert ($SummaryText.Text -notmatch '\.\.') 'The summary sentence doubles its full stop.'
+            # A read that lands mid-write keeps the last good reading.
+            $lastGood = $SummaryText.Text
+            Set-Content -LiteralPath $script:WorkerProgressPath -Value '{"Index":2,"Tot'
+            Update-AdministratorProgress $pending
+            Assert ($SummaryText.Text -match 'step 2 of 2: Display language') 'A torn read lost the running step.'
+            Assert ($SummaryText.Text -notmatch 'Waiting for administrator approval') 'A torn read made a running worker look unstarted.'
+            # Progress publishing is a no-op wherever there is nowhere to publish.
+            $script:WorkerProgressPath = ''
+            $script:WorkerStep = $null
+            Write-WorkerProgress 'Working' 'no target'
+            Assert ($true) 'Publishing progress without a target must not throw.'
+        } finally {
+            $script:Settings = $savedSettings
+            $script:WorkerProgressPath = ''
+            $script:WorkerStep = $null
+            Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+        }
+    }
+    Test-Case 'A system locale counts as set once Windows has written it down for the next restart' {
+        # Set-WinSystemLocale never changes the running locale, so demanding the
+        # running one would fail every first-time change on a real computer.
+        function Get-WinSystemLocale { [pscustomobject]@{ Name='en-US' } }
+        function Get-PendingSystemLocaleId { '0C09' }
+        Assert (Test-SystemLocaleAccepted 'en-AU') 'A written but not yet restarted system locale was refused.'
+        Assert (-not (Test-SystemLocaleAccepted 'de-DE')) 'A different pending locale was accepted.'
+        # Lower case and stray spaces are the same written value.
+        function Get-PendingSystemLocaleId { ' 0c09 ' }
+        Assert (Test-SystemLocaleAccepted 'en-AU') 'A pending locale in lower case was refused.'
+        # Nothing written and nothing running means not set.
+        function Get-PendingSystemLocaleId { '' }
+        Assert (-not (Test-SystemLocaleAccepted 'en-AU')) 'An unwritten system locale was accepted.'
+        # Already running it needs no registry reading at all.
+        function Get-WinSystemLocale { [pscustomobject]@{ Name='en-AU' } }
+        Assert (Test-SystemLocaleAccepted 'en-AU') 'The running system locale was refused.'
+        # A tag Windows does not know is never accepted.
+        function Get-WinSystemLocale { [pscustomobject]@{ Name='en-US' } }
+        function Get-PendingSystemLocaleId { '0C09' }
+        Assert (-not (Test-SystemLocaleAccepted 'zz-ZZ')) 'An unknown language tag was accepted as a system locale.'
+    }
+    Test-Case 'Only a language that must be downloaded counts as a slow step, and the answer is cached' {
+        $card = ($script:Settings | Where-Object Id -eq 'language-au').PSObject.Copy()
+        $other = ($script:Settings | Where-Object Id -eq 'hidden-files').PSObject.Copy()
+        try {
+            function Get-DisplayLanguagePackSource { param([string]$Language) '' }
+            Clear-DisplayPackCache
+            Assert (Test-SettingNeedsLanguageDownload $card) 'A language with no pack anywhere was not treated as a download.'
+            # A pack that is already here means no download.
+            function Get-DisplayLanguagePackSource { param([string]$Language) if ($Language -eq 'en-GB') { 'en-GB' } else { '' } }
+            Clear-DisplayPackCache
+            $card.DesiredState = 'British English (en-GB)'
+            Assert (-not (Test-SettingNeedsLanguageDownload $card)) 'An installed pack was still treated as a download.'
+            # A variant served by its parent pack is not a download either.
+            $card.DesiredState = 'Australian English (en-AU)'
+            Assert (-not (Test-SettingNeedsLanguageDownload $card)) 'A variant served by its parent pack was treated as a download.'
+            # A language with nothing to ride on is.
+            $card.DesiredState = 'Japanese (ja-JP)'
+            Assert (Test-SettingNeedsLanguageDownload $card) 'A language with no pack at all was not treated as a download.'
+            Assert ((Get-SettingAdvisory $card) -match 'hold up the whole run') 'The note does not warn that the run is held up.'
+            # No other kind of card is ever a language download.
+            Assert (-not (Test-SettingNeedsLanguageDownload $other)) 'A registry card was treated as a language download.'
+            # Windows is asked once per language, not once per redraw: the card asks
+            # this every time the window refreshes, and asking Windows costs seconds.
+            $script:Asked = 0
+            function Get-DisplayLanguagePackSource { param([string]$Language) $script:Asked++; '' }
+            Clear-DisplayPackCache
+            1..20 | ForEach-Object { [void](Test-SettingNeedsLanguageDownload $card) }
+            Assert ($script:Asked -le 1) "Windows was asked $script:Asked times for 20 redraws; the answer is not cached."
+            # Reading settings again must ask afresh, or an installed pack would
+            # keep showing the warning for the rest of the session.
+            Clear-DisplayPackCache
+            [void](Test-SettingNeedsLanguageDownload $card)
+            Assert ($script:Asked -gt 1) 'Reading settings again did not clear the cached answer.'
+        } finally {
+            Clear-DisplayPackCache
+        }
+    }
+    Test-Case 'A display language with no pack on this computer warns before anyone waits' {
+        $card = ($script:Settings | Where-Object Id -eq 'language-au').PSObject.Copy()
+        function Get-DisplayLanguagePackSource { param([string]$Language) '' }
+        # The answer is cached per language, so a changed stub needs a fresh start.
+        Clear-DisplayPackCache
+        $advisory = Get-SettingAdvisory $card
+        Assert ($advisory -match 'must download') 'A missing display pack does not warn that Windows must download one.'
+        Assert ($advisory -match 'ten minutes') 'The warning does not say how long the download can take.'
+        Assert ($advisory -match 'fifteen') 'The warning does not say when Dingo gives up.'
+        Assert ($advisory -match 'Every other selected change still runs') 'The warning does not say the rest of the plan is unaffected.'
+        Assert ($advisory -match 'hold up the whole run') 'The warning does not say the run is held up.'
+        # A pack that is already present is not worth a warning.
+        function Get-DisplayLanguagePackSource { param([string]$Language) 'en-GB' }
+        Clear-DisplayPackCache
+        Assert (-not (Get-SettingAdvisory $card)) 'An installed display pack still warns about a download.'
+        # A card of any other kind is never given this warning.
+        function Get-DisplayLanguagePackSource { param([string]$Language) '' }
+        Clear-DisplayPackCache
+        Assert (-not (Get-SettingAdvisory ($script:Settings | Where-Object Id -eq 'hidden-files'))) 'A registry card was given the language download warning.'
+    }
+    Test-Case 'A language download is watched for real activity and gives up early when it stalls' {
+        $script:Shown = New-Object System.Collections.ArrayList
+        function Write-WorkerProgress { param($Phase,$Detail) [void]$script:Shown.Add([string]$Detail) }
+        try {
+            # Windows writes progress records into the job when a command reports
+            # any, so the newest record is what it is doing right now.
+            $fake = [pscustomobject]@{ ChildJobs=@([pscustomobject]@{ Progress=@(
+                [pscustomobject]@{ PercentComplete=10; StatusDescription='Downloading' }
+                [pscustomobject]@{ PercentComplete=64; StatusDescription='Installing' }
+            ) }) }
+            $report = Get-JobProgressReport $fake
+            Assert ($report.Percent -eq 64) "The newest progress record was not read; got $($report.Percent)."
+            Assert ($report.Status -eq 'Installing') 'The newest status line was not read.'
+            Assert ((Get-JobProgressReport $fake).Signal -eq $report.Signal) 'The same progress reads as a change.'
+            $empty = Get-JobProgressReport ([pscustomobject]@{ ChildJobs=@() })
+            Assert ($empty.Percent -eq -1 -and $empty.Count -eq 0) 'A job with no progress stream did not read as no news.'
+            # The real signal for a language pack: Install-Language reports no
+            # percentage at all, so Dingo watches what Windows servicing touches.
+            $real = Get-ServicingActivity
+            Assert ($real -is [string]) 'The servicing activity signal is not a plain string.'
+            Assert ((Get-ServicingActivity) -eq $real -or $true) 'Reading servicing activity must not throw.'
+            # Servicing frozen and no percentage: give up early and say so.
+            function Get-ServicingActivity { 'frozen' }
+            function Install-Language { param($Language,[switch]$ExcludeFeatures,[switch]$AsJob) Start-Job -ScriptBlock { Start-Sleep -Seconds 90 } }
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            Assert-Throws { Install-DisplayLanguagePack 'en-GB' 90 10 } 'Neither Windows Update nor the servicing logs changed'
+            Assert ($watch.Elapsed.TotalSeconds -lt 60) "A stall waited $([int]$watch.Elapsed.TotalSeconds)s instead of giving up early."
+            Assert (@($script:Shown | Where-Object { $_ -match 'Nothing has moved for' }).Count -gt 0) 'A stalling download never said it had stopped moving.'
+            Assert (@($script:Shown | Where-Object { $_ -match 'gives no percentage' }).Count -gt 0) 'Dingo did not say plainly that Windows gives no percentage.'
+            # Servicing busy: no false stall, even with no percentage at all.
+            $script:Shown.Clear()
+            $script:Beat = 0
+            function Get-ServicingActivity { $script:Beat++; "moving-$script:Beat" }
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            Assert-Throws { Install-DisplayLanguagePack 'en-GB' 14 6 } 'did not finish installing'
+            Assert ($watch.Elapsed.TotalSeconds -ge 12) 'A busy download was cut short by a false stall.'
+            Assert (@($script:Shown | Where-Object { $_ -match 'Last sign of activity' }).Count -gt 0) 'A busy download never reported its last sign of activity.'
+            # A percentage, when a command does report one, is preferred and named.
+            $script:Shown.Clear()
+            function Get-ServicingActivity { 'frozen' }
+            function Install-Language { param($Language,[switch]$ExcludeFeatures,[switch]$AsJob)
+                Start-Job -ScriptBlock { Write-Progress -Activity 'l' -Status 'Downloading' -PercentComplete 41; Start-Sleep -Seconds 90 } }
+            Assert-Throws { Install-DisplayLanguagePack 'en-GB' 90 10 } 'It sat at 41%'
+            Assert (@($script:Shown | Where-Object { $_ -match '41% done' }).Count -gt 0) 'The real percentage was never shown.'
+            # Keeps moving and finishes: no stall, no throw.
+            $script:Shown.Clear()
+            function Install-Language { param($Language,[switch]$ExcludeFeatures,[switch]$AsJob)
+                Start-Job -ScriptBlock { foreach ($i in 20,60,100) { Write-Progress -Activity 'l' -Status 'Downloading' -PercentComplete $i; Start-Sleep -Seconds 3 } } }
+            Install-DisplayLanguagePack 'en-GB' 90 5
+            Assert (@($script:Shown | Where-Object { $_ -match '100% done' }).Count -gt 0) 'A download that kept moving never reported completion.'
+        } finally {
+            Get-Job | Remove-Job -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-Case 'Switching display language replaces the account language list rather than adding to it' {
+        # Windows shows Store apps in the FIRST supported language of this list, so
+        # leaving an old entry above the chosen one quietly defeats the change.
+        $card = $script:Settings | Where-Object Id -eq 'language-au'
+        $script:Applied = $null
+        $script:Forced = $false
+        function Get-DisplayLanguagePackSource { param([string]$Language) 'en-GB' }
+        function Test-DisplayLanguagePackInstalled { param([string]$Language) $true }
+        function New-WinUserLanguageList { param([string]$Language) @([pscustomobject]@{ LanguageTag=$Language }) }
+        function Set-WinUserLanguageList { param($LanguageList,[switch]$Force) $script:Applied = @($LanguageList); $script:Forced = [bool]$Force }
+        function Set-WinUILanguageOverride { param([string]$Language) }
+        function Get-WinUserLanguageList { $script:Applied }
+        function Get-WinUILanguageOverride { [pscustomobject]@{ Name='en-AU' } }
+        function Get-ConfiguredDateTimeFormatState { '' }
+        Set-LanguageKindPart $card 'Australian English (en-AU)' 'User'
+        Assert (@($script:Applied).Count -eq 1) "The account language list kept $(@($script:Applied).Count) entries instead of one."
+        Assert (@($script:Applied)[0].LanguageTag -eq 'en-AU') 'The chosen language is not the only entry.'
+        Assert ($script:Forced) 'The language list was not replaced with -Force.'
+        # With no pack installed the account is never pointed at the language.
+        $script:Applied = $null
+        function Test-DisplayLanguagePackInstalled { param([string]$Language) $false }
+        Assert-Throws { Set-LanguageKindPart $card 'Australian English (en-AU)' 'User' } 'cannot be switched to it yet'
+        Assert ($null -eq $script:Applied) 'The account language list changed even though no display pack was installed.'
+    }
+    Test-Case 'No script variable shares a name with a command-line parameter' {
+        # A script parameter lives in the script scope, so a top-level
+        # $script:Name = '' of the same name silently wipes the value the script
+        # was started with. That is invisible until something far away misbehaves.
+        $parameterNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+        Assert ($parameterNames.Count -gt 5) 'The parameter block could not be read.'
+        # An assignment that reads the parameter on its own right-hand side is
+        # extending it on purpose, which is safe. One that does not is a wipe.
+        $wipes = New-Object System.Collections.ArrayList
+        $checked = 0
+        foreach ($statement in $ast.EndBlock.Statements) {
+            if ($statement -isnot [Management.Automation.Language.AssignmentStatementAst]) { continue }
+            $left = $statement.Left
+            if ($left -isnot [Management.Automation.Language.VariableExpressionAst]) { continue }
+            $path = $left.VariablePath.UserPath
+            if ($path -notlike 'script:*') { continue }
+            $checked++
+            $name = $path.Substring(7)
+            if ($parameterNames -notcontains $name) { continue }
+            $reads = @($statement.Right.FindAll({ param($node)
+                $node -is [Management.Automation.Language.VariableExpressionAst] -and
+                $node.VariablePath.UserPath -eq $name }, $true))
+            if (-not $reads.Count) { [void]$wipes.Add($name) }
+        }
+        Assert ($checked -gt 3) 'No top-level script variables were found to check.'
+        $clashes = @($wipes | Select-Object -Unique)
+        Assert ($clashes.Count -eq 0) "These script variables wipe the parameter of the same name: $($clashes -join ', ')."
+    }
+    Test-Case 'The administrator step can be stopped, and keeps what it already finished' {
+        $dir = Join-Path ([IO.Path]::GetTempPath()) ('dingo-cancel-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        $flag = Join-Path $dir 'cancel.flag'
+        $savedSettings = $script:Settings
+        try {
+            # With nowhere to look, nothing is ever treated as a stop request.
+            $script:WorkerCancelPath = ''
+            Assert (-not (Test-WorkerCancelled)) 'A worker with no cancel path thought it was stopped.'
+            $script:WorkerCancelPath = $flag
+            Assert (-not (Test-WorkerCancelled)) 'A missing stop file was read as a stop request.'
+            Set-Content -LiteralPath $flag -Value 'stop'
+            Assert (Test-WorkerCancelled) 'A stop file was not noticed.'
+            # A long download lets go promptly and says why.
+            function Write-WorkerProgress { param($Phase,$Detail) }
+            function Get-ServicingActivity { [Guid]::NewGuid().ToString() }
+            function Install-Language { param($Language,[switch]$ExcludeFeatures,[switch]$AsJob) Start-Job -ScriptBlock { Start-Sleep -Seconds 120 } }
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            Assert-Throws { Install-DisplayLanguagePack 'en-GB' 120 60 } 'Stopped at your request'
+            Assert ($watch.Elapsed.TotalSeconds -lt 30) "A stop took $([int]$watch.Elapsed.TotalSeconds)s to take effect."
+            # The plan loop stops between settings, never halfway through one, and
+            # every setting it did finish is still reported.
+            Remove-Item -LiteralPath $flag -Force
+            # Keyed to the setting, not to a call count, so how many scopes each
+            # setting happens to have cannot change what this test proves.
+            function Invoke-SettingPartResults { param($Setting,$State,$Scope)
+                if ($Setting.Id -eq 'b') { Set-Content -LiteralPath $flag -Value 'stop' }
+                @((New-OperationComponent 'Machine' 'Succeeded' 'ok')) }
+            $plan = @('a','b','c','d') | ForEach-Object { [pscustomobject]@{ Id=$_; DesiredState='x' } }
+            # Real enough for the real scope check: one computer-wide entry each.
+            $all = @('a','b','c','d') | ForEach-Object { [pscustomobject]@{ Id=$_; Name="card $_"; DesiredState='x'; Kind='Registry'; Entries=@([pscustomobject]@{ Scope='Machine' }) } }
+            # Assigned, not piped: the function returns its list with a leading comma,
+            # so a pipeline sees one list object rather than one result per setting.
+            $results = Invoke-AdministratorPlan $plan $all
+            $ids = @(foreach ($result in $results) { [string]$result.Id })
+            Assert ($ids.Count -eq 2) "A stopped plan reported $($ids.Count) settings instead of the 2 it finished."
+            Assert (($ids -join ',') -eq 'a,b') "A stopped plan lost or reordered what it finished: $($ids -join ',')."
+            $failed = @(foreach ($result in $results) { if (-not $result.Success) { $result } })
+            Assert ($failed.Count -eq 0) 'A stopped plan marked a finished setting as failed.'
+        } finally {
+            $script:Settings = $savedSettings
+            $script:WorkerCancelPath = ''
+            Get-Job | Remove-Job -Force -ErrorAction SilentlyContinue
+            Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+        }
+    }
+    Test-Case 'A slow language download runs last and alongside the quick settings' {
+        $savedSettings = $script:Settings
+        try {
+            $entry = @([pscustomobject]@{ Scope='Machine' })
+            $all = @(
+                [pscustomobject]@{ Id='timezone-utc'; Name='Time zone'; DesiredState='UTC'; Kind='Registry'; Entries=$entry }
+                [pscustomobject]@{ Id='language-au'; Name='Display language'; DesiredState='British English (en-GB)'; Kind='Language'; Entries=$entry }
+                [pscustomobject]@{ Id='onedrive'; Name='OneDrive'; DesiredState='Disabled'; Kind='Registry'; Entries=$entry }
+                [pscustomobject]@{ Id='edge-copilot'; Name='Copilot in Edge'; DesiredState='Disabled'; Kind='Registry'; Entries=$entry }
+            )
+            $plan = @($all | ForEach-Object { [pscustomobject]@{ Id=$_.Id; DesiredState=$_.DesiredState } })
+            function Get-AvailableDisplayLanguagePacks { @('en-GB') }
+            # No pack here, so the language step is the slow one and goes last.
+            function Get-DisplayLanguagePackSource { param([string]$Language) '' }
+            Clear-DisplayPackCache
+            $split = Split-SlowPlanRequests $plan $all
+            Assert ((@($split.Quick) | ForEach-Object { $_.Id }) -join ',' -eq 'timezone-utc,onedrive,edge-copilot') 'The quick settings were reordered or lost.'
+            Assert ((@($split.Slow) | ForEach-Object { $_.Id }) -join ',' -eq 'language-au') 'The slow language step was not separated out.'
+            # A pack that is already here is not slow, so nothing is moved.
+            function Get-DisplayLanguagePackSource { param([string]$Language) 'en-GB' }
+            Clear-DisplayPackCache
+            $split = Split-SlowPlanRequests $plan $all
+            Assert (@($split.Slow).Count -eq 0) 'A language whose pack is installed was treated as slow.'
+            Assert (@($split.Quick).Count -eq 4) 'Settings went missing when nothing was slow.'
+            # The download is started up front and taken over later, so the quick
+            # settings run while Windows fetches it rather than queueing behind it.
+            function Get-DisplayLanguagePackSource { param([string]$Language) '' }
+            Clear-DisplayPackCache
+            $script:Notes = New-Object System.Collections.ArrayList
+            function Write-Log { param($Level,$Message) [void]$script:Notes.Add([string]$Message) }
+            function Write-WorkerProgress { param($Phase,$Detail) }
+            function Install-Language { param($Language,[switch]$ExcludeFeatures,[switch]$AsJob) Start-Job -ScriptBlock { Start-Sleep -Seconds 6 } }
+            function Invoke-SettingPartResults { param($Setting,$State,$Scope)
+                if ($Setting.Kind -eq 'Language') { [void](Install-DisplayLanguagePack 'en-GB' 60 30) } else { Start-Sleep -Milliseconds 700 }
+                @((New-OperationComponent 'Machine' 'Succeeded' 'ok')) }
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            $results = Invoke-AdministratorPlan $plan $all
+            $elapsed = $watch.Elapsed.TotalSeconds
+            $ids = @(foreach ($result in $results) { [string]$result.Id })
+            Assert (($ids -join ',') -eq 'timezone-utc,onedrive,edge-copilot,language-au') "The plan ran in the order $($ids -join ',')."
+            # Three quick settings of 0.7s plus a 6s download is 8.1s one after the
+            # other. Overlapped it is about 6s, so anything under 7.5s proves it.
+            Assert ($elapsed -lt 7.5) "The download did not overlap the quick settings: the plan took $([math]::Round($elapsed,1))s."
+            Assert ($elapsed -ge 5.5) "The download did not actually run: the plan took $([math]::Round($elapsed,1))s."
+            Assert (@($script:Notes | Where-Object { $_ -match 'in the background' }).Count -gt 0) 'The early download was never started.'
+            Assert (@($script:Notes | Where-Object { $_ -match 'Taking over' }).Count -gt 0) 'The early download was started but not used.'
+            # Starting it twice would download it twice.
+            Clear-DisplayPackCache
+            $script:Notes.Clear()
+            Assert ((Start-DisplayLanguagePackPrefetch @('en-GB')) -eq 'en-GB') 'The first request did not start a download.'
+            Assert ((Start-DisplayLanguagePackPrefetch @('en-GB')) -eq '') 'The same pack was queued for download twice.'
+            Stop-PrestartedPackJobs
+            # A pack already present is never downloaded again.
+            function Get-DisplayLanguagePackSource { param([string]$Language) 'en-GB' }
+            Clear-DisplayPackCache
+            Assert ((Start-DisplayLanguagePackPrefetch @('en-GB')) -eq '') 'An installed pack was queued for download.'
+            # A download nobody took over is dropped rather than left running.
+            function Get-DisplayLanguagePackSource { param([string]$Language) '' }
+            Clear-DisplayPackCache
+            [void](Start-DisplayLanguagePackPrefetch @('en-GB'))
+            Stop-PrestartedPackJobs
+            Assert ($null -eq (Get-PrestartedPackJob 'en-GB')) 'A dropped download was still on offer.'
+        } finally {
+            $script:Settings = $savedSettings
+            Clear-DisplayPackCache
+            Get-Job | Remove-Job -Force -ErrorAction SilentlyContinue
+        }
+    }
     Test-Case 'An unknown word is refused and the sections are named' {
         Assert-Throws { Resolve-QuickApplySettings $script:Settings @('tweeks') @() } "tweeks"
         Assert-Throws { Resolve-QuickApplySettings $script:Settings @('tweeks') @() } "'tweaks' and 'tools'"
