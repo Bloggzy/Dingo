@@ -134,7 +134,7 @@ Each card offers a list to choose from.
 | --- | --- | --- | --- |
 | `timezone-utc` | Time zone | yes | UTC |
 | `region-australia` | Region and formats | no | Australia (en-AU) |
-| `language-au` | Display language | yes | British English (en-GB) |
+| `display-language` | Display language | yes | British English (en-GB) |
 | `iso-time` | Date and time format | no | yyyy-MM-dd HH:mm |
 
 ### Taskbar

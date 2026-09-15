@@ -2198,7 +2198,7 @@ function Get-Settings {
 
     [void]$settings.Add((New-Setting 'timezone-utc' 'Region & language' 'Time zone' 'The clock this computer runs on. UTC is preferred, because a timeline read in UTC needs no conversion.' 'UTC' $null 'TimeZone' @() $false $false -StateChoices (Get-TimeZoneChoices)))
     [void]$settings.Add((New-Setting 'region-australia' 'Region & language' 'Region and formats' 'The country and number, currency, and date formats Windows uses for this account. Australia is preferred.' 'Australia (en-AU)' $null 'Region' @() $false $false -StateChoices (@((Get-RegionChoiceTable).Keys))))
-    [void]$settings.Add((New-Setting 'language-au' 'Region & language' 'Display language' 'The language of the Windows interface, keyboard, and spelling, and the system locale. British English is preferred. Some choices, such as Australian English, are supplied through another language pack, because Windows ships no separate interface for them.' 'British English (en-GB)' $null 'Language' @() $false $true -StateChoices (@((Get-LanguageChoiceTable).Keys))))
+    [void]$settings.Add((New-Setting 'display-language' 'Region & language' 'Display language' 'The language of the Windows interface, keyboard, and spelling, and the system locale. British English is preferred. Some choices, such as Australian English, are supplied through another language pack, because Windows ships no separate interface for them.' 'British English (en-GB)' $null 'Language' @() $false $true -StateChoices (@((Get-LanguageChoiceTable).Keys))))
     # Every date and time choice sets the same seven values, so each entry
     # carries one value per choice instead of a single preferred value.
     $dateTimeFormats = Get-DateTimeFormatChoices
