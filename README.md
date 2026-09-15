@@ -81,6 +81,8 @@ Step 2 of 2: applying and checking all 43 change(s).
   1/43 [timezone-utc] Succeeded: UTC
 ```
 
+A change that is going to cost real time says so before the work starts, as a **Note** line. The display language is the one that matters: if this computer has no pack for the language you chose, Windows must fetch it from Windows Update, and that one step usually takes about ten minutes. Every other selected change still runs. Deselect the display language, or pick a language whose pack is already on the machine, to keep a run to a minute or two.
+
 The word is **change**, not setting. A plan holds Windows settings, but also tools to install, shortcuts to write, file types to claim, and the PATH.
 
 **Step 1** is the part Windows must approve. It runs first, in a second process, so it is counted out of its own total. A line appears as each change finishes.

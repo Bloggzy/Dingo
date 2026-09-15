@@ -4347,6 +4347,19 @@ if ($SelfTest) {
     # Both counts must be named, so nobody has to guess what 26 and 43 mean.
     if ($sourceText -notmatch 'Step 1 of 2: \$administratorCount of the \$planCount change') { throw 'The administrator count must say what it counts.' }
     if ($sourceText -notmatch 'Step 2 of 2: applying and checking all \$planCount change') { throw 'The whole-plan count must say what it counts.' }
+    # A caveat has to reach the screen before the work starts, or a ten minute
+    # download is just an unexplained wait. A dry run has always printed them;
+    # so must a real run, and before the administrator step is started.
+    $noteOffset = $sourceText.IndexOf('Write-CliStatus "  Note [$($item.Id)]: $advisory"')
+    $adminStartOffset = $sourceText.IndexOf('$operation = Start-AdministratorChanges $selected')
+    if ($noteOffset -lt 0) { throw 'A quick apply must print the caveats it knows about.' }
+    if ($adminStartOffset -lt 0 -or $noteOffset -gt $adminStartOffset) { throw 'Caveats must be printed before the administrator step starts.' }
+    if ($noteOffset -lt $quickApplyOffset) { throw 'The caveats must belong to the quick-apply block.' }
+    # The display language caveat is the one that costs real time, so prove it
+    # says how long, rather than only that something is slow.
+    foreach ($mustSay in @('about ten minutes', 'Windows Update', 'every other selected change still runs')) {
+        if ($sourceText -notmatch [regex]::Escape($mustSay)) { throw "The display language caveat no longer says '$mustSay'." }
+    }
     # A plan holds tools, shortcuts, file types and the PATH as well as Windows
     # settings, so no count may call the whole lot "settings".
     foreach ($countedLine in @($sourceText -split "`n" | Where-Object { $_ -match 'Write-CliStatus' -and $_ -match '\$planCount|\$\(\$selected\.Count\)' })) {
@@ -4667,6 +4680,16 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             if ($skippedNotice) { Write-CliStatus $skippedNotice }
             Write-Log 'INFO' "Quick apply started for $planCount change(s)."
             if ($skippedNotice) { Write-Log 'INFO' $skippedNotice }
+            # A caveat is worth far more before the work starts than in the
+            # results afterwards. A dry run has always printed these. A real run
+            # did not, so the display language pack, which alone can turn a two
+            # minute run into ten, arrived as an unexplained wait.
+            foreach ($item in $selected) {
+                $advisory = Get-SettingAdvisory $item
+                if (-not $advisory) { continue }
+                Write-CliStatus "  Note [$($item.Id)]: $advisory"
+                Write-Log 'INFO' "Caveat [$($item.Id)]: $advisory"
+            }
             $administratorResults = @{}
             $administratorCount = @($selected | Where-Object RequiresAdmin).Count
             if ($administratorCount) {
