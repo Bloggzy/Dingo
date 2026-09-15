@@ -1,0 +1,7 @@
+# The Sponsor button GitHub shows at the top of the repository page.
+#
+# The key is the platform and the value is the username on it, not a URL:
+# `buy_me_a_coffee: bloggz` is what produces https://buymeacoffee.com/bloggz.
+# This file has to sit at .github/FUNDING.yml on the default branch or GitHub
+# does not look at it.
+buy_me_a_coffee: bloggz
