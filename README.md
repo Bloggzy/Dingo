@@ -19,9 +19,9 @@ Current version: **0.7.5**.
 1. Copy the whole Dingo folder to the machine.
 2. Double-click `Start-Dingo.cmd`. Do **not** use *Run as administrator*. Dingo asks for administrator rights later, only when it needs them.
 3. Pick a section:
-   - **Tweaks** — Windows settings (My account / Whole computer).
-   - **Tools** — Install tools, Tool shortcuts, File associations.
-   - **Options** — Dingo's own choices, such as the log folder and where tools are installed.
+   - **Tweaks** - Windows settings (My account / Whole computer).
+   - **Tools** - Install tools, Tool shortcuts, File associations.
+   - **Options** - Dingo's own choices, such as the log folder and where tools are installed.
 4. Turn on the switch on each card you want, or press **Choose all my preferred settings**.
 5. Press **Apply selected changes**. Windows asks for approval if the plan touches the whole computer.
 
@@ -295,7 +295,7 @@ These are isolated checks with mocked installers. They write no registry values.
 
 ## Credits
 
-**[Chris Titus Tech's WinUtil](https://github.com/ChrisTitusTech/winutil)** — most of Dingo's funtionality and features were inspired by this excellent project. Some of the Windows settings and tweaks, and the Edge debloat options come from WinUtil's well-researched `EdgeDebloat` list. WinUtil is a reference only. Dingo does not bundle or run any part of it.
+**[Chris Titus Tech's WinUtil](https://github.com/ChrisTitusTech/winutil)** - most of Dingo's funtionality and features were inspired by this excellent project. Some of the Windows settings and tweaks, and the Edge debloat options come from WinUtil's well-researched `EdgeDebloat` list. WinUtil is a reference only. Dingo does not bundle or run any part of it.
 
 - Microsoft's [Edge policy reference](https://learn.microsoft.com/en-us/deployedge/microsoft-edge-policies), for policy names, types, and values.
 - Eric Lawrence's [Managing Edge via Policy](https://textslashplain.com/2020/08/24/managing-edge-via-policy/), which explains why some Edge policies are ignored on unmanaged devices.
