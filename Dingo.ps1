@@ -4326,6 +4326,13 @@ if ($SelfTest) {
     # A step with nothing running must return at once rather than wait for ever.
     Wait-AdministratorChangesOnConsole $null
     Wait-AdministratorChangesOnConsole ([PSCustomObject]@{ Process=$null; ProgressPath='' })
+    # Closing File Explorer repaints every console on the desktop, so a command
+    # line run must have finished printing before it happens. Otherwise stale
+    # lines are redrawn over the results and a good run looks like a bad one.
+    $finishedOffset = $sourceText.IndexOf('Dingo finished: $succeeded succeeded')
+    $restartOffset = $sourceText.IndexOf('if ($restartExplorer -and -not $NoRestartExplorer)')
+    if ($finishedOffset -lt 0 -or $restartOffset -lt 0) { throw 'The quick-apply ending could not be found in the source.' }
+    if ($restartOffset -lt $finishedOffset) { throw 'A command-line run must print its results before File Explorer is restarted.' }
     $pathSetting = $script:Settings | Where-Object Id -eq 'tools-on-path' | Select-Object -First 1
     if (-not $pathSetting) { throw 'The command-line access setting is missing.' }
     if ($pathSetting.Tab -ne 'Tool shortcuts' -or -not $pathSetting.RequiresAdmin -or -not $pathSetting.CanChoose) {
@@ -4648,7 +4655,6 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
                 $resultId = $_.Id
                 $selected | Where-Object { $_.Id -eq $resultId -and $_.RestartExplorer }
             }).Count -gt 0
-            if ($restartExplorer -and -not $NoRestartExplorer) { [void](Restart-DesktopExplorer) }
             $resultRows = @($results | ForEach-Object {
                 $item = $selected | Where-Object Id -eq $_.Id | Select-Object -First 1
                 [PSCustomObject]@{ Id=$_.Id; Outcome=$_.Outcome; CurrentStatus=$item.CurrentState.Status; CurrentState=$item.CurrentState.DisplayText; State=$item.CurrentState; VerificationBasis=(Get-VerificationDescription $item); Message=$_.Message; Components=$_.Components }
@@ -4666,6 +4672,13 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             } else {
                 [Console]::Out.WriteLine(($resultRows | Format-Table Id,Outcome,CurrentState,Message -AutoSize | Out-String -Width 220).TrimEnd())
                 Write-CliStatus "Dingo finished: $succeeded succeeded; $partial partially applied; $failed failed. Log: $script:LogFile"
+            }
+            # Last of all, because closing File Explorer repaints every console
+            # on the desktop. Doing it earlier redraws stale lines over the
+            # results table, and the run then looks like it went wrong.
+            if ($restartExplorer -and -not $NoRestartExplorer) {
+                Write-CliStatus 'Restarting File Explorer to finish. The desktop blinks once.'
+                [void](Restart-DesktopExplorer)
             }
             Write-Log 'INFO' "Quick apply finished: $succeeded succeeded; $partial partially applied; $failed failed."
         }
