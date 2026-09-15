@@ -77,8 +77,8 @@ Step 1 of 2: 26 of the 43 change(s) need administrator approval.
   still working: Display language: Downloading - Windows is downloading the en-GB pack... [3:00 so far]
   26/26 Display language
 Step 2 of 2: applying and checking all 43 change(s).
-  1/43 [timezone-utc] Applying UTC...
-  1/43 [timezone-utc] Succeeded: UTC
+  1/43 [time-zone] Applying UTC...
+  1/43 [time-zone] Succeeded: UTC
 ```
 
 A change that is going to cost real time says so before the work starts, as a **Note** line. The display language is the one that matters: if this computer has no pack for the language you chose, Windows must fetch it from Windows Update, and that one step usually takes about ten minutes. Every other selected change still runs. Deselect the display language, or pick a language whose pack is already on the machine, to keep a run to a minute or two.
@@ -136,16 +136,18 @@ Do not apply changes from an elevated console. Dingo must stay in your signed-in
 
 Forty-three cards. The ID is what `-Include` and `-Exclude` accept. **Admin** means Windows asks for approval.
 
+An ID names the setting, never a value it can hold. `time-zone`, not `timezone-utc`: UTC is one choice of many, and an ID that names it goes stale the day a second choice appears. A test holds this for every card that offers a list.
+
 ### Region and language
 
 Each card offers a list to choose from.
 
 | ID | Setting | Admin | Preferred |
 | --- | --- | --- | --- |
-| `timezone-utc` | Time zone | yes | UTC |
-| `region-australia` | Region and formats | no | Australia (en-AU) |
+| `time-zone` | Time zone | yes | UTC |
+| `region` | Region and formats | no | Australia (en-AU) |
 | `display-language` | Display language | yes | Australian English (en-AU) |
-| `iso-time` | Date and time format | no | yyyy-MM-dd HH:mm |
+| `date-time-format` | Date and time format | no | yyyy-MM-dd HH:mm |
 
 ### Taskbar
 
@@ -155,14 +157,14 @@ Each card offers a list to choose from.
 | `task-view` | Task View button | no | Hidden |
 | `widgets` | Windows Widgets | no | Removed for this account |
 | `resume` | Cross-device Resume | yes | Disabled |
-| `never-combine` | Combine taskbar buttons | no | Never combine |
+| `taskbar-combine` | Combine taskbar buttons | no | Never combine |
 | `end-task` | End task on right-click | no | Enabled |
 
 ### File Explorer
 
 | ID | Setting | Admin | Preferred |
 | --- | --- | --- | --- |
-| `explorer-this-pc` | Default landing page | no | This PC |
+| `explorer-landing` | Default landing page | no | This PC |
 | `hidden-files` | Hidden files and folders | no | Shown |
 | `file-extensions` | File-name extensions | no | Shown |
 | `protected-files` | Protected system files | no | Shown (caution) |
