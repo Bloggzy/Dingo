@@ -33,6 +33,7 @@ param(
     [string]$ProgressPath,
     [string]$CancelPath,
     [string]$TargetUserSid,
+    [string]$ToolRoot,
     [Parameter(ValueFromRemainingArguments=$true)]
     [object[]]$UnexpectedArguments
 )
@@ -56,11 +57,25 @@ $script:PendingApply = $null
 $script:ApplyInProgress = $false
 $script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.7.4'
+$script:DingoVersion = '0.7.5'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
-$script:ShimDirectory = 'C:\DFIR\Tools\bin'
+# Where tools that carry no installer of their own are put. Every catalog path
+# is written with the token below instead of a literal folder, so one option can
+# move them all. Initialize-DingoToolRoot fills the token in.
+$script:DefaultToolRoot = 'C:\DFIR\Tools'
+$script:ToolRootToken = '%DINGO_TOOL_ROOT%'
+$script:ToolRootVariableName = 'DINGO_TOOL_ROOT'
+# Named apart from the -ToolRoot parameter on purpose: a script parameter lives
+# in the script scope, so reusing the name here would wipe the value an elevated
+# step was started with.
+$script:ActiveToolRoot = $script:DefaultToolRoot
+$script:ToolRootWarning = ''
+$script:ToolRootRejected = $false
+$script:ToolRootRejectMessage = ''
+# A folder inside the tools folder, so moving the tools folder moves this too.
+$script:ShimDirectory = Join-Path $script:DefaultToolRoot 'bin'
 # Only files carrying this marker are ever deleted, so a launcher someone wrote
 # by hand in the same folder is left alone.
 $script:ShimMarker = 'REM Written by Dingo. Safe to delete.'
@@ -150,6 +165,10 @@ if (-not ($SelfTest -or $StateSelfTest -or $UiSelfTest -or $ApplyPreferred -or $
     }
     try {
         $hostArguments = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}" -WpfHost' -f $PSCommandPath
+        # A tools folder asked for on the command line is for this run only, so it
+        # is handed to the window rather than saved. The window checks it and says
+        # on the Options tab if it cannot be used.
+        if ($ToolRoot) { $hostArguments += ' -ToolRoot "{0}"' -f $ToolRoot }
         $hostProcess = Start-Process -FilePath (Get-PowerShellHostPath) -ArgumentList $hostArguments -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
         # Bring the console back for a failure, so the launcher's pause prompt and
         # any error text are on a window the person can actually see.
@@ -645,6 +664,125 @@ function Get-JsonField($Object, [string]$Name, $Default = $null) {
     return $property.Value
 }
 
+function Get-DingoConfigPath {
+    # Per-user and outside the script folder, so changing an option never needs
+    # administrator approval and a copied-in Dingo folder stays untouched.
+    Join-Path $env:LOCALAPPDATA 'Dingo\config.json'
+}
+
+function Test-PathIsOnLocalDrive([string]$Path) {
+    # True only for a full path on a drive letter of this computer, with at least
+    # one folder name after the drive. A network path is deliberately excluded.
+    $value = [string]$Path
+    if ($value.Length -lt 4) { return $false }
+    if ($value[0] -notmatch '[A-Za-z]' -or $value[1] -ne ':') { return $false }
+    if ($value[2] -ne [IO.Path]::DirectorySeparatorChar -and $value[2] -ne [IO.Path]::AltDirectorySeparatorChar) { return $false }
+    return $true
+}
+
+function Test-ToolRootIsUsable([string]$Value) {
+    # Returns the reason the folder cannot be used, or an empty string when it
+    # can. One rule set is used by the option, by the command line, and by the
+    # elevated worker, so all three agree.
+    if ([string]::IsNullOrWhiteSpace($Value)) { return 'Type a folder path.' }
+    $trimmed = ([string]$Value).Trim()
+    if ($trimmed.IndexOfAny([IO.Path]::GetInvalidPathChars()) -ge 0) { return 'That path holds a character Windows does not allow in a path.' }
+    if ($trimmed -match '[*?%"<>|]') { return 'Use a plain folder path, with no * ? % " < > or | in it.' }
+    if (-not (Test-PathIsOnLocalDrive $trimmed)) { return 'Use a full path on a drive of this computer, such as D:\DFIR\Tools. A network path is not supported.' }
+    try { $full = ([IO.Path]::GetFullPath($trimmed)).TrimEnd('\') } catch { return 'Windows could not read that as a folder path.' }
+    if ($full -match '^[A-Za-z]:$') { return 'Choose a folder on the drive, not the drive itself.' }
+    $driveRoot = $full.Substring(0,3)
+    if (-not (Test-Path -LiteralPath $driveRoot -PathType Container)) { return "Drive $($full.Substring(0,2)) is not on this computer." }
+    # A folder on the computer PATH must not be writable by a standard account,
+    # or one account could drop a program there that every other account runs.
+    # These trees are either owned by Windows or writable by their owner.
+    $forbidden = @(
+        [PSCustomObject]@{ Path=$env:SystemRoot; Reason='Windows owns that folder.' },
+        [PSCustomObject]@{ Path=${env:ProgramFiles}; Reason='That folder is for programs with their own installer.' },
+        [PSCustomObject]@{ Path=${env:ProgramFiles(x86)}; Reason='That folder is for programs with their own installer.' },
+        [PSCustomObject]@{ Path=(Join-Path $env:SystemDrive 'Users'); Reason='A folder inside an account profile can be changed by that account, and the launcher folder goes on the computer PATH.' }
+    )
+    foreach ($entry in $forbidden) {
+        if ([string]::IsNullOrWhiteSpace([string]$entry.Path)) { continue }
+        $root = ([string]$entry.Path).TrimEnd('\')
+        if ($full -ieq $root -or $full.StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase)) {
+            return "Choose a folder outside $root. $($entry.Reason)"
+        }
+    }
+    return ''
+}
+
+function Resolve-ToolRootValue([string]$Value) {
+    $reason = Test-ToolRootIsUsable $Value
+    if ($reason) { throw $reason }
+    return ([IO.Path]::GetFullPath(([string]$Value).Trim())).TrimEnd('\')
+}
+
+function Set-DingoToolRoot([string]$Value) {
+    $resolved = Resolve-ToolRootValue $Value
+    $script:ActiveToolRoot = $resolved
+    $script:ShimDirectory = Join-Path $resolved 'bin'
+    # Every catalog path carries the token, and every place that uses one asks
+    # Windows to expand it, so setting the variable in this process is what gives
+    # the token a meaning. A child process inherits it.
+    [Environment]::SetEnvironmentVariable($script:ToolRootVariableName, $resolved, 'Process')
+    return $resolved
+}
+
+function Expand-ToolRootPath([string]$Path) {
+    # The token is expanded by Windows like any other environment variable. This
+    # wrapper exists so a path that still holds the token after expansion is
+    # caught here rather than becoming a folder with a '%' in its name.
+    $expanded = [Environment]::ExpandEnvironmentVariables([string]$Path)
+    if ($expanded -like "*$($script:ToolRootToken)*") { throw "The tools folder is not set, so '$Path' could not be resolved." }
+    return $expanded
+}
+
+function Read-DingoToolRootPreference([string]$Path = '') {
+    $path = if ($Path) { $Path } else { Get-DingoConfigPath }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return '' }
+    try {
+        $decoded = Read-JsonFileTolerantly $path
+        return ([string](Get-JsonField $decoded 'toolRoot' '')).Trim()
+    } catch {
+        $script:ToolRootWarning = "Dingo could not read its options file '$path', so the default tools folder is being used. $($_.Exception.Message)"
+        return ''
+    }
+}
+
+function Save-DingoToolRootPreference([string]$Value, [string]$Path = '') {
+    $resolved = Resolve-ToolRootValue $Value
+    $path = if ($Path) { $Path } else { Get-DingoConfigPath }
+    $directory = [IO.Path]::GetDirectoryName($path)
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        New-Item -ItemType Directory -Path $directory -Force -ErrorAction Stop | Out-Null
+    }
+    Write-Utf8FileAtomically $path (ConvertTo-Json -InputObject ([PSCustomObject]@{ toolRoot = $resolved }) -Depth 3)
+    Write-Log 'INFO' "Saved the tools folder '$resolved' to $path."
+    return $resolved
+}
+
+function Initialize-DingoToolRoot {
+    # Order: what an elevated step was told on its command line, then the saved
+    # option, then the built-in default. The elevated step is told explicitly
+    # because it can run as another account, which has another options file.
+    $wanted = if ($ToolRoot) { ([string]$ToolRoot).Trim() } else { Read-DingoToolRootPreference }
+    if ($wanted) {
+        $reason = Test-ToolRootIsUsable $wanted
+        if ($reason) {
+            # An elevated step must never quietly install somewhere else than
+            # the window asked for, so the flag is checked by that step and the
+            # run is refused with this reason.
+            $script:ToolRootRejected = $true
+            $script:ToolRootRejectMessage = "The tools folder '$wanted' cannot be used. $reason"
+            $script:ToolRootWarning = "The tools folder '$wanted' cannot be used, so $($script:DefaultToolRoot) is being used instead. $reason"
+            $wanted = ''
+        }
+    }
+    if (-not $wanted) { $wanted = $script:DefaultToolRoot }
+    return (Set-DingoToolRoot $wanted)
+}
+
 function ConvertTo-ToolDefinition($Raw) {
     $id = [string](Get-JsonField $Raw 'id' '')
     if ($id -notmatch '^tool-[a-z0-9][a-z0-9-]*$') { throw "Tool id '$id' must look like 'tool-example'." }
@@ -823,39 +961,39 @@ function Get-BuiltInToolCatalog {
                 kind='script'; scope='machine'
                 url='https://raw.githubusercontent.com/EricZimmerman/Get-ZimmermanTools/d808d1dfe6446faf884576a8a1c11b6875197a19/Get-ZimmermanTools.ps1'
                 sha256='B9122527E7049D2AB3F9A58BC972189AAC62FAD9A83FDA59EA6B70C7360D7834'
-                dest='C:\DFIR\Tools\EZTools'
+                dest='%DINGO_TOOL_ROOT%\EZTools'
                 arguments=@('-NetVersion','9')
                 timeoutMinutes=45
             }
-            shims=[PSCustomObject]@{ from='C:/DFIR/Tools/EZTools/net9'; pattern='*.exe'; recurse=$true }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/EZTools/net9'; pattern='*.exe'; recurse=$true }
             # Timeline Explorer is the reason most analysts open a csv at all.
             # .dat goes to Registry Explorer: on an analysis VM a .dat file is
             # almost always a registry hive, NTUSER.DAT or UsrClass.dat. Windows
             # leaves .dat unclaimed, so Dingo can take it.
             associations=@(
-                [PSCustomObject]@{ extension='.csv'; target='C:/DFIR/Tools/EZTools/net9/TimelineExplorer/TimelineExplorer.exe'; description='Comma separated values' },
-                [PSCustomObject]@{ extension='.tsv'; target='C:/DFIR/Tools/EZTools/net9/TimelineExplorer/TimelineExplorer.exe'; description='Tab separated values' },
-                [PSCustomObject]@{ extension='.dat'; target='C:/DFIR/Tools/EZTools/net9/RegistryExplorer/RegistryExplorer.exe'; description='Registry hive' }
+                [PSCustomObject]@{ extension='.csv'; target='%DINGO_TOOL_ROOT%/EZTools/net9/TimelineExplorer/TimelineExplorer.exe'; description='Comma separated values' },
+                [PSCustomObject]@{ extension='.tsv'; target='%DINGO_TOOL_ROOT%/EZTools/net9/TimelineExplorer/TimelineExplorer.exe'; description='Tab separated values' },
+                [PSCustomObject]@{ extension='.dat'; target='%DINGO_TOOL_ROOT%/EZTools/net9/RegistryExplorer/RegistryExplorer.exe'; description='Registry hive' }
             )
             # Get-ZimmermanTools makes no shortcuts at all, so the window tools are
             # invisible in the Start menu. A target that is not on disk is skipped.
             shortcuts=@(
-                [PSCustomObject]@{ name='Timeline Explorer'; target='C:/DFIR/Tools/EZTools/net9/TimelineExplorer/TimelineExplorer.exe' },
-                [PSCustomObject]@{ name='Registry Explorer'; target='C:/DFIR/Tools/EZTools/net9/RegistryExplorer/RegistryExplorer.exe' },
-                [PSCustomObject]@{ name='MFT Explorer'; target='C:/DFIR/Tools/EZTools/net9/MFTExplorer/MFTExplorer.exe' },
-                [PSCustomObject]@{ name='ShellBags Explorer'; target='C:/DFIR/Tools/EZTools/net9/ShellBagsExplorer/ShellBagsExplorer.exe' },
-                [PSCustomObject]@{ name='Jump List Explorer'; target='C:/DFIR/Tools/EZTools/net9/JumpListExplorer/JumpListExplorer.exe' },
-                [PSCustomObject]@{ name='SDB Explorer'; target='C:/DFIR/Tools/EZTools/net9/SDBExplorer/SDBExplorer.exe' },
-                [PSCustomObject]@{ name='EZViewer'; target='C:/DFIR/Tools/EZTools/net9/EZViewer/EZViewer.exe' }
+                [PSCustomObject]@{ name='Timeline Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/TimelineExplorer/TimelineExplorer.exe' },
+                [PSCustomObject]@{ name='Registry Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/RegistryExplorer/RegistryExplorer.exe' },
+                [PSCustomObject]@{ name='MFT Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/MFTExplorer/MFTExplorer.exe' },
+                [PSCustomObject]@{ name='ShellBags Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/ShellBagsExplorer/ShellBagsExplorer.exe' },
+                [PSCustomObject]@{ name='Jump List Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/JumpListExplorer/JumpListExplorer.exe' },
+                [PSCustomObject]@{ name='SDB Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/SDBExplorer/SDBExplorer.exe' },
+                [PSCustomObject]@{ name='EZViewer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/EZViewer/EZViewer.exe' }
             )
             requires=@('tool-dotnet-desktop-9')
             # A minimum inventory, not proof that every upstream tool downloaded.
             detectMode='all'
             detect=@(
-                [PSCustomObject]@{ kind='file'; path='C:/DFIR/Tools/EZTools/net9/TimelineExplorer/TimelineExplorer.exe' },
-                [PSCustomObject]@{ kind='file'; path='C:/DFIR/Tools/EZTools/net9/RegistryExplorer/RegistryExplorer.exe' },
-                [PSCustomObject]@{ kind='file'; path='C:/DFIR/Tools/EZTools/net9/EvtxECmd/EvtxECmd.exe' },
-                [PSCustomObject]@{ kind='file'; path='C:/DFIR/Tools/EZTools/net9/RECmd/RECmd.exe' }
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/EZTools/net9/TimelineExplorer/TimelineExplorer.exe' },
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/EZTools/net9/RegistryExplorer/RegistryExplorer.exe' },
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/EZTools/net9/EvtxECmd/EvtxECmd.exe' },
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/EZTools/net9/RECmd/RECmd.exe' }
             )
         },
         [PSCustomObject]@{
@@ -961,7 +1099,7 @@ function Find-ToolDetectionRule($rule) {
             $entry = Get-UninstallEntry $rule.Match
             if ($entry) { return [PSCustomObject]@{ Version=(Get-DisplayVersion $entry.Version); Evidence="Windows lists it as '$($entry.Name)'." } }
         } elseif ($rule.Kind -eq 'file') {
-            $path = [Environment]::ExpandEnvironmentVariables($rule.Path)
+            $path = Expand-ToolRootPath $rule.Path
             if ($path.Contains('*') -or $path.Contains('?')) {
                 # A wildcard lets a rule match a versioned folder, such as the
                 # .NET runtime, whose exact patch number is not known in advance.
@@ -1233,12 +1371,16 @@ function Install-ScriptPackage($Tool) {
         if ($expected -and $hash -ine $expected) { throw "Installer SHA256 mismatch for $($Tool.Name); the script was not executed." }
         if (-not $expected) { Write-Log 'WARN' "No expected SHA256 configured for $($Tool.Name). Recorded provenance is not a trust check." }
 
-        if (-not (Test-Path -LiteralPath $Tool.Dest -PathType Container)) {
-            New-Item -ItemType Directory -Path $Tool.Dest -Force -ErrorAction Stop | Out-Null
-            Write-Log 'INFO' "Created $($Tool.Dest)."
+        # The catalog names the folder with the tools-folder token, so resolve it
+        # here and check the result before a folder is made or a script runs.
+        $destination = Expand-ToolRootPath $Tool.Dest
+        if (-not (Test-PathIsOnLocalDrive $destination)) { throw "The install folder '$destination' for $($Tool.Name) is not a full path on a drive of this computer." }
+        if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
+            New-Item -ItemType Directory -Path $destination -Force -ErrorAction Stop | Out-Null
+            Write-Log 'INFO' "Created $destination."
         }
-        $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-NonInteractive','-File',$scriptPath,'-Dest',$Tool.Dest) + @($Tool.Arguments)
-        Write-Log 'INFO' "Running the $($Tool.Name) install script into $($Tool.Dest)."
+        $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-NonInteractive','-File',$scriptPath,'-Dest',$destination) + @($Tool.Arguments)
+        Write-Log 'INFO' "Running the $($Tool.Name) install script into $destination."
         $run = Invoke-ChildProcess (Get-PowerShellHostPath) $arguments $Tool.TimeoutSeconds "The $($Tool.Name) install script"
         Write-Log 'DEBUG' "Install script exit code $($run.ExitCode) for $($Tool.Name): $(Get-OutputTail $run.Output 2000)"
         if ($run.ExitCode -ne 0) {
@@ -1320,7 +1462,7 @@ function Get-ExpectedShims {
     $shims = New-Object System.Collections.Specialized.OrderedDictionary
     foreach ($tool in (Get-ToolCatalog)) {
         if (-not $tool.Shims) { continue }
-        $from = [Environment]::ExpandEnvironmentVariables($tool.Shims.From)
+        $from = Expand-ToolRootPath $tool.Shims.From
         if (-not (Test-Path -LiteralPath $from -PathType Container)) { continue }
         foreach ($file in @(Get-ChildItem -LiteralPath $from -Filter $tool.Shims.Pattern -File -Recurse:$tool.Shims.Recurse -ErrorAction SilentlyContinue)) {
             $name = [IO.Path]::GetFileNameWithoutExtension($file.Name)
@@ -1442,7 +1584,7 @@ function Get-ExpectedShortcuts {
     $wanted = New-Object System.Collections.Specialized.OrderedDictionary
     foreach ($tool in (Get-ToolCatalog)) {
         foreach ($shortcut in @($tool.Shortcuts)) {
-            $target = [Environment]::ExpandEnvironmentVariables($shortcut.Target)
+            $target = Expand-ToolRootPath $shortcut.Target
             # The tool may not be installed, or this program may not be part of it.
             if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { continue }
             if ($wanted.Contains($shortcut.Name)) {
@@ -1577,7 +1719,7 @@ function Join-WordList([string[]]$Words) {
 function Get-AssociationProgId($Association) {
     # One handler name per program, so two tools can never collide, and so a
     # name starting with Dingo. always means Dingo put it there.
-    $stem = [IO.Path]::GetFileNameWithoutExtension([Environment]::ExpandEnvironmentVariables($Association.Target))
+    $stem = [IO.Path]::GetFileNameWithoutExtension((Expand-ToolRootPath $Association.Target))
     return $script:AssociationProgIdPrefix + ($stem -replace '[^A-Za-z0-9]', '')
 }
 
@@ -1585,7 +1727,7 @@ function Get-AssociationTarget($Association) {
     # Catalog paths use forward slashes so Tools.json remains easy to edit, but
     # Explorer's shell association launcher can reject an otherwise valid local
     # executable command written in that form. Store a native Windows path.
-    return [Environment]::ExpandEnvironmentVariables($Association.Target).Replace('/', '\')
+    return (Expand-ToolRootPath $Association.Target).Replace('/', '\')
 }
 
 function Get-ExtensionUserChoice([string]$Extension) {
@@ -2038,7 +2180,7 @@ function Get-Settings {
     # Added last on purpose. The elevated worker runs the plan in this order, so
     # the launchers are written after the tools they point at are installed.
     [void]$settings.Add((New-Setting 'tools-on-path' 'Tools' 'Run tools from anywhere' `
-        "Puts one small launcher for each installed command-line tool into $script:ShimDirectory, then adds that single folder to the computer PATH. You can then type EvtxECmd from any folder. The folder is added at the end of the PATH, so a tool can never shadow a Windows command." `
+        "Puts one small launcher for each installed command-line tool into a bin folder inside your tools folder, then adds that single folder to the computer PATH. You can then type EvtxECmd from any folder. The folder is added at the end of the PATH, so a tool can never shadow a Windows command. The card says which folder once it is read." `
         'On the PATH' 'Not on the PATH' 'ToolPath' @() $false $false @{} 'Tool shortcuts'))
     # File types come last. They point at a program, so the program has to be
     # installed first, and the worker applies the plan in this order.
@@ -3055,7 +3197,9 @@ function Start-AdministratorChanges([array]$Selected) {
         Write-Utf8FileAtomically $planPath (ConvertTo-Json -InputObject $requests -Depth 6)
         Write-Utf8FileAtomically $resultPath '[]'
         $desktopSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        $argumentText = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}" -ElevationBroker -PlanPath "{1}" -ResultPath "{2}" -WorkerLogPath "{3}" -TargetUserSid "{4}" -ProgressPath "{5}" -CancelPath "{6}"' -f $PSCommandPath,$planPath,$resultPath,$script:LogFile,$desktopSid,$progressPath,$cancelPath
+        # The tools folder is handed over explicitly. The elevated step can run as
+        # another account, and that account has its own options file.
+        $argumentText = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}" -ElevationBroker -PlanPath "{1}" -ResultPath "{2}" -WorkerLogPath "{3}" -TargetUserSid "{4}" -ProgressPath "{5}" -CancelPath "{6}" -ToolRoot "{7}"' -f $PSCommandPath,$planPath,$resultPath,$script:LogFile,$desktopSid,$progressPath,$cancelPath,$script:ActiveToolRoot
         $process = Start-Process -FilePath (Get-PowerShellHostPath) -ArgumentList $argumentText -WindowStyle Hidden -PassThru -ErrorAction Stop
         if (-not $process) { throw 'Windows returned no process handle for the elevation broker.' }
         return [PSCustomObject]@{ Process=$process; PlanPath=$planPath; ResultPath=$resultPath; ProgressPath=$progressPath; CancelPath=$cancelPath; Selected=$Selected; Started=Get-Date; StartError=$null }
@@ -3251,6 +3395,10 @@ Tools:
   Dingo installs them with winget and never uninstalls them.
   Add your own by placing a Tools.json file next to Dingo.ps1. See the README.
 
+  A tool with no installer of its own goes in C:\DFIR\Tools. Change that folder on
+  the Options tab of the window, or for one run only:
+  -ToolRoot "D:\DFIR\Tools"        a full path on a drive of this computer
+
 Exit codes: 0 success, 1 partial/failed application, 2 invalid command/environment, 3 already running.
 '@
 }
@@ -3376,10 +3524,16 @@ function Test-PlanPreflight([array]$Selected) {
     return @($Selected | ForEach-Object { Test-SettingPreflight $_ })
 }
 
+# The tools folder has to be known before the cards are built, because a card's
+# text and its state both name folders inside it.
+[void](Initialize-DingoToolRoot)
 Initialize-SettingHandlers
 $script:Settings = Get-Settings
 # The GUI shows this on the Tools tab. Command-line runs have no tab, so say it here.
 if ($script:ToolCatalogWarning -and -not $WpfHost) { [Console]::Error.WriteLine($script:ToolCatalogWarning) }
+# Same for the tools folder. The Options tab shows it in the window.
+# A folder asked for on the command line is refused below instead, with one message.
+if ($script:ToolRootWarning -and -not $WpfHost -and -not $ToolRoot) { [Console]::Error.WriteLine($script:ToolRootWarning) }
 
 $unexpectedValues = @($script:UnexpectedArguments)
 if ($unexpectedValues.Count) {
@@ -3423,7 +3577,10 @@ if ($ListSettings) {
 
 if ($ElevationBroker) {
     try {
-        $workerArguments = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}" -MachineWorker -PlanPath "{1}" -ResultPath "{2}" -WorkerLogPath "{3}" -TargetUserSid "{4}" -ProgressPath "{5}" -CancelPath "{6}"' -f $PSCommandPath,$PlanPath,$ResultPath,$WorkerLogPath,$TargetUserSid,$ProgressPath,$CancelPath
+        # Installing somewhere other than the window asked for would be a quiet
+        # surprise, so a folder that cannot be used stops the run instead.
+        if ($script:ToolRootRejected) { throw $script:ToolRootRejectMessage }
+        $workerArguments = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}" -MachineWorker -PlanPath "{1}" -ResultPath "{2}" -WorkerLogPath "{3}" -TargetUserSid "{4}" -ProgressPath "{5}" -CancelPath "{6}" -ToolRoot "{7}"' -f $PSCommandPath,$PlanPath,$ResultPath,$WorkerLogPath,$TargetUserSid,$ProgressPath,$CancelPath,$script:ActiveToolRoot
         $workerProcess = Start-Process -FilePath (Get-PowerShellHostPath) -ArgumentList $workerArguments -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
         if (-not $workerProcess) { throw 'Windows returned no process handle after administrator approval.' }
         exit $workerProcess.ExitCode
@@ -3739,8 +3896,58 @@ if ($SelfTest) {
     $ezTool = $builtInTools | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1
     if ($ezTool.InstallKind -ne 'script') { throw 'The Eric Zimmerman tool set must use the script install kind.' }
     if ($ezTool.Url -notmatch '^https://raw\.githubusercontent\.com/EricZimmerman/') { throw 'The Get-ZimmermanTools script must come from its own repository over https.' }
-    if ($ezTool.Dest -ne 'C:\DFIR\Tools\EZTools') { throw 'The Eric Zimmerman tool set must install to C:\DFIR\Tools\EZTools.' }
-    if ($ezTool.Scope -ne 'machine') { throw 'Writing to C:\DFIR needs administrator approval.' }
+    # The folder is named with the token, not a literal, so the Options tab can
+    # move it. A literal here would silently ignore the option.
+    if ($ezTool.Dest -ne "$($script:ToolRootToken)\EZTools") { throw "The Eric Zimmerman tool set must install to $($script:ToolRootToken)\EZTools." }
+    if ($ezTool.Scope -ne 'machine') { throw 'Writing to the tools folder needs administrator approval.' }
+    # The tools folder: one rule set decides what may be used, and the token is
+    # what makes every catalog path follow it.
+    foreach ($bad in @(
+        '', '   ', 'DFIR\Tools', '\DFIR\Tools', 'C:', 'C:\', '\\server\share\Tools',
+        'C:\DFIR\To*ls', "$($env:SystemRoot)\Tools", "$($env:SystemRoot)",
+        "$(${env:ProgramFiles})\Tools", "$($env:SystemDrive)\Users\Public\Tools"
+    )) {
+        if (-not (Test-ToolRootIsUsable $bad)) { throw "An unusable tools folder was accepted: '$bad'." }
+        $refused = $false
+        try { [void](Resolve-ToolRootValue $bad) } catch { $refused = $true }
+        if (-not $refused) { throw "Resolving an unusable tools folder did not fail: '$bad'." }
+    }
+    foreach ($good in @('C:\DFIR\Tools', 'C:\DFIR\Tools\', 'C:\Dingo Tools\set 1')) {
+        $reason = Test-ToolRootIsUsable $good
+        if ($reason) { throw "A usable tools folder was refused: '$good'. $reason" }
+    }
+    if ((Resolve-ToolRootValue 'C:\DFIR\Tools\') -ne 'C:\DFIR\Tools') { throw 'A trailing backslash must be trimmed from the tools folder.' }
+    if ($script:DefaultToolRoot -ne 'C:\DFIR\Tools') { throw 'The default tools folder changed.' }
+    $savedToolRoot = $script:ActiveToolRoot
+    $toolRootTestFile = Join-Path $env:TEMP ("Dingo-toolroot-test-{0}.json" -f [Guid]::NewGuid().ToString('N'))
+    try {
+        [void](Set-DingoToolRoot 'C:\Dingo-ToolRoot-Test')
+        if ($script:ShimDirectory -ne 'C:\Dingo-ToolRoot-Test\bin') { throw 'The launcher folder must sit inside the tools folder.' }
+        if ([Environment]::GetEnvironmentVariable($script:ToolRootVariableName) -ne 'C:\Dingo-ToolRoot-Test') { throw 'The tools folder was not published to the environment.' }
+        if ((Expand-ToolRootPath "$($script:ToolRootToken)\EZTools") -ne 'C:\Dingo-ToolRoot-Test\EZTools') { throw 'The tools folder token did not expand.' }
+        $ezPath = Expand-ToolRootPath ($builtInTools | Where-Object Id -eq 'tool-eztools').Dest
+        if ($ezPath -ne 'C:\Dingo-ToolRoot-Test\EZTools') { throw "The Eric Zimmerman install folder ignored the tools folder: $ezPath" }
+        $ezShortcut = Expand-ToolRootPath (($builtInTools | Where-Object Id -eq 'tool-eztools').Shortcuts[0].Target)
+        if ($ezShortcut -notlike 'C:\Dingo-ToolRoot-Test/*') { throw "A tool shortcut ignored the tools folder: $ezShortcut" }
+        # An unset token must be reported, never turned into a folder name.
+        [Environment]::SetEnvironmentVariable($script:ToolRootVariableName, $null, 'Process')
+        $tokenRefused = $false
+        try { [void](Expand-ToolRootPath "$($script:ToolRootToken)\EZTools") } catch { $tokenRefused = $true }
+        if (-not $tokenRefused) { throw 'An unresolved tools folder token must not be used as a path.' }
+        # The saved option round trips, and rubbish in the file is ignored.
+        [void](Save-DingoToolRootPreference 'C:\Dingo-ToolRoot-Test\deeper' $toolRootTestFile)
+        if ((Read-DingoToolRootPreference $toolRootTestFile) -ne 'C:\Dingo-ToolRoot-Test\deeper') { throw 'The saved tools folder did not read back.' }
+        [IO.File]::WriteAllText($toolRootTestFile, 'not json at all')
+        $script:ToolRootWarning = ''
+        if ((Read-DingoToolRootPreference $toolRootTestFile) -ne '') { throw 'An unreadable options file must not supply a tools folder.' }
+        if (-not $script:ToolRootWarning) { throw 'An unreadable options file must be reported.' }
+        if ((Read-DingoToolRootPreference (Join-Path $env:TEMP "Dingo-absent-$([Guid]::NewGuid().ToString('N')).json")) -ne '') { throw 'A missing options file must be silent.' }
+    } finally {
+        $script:ToolRootWarning = ''
+        Remove-Item -LiteralPath $toolRootTestFile -Force -ErrorAction SilentlyContinue
+        [void](Set-DingoToolRoot $savedToolRoot)
+    }
+    if ((Get-DingoConfigPath) -notlike "$($env:LOCALAPPDATA)\*") { throw 'The options file must live in the account it belongs to.' }
     if ($ezTool.TimeoutSeconds -lt 1800) { throw 'The Eric Zimmerman download needs a long timeout.' }
     $ezSetting = $script:Settings | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1
     if (-not $ezSetting.RequiresAdmin) { throw 'The Eric Zimmerman tool set must request administrator approval.' }
@@ -3963,6 +4170,9 @@ if ($MachineWorker) {
     try {
         Write-Log 'INFO' "Administrator worker started as $([Security.Principal.WindowsIdentity]::GetCurrent().Name) for desktop SID $TargetUserSid."
         if (-not (Test-IsAdministrator)) { throw 'The machine worker was not elevated.' }
+        if ($script:ToolRootRejected) { throw $script:ToolRootRejectMessage }
+        Write-Log 'INFO' "Administrator worker is using the tools folder $($script:ActiveToolRoot)."
+
         if ($TargetUserSid -notmatch '^S-\d(?:-\d+)+$') { throw 'The desktop user SID supplied to the administrator step is invalid.' }
         $plan = @(ConvertFrom-JsonList (Get-Content -LiteralPath $PlanPath -Raw))
         Write-Log 'INFO' "Administrator worker received $($plan.Count) setting(s)."
@@ -3975,6 +4185,11 @@ if ($MachineWorker) {
         Write-WorkerResults @((New-ApplyResult '*' @((New-OperationComponent 'Administrator worker' 'Failed' $_.Exception.Message)) $_.Exception.Message)) $ResultPath
         exit 1
     }
+}
+
+if ($ToolRoot -and $script:ToolRootRejected -and -not ($MachineWorker -or $ElevationBroker -or $WpfHost)) {
+    Write-CliErrorResponse $script:ToolRootRejectMessage 2
+    exit 2
 }
 
 if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
@@ -4271,6 +4486,18 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
             <TextBlock Text="When applying changes" FontWeight="SemiBold" Foreground="#17212B" Margin="0,8,0,6"/>
             <CheckBox Name="RestartExplorerCheckBox" Content="Restart File Explorer when finished" IsChecked="True"/>
             <TextBlock Text="Some File Explorer and taskbar changes only appear after Explorer restarts. Dingo restarts it only when a change it applied needs it." TextWrapping="Wrap" Foreground="#52606D" Margin="24,4,0,0"/>
+            <TextBlock Text="Where tools are installed" FontWeight="SemiBold" Foreground="#17212B" Margin="0,20,0,6"/>
+            <TextBlock Text="Some tools have no installer of their own, so Dingo puts those in this folder. A tool that carries its own installer is not affected. Changing this does not move a tool that is already installed, and does not remove the old folder." TextWrapping="Wrap" Foreground="#52606D" Margin="0,0,0,8"/>
+            <Grid>
+              <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <TextBox Name="ToolRootTextBox" Grid.Column="0" VerticalAlignment="Center" Padding="6,5" FontFamily="Consolas"/>
+              <Button Name="ToolRootBrowseButton" Grid.Column="1" Content="Browse" Margin="8,0,0,0"/>
+            </Grid>
+            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+              <Button Name="ToolRootSaveButton" Content="Save tools folder"/>
+              <Button Name="ToolRootDefaultButton" Content="Use the default folder"/>
+            </StackPanel>
+            <TextBlock Name="ToolRootStatusText" Text="" TextWrapping="Wrap" Foreground="#52606D" Margin="0,8,0,0"/>
             <TextBlock Text="Logs" FontWeight="SemiBold" Foreground="#17212B" Margin="0,20,0,6"/>
             <TextBlock Text="Dingo writes what it read and what it changed to a log file for this run." TextWrapping="Wrap" Foreground="#52606D" Margin="0,0,0,6"/>
             <TextBlock Name="LogPathText" Text="" TextWrapping="Wrap" Foreground="#52606D" FontFamily="Consolas" Margin="0,0,0,8"/>
@@ -4299,7 +4526,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $script:DingoWindow = $window
-foreach ($name in @('IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ApplyButton')) {
+foreach ($name in @('IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
 $desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -4312,7 +4539,43 @@ if ($script:ToolCatalogWarning) {
 }
 $VersionText.Text = "Version $($script:DingoVersion)"
 $LogPathText.Text = [string]$script:LogFile
-$script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$UncheckButton,$RefreshButton)
+$ToolRootTextBox.Text = $script:ActiveToolRoot
+# The tools folder is changed here too, so it is locked while a plan runs.
+$script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$UncheckButton,$RefreshButton,
+    $ToolRootTextBox,$ToolRootBrowseButton,$ToolRootSaveButton,$ToolRootDefaultButton)
+
+function Set-ToolRootStatus([string]$Text, [bool]$IsProblem) {
+    $ToolRootStatusText.Text = $Text
+    $ToolRootStatusText.Foreground = if ($IsProblem) { '#8A2B21' } else { '#52606D' }
+}
+
+function Show-ToolRootInUse([string]$Prefix) {
+    $text = "Tools without their own installer go in $($script:ActiveToolRoot). Command-line launchers go in $($script:ShimDirectory)."
+    Set-ToolRootStatus (("$Prefix $text").Trim()) $false
+}
+
+function Save-ToolRootChoice([string]$Wanted) {
+    $reason = Test-ToolRootIsUsable $Wanted
+    if ($reason) { Set-ToolRootStatus $reason $true; return }
+    try {
+        $resolved = Save-DingoToolRootPreference $Wanted
+        [void](Set-DingoToolRoot $resolved)
+        $ToolRootTextBox.Text = $resolved
+    } catch {
+        Set-ToolRootStatus "The tools folder was not changed. $($_.Exception.Message)" $true
+        return
+    }
+    # A tool card reports what is on disk, so the cards are read again with the
+    # new folder. Nothing on disk is moved or removed.
+    Show-ToolRootInUse 'Saved.'
+    $saved = $ToolRootStatusText.Text
+    Update-CurrentStates
+    Set-ToolRootStatus $saved $false
+}
+
+# Say straight away where tools go, or why the saved folder was not used.
+if ($script:ToolRootWarning) { Set-ToolRootStatus $script:ToolRootWarning $true } else { Show-ToolRootInUse '' }
+
 
 function Show-StopButton([bool]$Visible) {
     $StopButton.Visibility = if ($Visible) { 'Visible' } else { 'Collapsed' }
@@ -4696,6 +4959,11 @@ if ($UiSelfTest) {
     }
     if (-not $RestartExplorerCheckBox) { throw 'The Options section does not hold the File Explorer restart choice.' }
     if (-not $OpenLogButton) { throw 'The Options section does not hold the log folder button.' }
+    if (-not $ToolRootTextBox -or -not $ToolRootSaveButton -or -not $ToolRootDefaultButton -or -not $ToolRootBrowseButton) {
+        throw 'The Options section does not hold the tools folder controls.'
+    }
+    if ($ToolRootTextBox.Text -ne $script:ActiveToolRoot) { throw 'The Options section does not show the tools folder in use.' }
+    if (-not $ToolRootStatusText.Text) { throw 'The Options section does not say where tools are installed.' }
     if (-not $LogPathText.Text) { throw 'The Options section does not name the log file.' }
     # A window showing a stale version is worse than one showing none at all.
     if ($VersionText.Text -notmatch [regex]::Escape($script:DingoVersion)) {
@@ -4873,6 +5141,29 @@ $UncheckButton.Add_Click({
 })
 $RefreshButton.Add_Click({ Update-CurrentStates })
 $OpenLogButton.Add_Click({ Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $script:LogFile) })
+$ToolRootSaveButton.Add_Click({ Save-ToolRootChoice ([string]$ToolRootTextBox.Text) })
+$ToolRootDefaultButton.Add_Click({ Save-ToolRootChoice $script:DefaultToolRoot })
+$ToolRootBrowseButton.Add_Click({
+    # The folder picker lives in Windows Forms, which the window does not need
+    # otherwise, so it is loaded only when the button is used. Typing the path
+    # still works if loading fails.
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dialog.Description = 'Choose the folder for tools that have no installer of their own.'
+        $dialog.ShowNewFolderButton = $true
+        if (Test-Path -LiteralPath $ToolRootTextBox.Text -PathType Container) { $dialog.SelectedPath = $ToolRootTextBox.Text }
+        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $ToolRootTextBox.Text = $dialog.SelectedPath
+            $reason = Test-ToolRootIsUsable $dialog.SelectedPath
+            if ($reason) { Set-ToolRootStatus $reason $true }
+            else { Set-ToolRootStatus 'Click Save tools folder to use this folder.' $false }
+        }
+        $dialog.Dispose()
+    } catch {
+        Set-ToolRootStatus "The folder picker could not open, so type the full path instead. $($_.Exception.Message)" $true
+    }
+})
 
 $ApplyButton.Add_Click({
     if ($script:ApplyInProgress) { return }

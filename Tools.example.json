@@ -1,6 +1,8 @@
 {
   // Copy this file to Tools.json to use it. Comments and trailing commas are allowed.
   // A new "id" adds a tool. An "id" that matches a built-in one replaces it.
+  // Any path may hold %DINGO_TOOL_ROOT%, which Dingo replaces with the tools
+  // folder from the Options tab. Use it for a tool with no installer of its own.
   "tools": [
     {
       "id": "tool-hxd",

@@ -16,7 +16,14 @@ $script:SettingHandlers=@{}
 $script:ToolCatalogWarning=''
 $script:DeviceIsManaged=$false
 $script:AssociationProgIdPrefix='Dingo.'
-$script:ShimDirectory='C:\DFIR\Tools\bin'
+$script:DefaultToolRoot='C:\DFIR\Tools'
+$script:ToolRootToken='%DINGO_TOOL_ROOT%'
+$script:ToolRootVariableName='DINGO_TOOL_ROOT'
+$script:ActiveToolRoot=$script:DefaultToolRoot
+$script:ToolRootWarning=''
+$script:ToolRootRejected=$false
+# Sets the launcher folder and publishes the token, the same as a real start.
+[void](Set-DingoToolRoot $script:DefaultToolRoot)
 $script:StartMenuShortcutDirectory='C:\Unused-Test-Folder'
 $script:DesktopShortcutDirectory='C:\Unused-Test-Folder'
 $script:ToolCatalogCache=@(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
