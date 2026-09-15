@@ -21,7 +21,7 @@ Current version: **0.7.5**.
 3. Pick a section:
    - **Tweaks** — Windows settings (My account / Whole computer).
    - **Tools** — Install tools, Tool shortcuts, File associations.
-   - **Options** — Dingo's own choices, such as the log folder.
+   - **Options** — Dingo's own choices, such as the log folder and where tools are installed.
 4. Turn on the switch on each card you want, or press **Choose all my preferred settings**.
 5. Press **Apply selected changes**. Windows asks for approval if the plan touches the whole computer.
 
@@ -157,7 +157,16 @@ Each tool card has two choices: **Installed** (install it if missing, leave it a
 
 Select .NET 9 as well as Eric Zimmerman's tools. Those tools need it, and a fresh Windows 11 does not have it. Dingo lists it first, so one run installs both in the right order.
 
-Most tools come from winget, so you need a network connection. Eric Zimmerman's tools are not in winget. Dingo runs the author's own `Get-ZimmermanTools.ps1` over HTTPS and checks its SHA256 before running it. They install to `C:\DFIR\Tools\EZTools`, and the download is several hundred megabytes.
+Most tools come from winget, so you need a network connection. Eric Zimmerman's tools are not in winget. Dingo runs the author's own `Get-ZimmermanTools.ps1` over HTTPS and checks its SHA256 before running it. They install to `EZTools` inside the tools folder, `C:\DFIR\Tools` by default, and the download is several hundred megabytes.
+
+### Where tools are installed
+
+A tool with its own installer goes where that installer puts it. A tool without one, such as Eric Zimmerman's set, goes in Dingo's **tools folder**: `C:\DFIR\Tools` by default. Change it on the **Options** tab.
+
+- The choice is saved in `%LOCALAPPDATA%\Dingo\config.json`. No administrator approval needed.
+- The launcher folder is always `bin` inside the tools folder, so moving one moves both.
+- Changing it moves nothing. A tool already installed stays where it is. Install it again to put it in the new folder.
+- Dingo refuses a network path, a drive letter on its own, and anything inside `%SystemRoot%`, `%ProgramFiles%`, or `C:\Users`. The launcher folder goes on the computer PATH, so a standard account must not be able to write to it.
 
 ### Shortcuts and PATH
 
@@ -165,9 +174,9 @@ Most tools come from winget, so you need a network connection. Eric Zimmerman's 
 | --- | --- | --- |
 | `tools-start-menu` | Start menu shortcuts | Writes shortcuts to `...\Start Menu\Programs\DFIR Tools` |
 | `tools-desktop` | Desktop shortcuts | Writes shortcuts to `C:\Users\Public\Desktop` |
-| `tools-on-path` | Run tools from anywhere | Puts `C:\DFIR\Tools\bin` on the computer PATH |
+| `tools-on-path` | Run tools from anywhere | Puts the tools `bin` folder on the computer PATH |
 
-**Run tools from anywhere** writes one small `.cmd` launcher per command-line tool into `C:\DFIR\Tools\bin`, then adds that one folder to the PATH. You can then type this from any folder:
+**Run tools from anywhere** writes one small `.cmd` launcher per command-line tool into `bin` inside the tools folder, `C:\DFIR\Tools\bin` by default, then adds that one folder to the PATH. You can then type this from any folder:
 
 ```bat
 EvtxECmd -d "C:\Evidence"
@@ -216,6 +225,8 @@ A missing completion record means **unknown**, not safe. Read the settings again
 ## Add your own tools
 
 Put a `Tools.json` file next to `Dingo.ps1`. A new `id` adds a tool. A matching `id` replaces a built-in one.
+
+Any path may hold `%DINGO_TOOL_ROOT%`, which Dingo replaces with the tools folder. Use it for a tool with no installer of its own. `%ProgramFiles%` and other environment variables work too.
 
 ```json
 {
