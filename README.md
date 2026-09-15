@@ -65,6 +65,8 @@ Start-Dingo.cmd -Version
 
 Add `-OutputFormat Json` to `-WhatIf`, `-ApplyPreferred`, or `-ListSettings` for machine-readable output. Add `-NoRestartExplorer` to skip the File Explorer restart.
 
+While the administrator step runs, Dingo names each card as it reaches it, and repeats the line once a minute for a step that is still running. A tool download can take half an hour, so a quiet screen never means a stopped run. Full detail goes to the log either way.
+
 Add `-ToolRoot` to use a different tools folder for one run, without saving it:
 
 ```bat

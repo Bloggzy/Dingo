@@ -3392,6 +3392,89 @@ function Start-AdministratorChanges([array]$Selected) {
     }
 }
 
+function Format-Duration([TimeSpan]$Span) {
+    if ($Span.TotalSeconds -lt 0) { return '0:00' }
+    '{0}:{1:00}' -f [math]::Floor($Span.TotalMinutes),$Span.Seconds
+}
+
+function Read-WorkerProgressFile([string]$Path) {
+    # Read failures are normal: the worker replaces this file about twice a
+    # second. The caller keeps showing the last good reading instead.
+    if (-not $Path) { return $null }
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+        return ConvertFrom-Json $raw
+    } catch { return $null }
+}
+
+function Read-WorkerFinishedIds([string]$Path) {
+    # The worker rewrites its result file after every setting, so the window can
+    # tell which cards are already done long before the process exits.
+    if (-not $Path) { return @() }
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+        return @(@(ConvertFrom-JsonList $raw) | ForEach-Object { [string]$_.Id } | Where-Object { $_ })
+    } catch { return @() }
+}
+
+function Format-WorkerProgressLine($Progress, [TimeSpan]$StepElapsed) {
+    $index = [int](Get-JsonField $Progress 'Index' 0)
+    $total = [int](Get-JsonField $Progress 'Total' 0)
+    $name = [string](Get-JsonField $Progress 'Name' '')
+    $phase = [string](Get-JsonField $Progress 'Phase' '')
+    $detail = [string](Get-JsonField $Progress 'Detail' '')
+    $counter = if ($total -gt 0) { "$index/$total " } else { '' }
+    $words = @($name, $phase) | Where-Object { $_ }
+    $line = "  $counter$($words -join ': ')"
+    if ($detail -and $detail -ne $phase) { $line += " - $detail" }
+    # The time is only worth printing once a step has been running a while.
+    if ($StepElapsed.TotalSeconds -lt 1) { return $line }
+    return "$line [$(Format-Duration $StepElapsed) so far]"
+}
+
+function Wait-AdministratorChangesOnConsole($Operation, [int]$PollMilliseconds = 500, [int]$HeartbeatSeconds = 60) {
+    # A command-line run would otherwise print nothing at all between the Windows
+    # approval prompt and the last result, and a tool download can take half an
+    # hour. The worker already writes down every step for the window, so read the
+    # same file and say what it says.
+    if (-not $Operation -or -not $Operation.Process) { return }
+    $waiting = $true
+    $lastKey = ''
+    $stepStarted = Get-Date
+    $lastHeartbeat = Get-Date
+    while (-not $Operation.Process.HasExited) {
+        Start-Sleep -Milliseconds $PollMilliseconds
+        $progress = Read-WorkerProgressFile $Operation.ProgressPath
+        if (-not $progress) {
+            # Nothing has ever been published, which almost always means the
+            # Windows approval prompt is still on screen.
+            if ($waiting -and ((Get-Date) - $lastHeartbeat).TotalSeconds -ge $HeartbeatSeconds) {
+                Write-CliStatus '  Still waiting for administrator approval. Accept the Windows prompt to let Dingo continue.'
+                $lastHeartbeat = Get-Date
+            }
+            continue
+        }
+        $waiting = $false
+        $key = '{0}|{1}|{2}' -f [string](Get-JsonField $progress 'Id' ''), [string](Get-JsonField $progress 'Phase' ''), [string](Get-JsonField $progress 'Detail' '')
+        if ($key -ne $lastKey) {
+            $lastKey = $key
+            $stepStarted = Get-Date
+            $lastHeartbeat = Get-Date
+            Write-CliStatus (Format-WorkerProgressLine $progress ([TimeSpan]::Zero))
+            continue
+        }
+        # One step can run for many minutes. Say so, rather than look stopped.
+        if (((Get-Date) - $lastHeartbeat).TotalSeconds -ge $HeartbeatSeconds) {
+            $lastHeartbeat = Get-Date
+            Write-CliStatus (Format-WorkerProgressLine $progress ((Get-Date) - $stepStarted))
+        }
+    }
+}
+
 function Complete-AdministratorChanges($Operation) {
     $map = @{}
     if (-not $Operation.Process) {
@@ -4215,6 +4298,34 @@ if ($SelfTest) {
     if (-not $wildcardFound -or -not $wildcardFound.Version) { throw 'A wildcard rule did not match a folder that does exist.' }
     # PATH damage is the worst thing this tool could do, so prove the string
     # handling on a stand-in value before it is ever written to the registry.
+    # A command-line run reads the worker's progress file and says what it says,
+    # so a long step never looks like a hang. PowerShell defines a function only
+    # when execution reaches it, and a quick apply exits long before the window
+    # code is read, so every reader it uses must stand above that block.
+    $sourceText = Get-Content -LiteralPath $PSCommandPath -Raw -ErrorAction Stop
+    $quickApplyOffset = $sourceText.IndexOf('Dingo quick apply: applying')
+    if ($quickApplyOffset -lt 0) { throw 'The quick-apply block could not be found in the source.' }
+    foreach ($needed in @('Format-Duration','Read-WorkerProgressFile','Read-WorkerFinishedIds','Format-WorkerProgressLine','Wait-AdministratorChangesOnConsole')) {
+        $definedAt = $sourceText.IndexOf("function $needed")
+        if ($definedAt -lt 0) { throw "'$needed' is missing." }
+        if ($definedAt -gt $quickApplyOffset) { throw "'$needed' is defined after the quick-apply block, so a command-line run could never call it." }
+    }
+    if ($sourceText.IndexOf('Wait-AdministratorChangesOnConsole $operation') -lt 0) { throw 'A command-line run must watch the administrator step.' }
+    # A progress reading turns into one readable line, and a missing field is
+    # left out rather than printed as an empty word.
+    $progressLine = Format-WorkerProgressLine ([PSCustomObject]@{
+        Index=2; Total=5; Id='tool-eztools'; Name="Eric Zimmerman's tools"; Phase='Installing'; Detail='Downloading'
+    }) ([TimeSpan]::FromSeconds(90))
+    foreach ($part in @('2/5', "Eric Zimmerman's tools", 'Installing', 'Downloading', '1:30 so far')) {
+        if ($progressLine -notmatch [regex]::Escape($part)) { throw "A progress line lost '$part': $progressLine" }
+    }
+    $sparseLine = Format-WorkerProgressLine ([PSCustomObject]@{ Name='Widgets'; Phase='Applying' }) ([TimeSpan]::Zero)
+    if ($sparseLine -notmatch 'Widgets: Applying') { throw "A progress reading with no counter read badly: $sparseLine" }
+    if ($sparseLine -match ' - ') { throw "An absent detail must not be printed: $sparseLine" }
+    if ($sparseLine -match 'so far') { throw "A step that just started must not print a time: $sparseLine" }
+    # A step with nothing running must return at once rather than wait for ever.
+    Wait-AdministratorChangesOnConsole $null
+    Wait-AdministratorChangesOnConsole ([PSCustomObject]@{ Process=$null; ProgressPath='' })
     $pathSetting = $script:Settings | Where-Object Id -eq 'tools-on-path' | Select-Object -First 1
     if (-not $pathSetting) { throw 'The command-line access setting is missing.' }
     if ($pathSetting.Tab -ne 'Tool shortcuts' -or -not $pathSetting.RequiresAdmin -or -not $pathSetting.CanChoose) {
@@ -4523,6 +4634,7 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             if ($selected | Where-Object RequiresAdmin) {
                 Write-CliStatus 'Administrator approval is required for part of this plan.'
                 $operation = Start-AdministratorChanges $selected
+                Wait-AdministratorChangesOnConsole $operation
                 $administratorResults = Complete-AdministratorChanges $operation
             }
             $results = New-Object System.Collections.ArrayList
@@ -4862,35 +4974,6 @@ function New-CardText {
 function Add-CardColumn($Grid, $Control, [int]$Column) {
     [Windows.Controls.Grid]::SetColumn($Control, $Column)
     [void]$Grid.Children.Add($Control)
-}
-
-function Format-Duration([TimeSpan]$Span) {
-    if ($Span.TotalSeconds -lt 0) { return '0:00' }
-    '{0}:{1:00}' -f [math]::Floor($Span.TotalMinutes),$Span.Seconds
-}
-
-function Read-WorkerProgressFile([string]$Path) {
-    # Read failures are normal: the worker replaces this file about twice a
-    # second. The caller keeps showing the last good reading instead.
-    if (-not $Path) { return $null }
-    try {
-        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
-        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
-        return ConvertFrom-Json $raw
-    } catch { return $null }
-}
-
-function Read-WorkerFinishedIds([string]$Path) {
-    # The worker rewrites its result file after every setting, so the window can
-    # tell which cards are already done long before the process exits.
-    if (-not $Path) { return @() }
-    try {
-        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
-        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
-        if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
-        return @(@(ConvertFrom-JsonList $raw) | ForEach-Object { [string]$_.Id } | Where-Object { $_ })
-    } catch { return @() }
 }
 
 function Request-AdministratorStop($Pending) {
