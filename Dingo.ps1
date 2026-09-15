@@ -4357,48 +4357,6 @@ if ($SelfTest) {
     $restartOffset = $sourceText.IndexOf('if ($restartExplorer -and -not $NoRestartExplorer)')
     if ($finishedOffset -lt 0 -or $restartOffset -lt 0) { throw 'The quick-apply ending could not be found in the source.' }
     if ($restartOffset -lt $finishedOffset) { throw 'A command-line run must print its results before File Explorer is restarted.' }
-    # Tab completion for the .cmd launcher lives in its own opt-in file. Its
-    # switch list is read from this script, so the only thing that can rot is
-    # the list of names it hides. Check it here, where a new parameter is added.
-    $completionPath = Join-Path $PSScriptRoot 'Dingo.Completion.ps1'
-    if (Test-Path -LiteralPath $completionPath -PathType Leaf) {
-        $completionErrors = $null
-        $completionTokens = $null
-        $completionAst = [Management.Automation.Language.Parser]::ParseFile($completionPath, [ref]$completionTokens, [ref]$completionErrors)
-        if ($completionErrors.Count) { throw "Dingo.Completion.ps1 does not parse: $($completionErrors[0].Message)" }
-        # Take the reader function alone. Loading the whole file would replace
-        # TabExpansion2 in this process, and a self-test changes nothing.
-        $readerAst = @($completionAst.FindAll({
-            param($node)
-            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-DingoCompletionSwitch'
-        }, $true))
-        if ($readerAst.Count -ne 1) { throw 'Dingo.Completion.ps1 must define Get-DingoCompletionSwitch once.' }
-        Invoke-Expression $readerAst[0].Extent.Text
-        $offered = @(Get-DingoCompletionSwitch $PSCommandPath)
-        $offeredNames = @($offered | ForEach-Object { $_.Name })
-        # Every switch a person is told to type must be offered.
-        foreach ($public in @('ApplyPreferred','WhatIf','ListSettings','RecoveryReport','Help','Version','Include','Exclude','OutputFormat','NoRestartExplorer','ToolRoot')) {
-            if ($offeredNames -notcontains $public) { throw "Tab completion does not offer -$public." }
-        }
-        # Nothing Dingo passes to its own elevated worker may be offered.
-        foreach ($private in @('MachineWorker','ElevationBroker','WpfHost','PlanPath','ResultPath','WorkerLogPath','ProgressPath','CancelPath','TargetUserSid','UnexpectedArguments')) {
-            if ($offeredNames -contains $private) { throw "Tab completion offers -$private, which is internal plumbing." }
-        }
-        # A parameter that takes a value is marked as such, so the tip reads right.
-        if (-not (@($offered | Where-Object { $_.Name -eq 'Include' }).TakesValue)) { throw '-Include takes a value, and completion must say so.' }
-        if (@($offered | Where-Object { $_.Name -eq 'WhatIf' }).TakesValue) { throw '-WhatIf is a switch, and completion must say so.' }
-        # A name hidden by the file must still be a real parameter of this script.
-        $realNames = @(([Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null)).ParamBlock.Parameters |
-            ForEach-Object { $_.Name.VariablePath.UserPath })
-        $hiddenListAst = @($completionAst.FindAll({
-            param($node)
-            $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$internal'
-        }, $true))
-        if ($hiddenListAst.Count -ne 1) { throw 'Dingo.Completion.ps1 must name the hidden switches once.' }
-        foreach ($hidden in @([regex]::Matches($hiddenListAst[0].Right.Extent.Text, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })) {
-            if ($realNames -notcontains $hidden) { throw "Tab completion hides '$hidden', which is not a parameter of Dingo.ps1 any more." }
-        }
-    }
     $pathSetting = $script:Settings | Where-Object Id -eq 'tools-on-path' | Select-Object -First 1
     if (-not $pathSetting) { throw 'The command-line access setting is missing.' }
     if ($pathSetting.Tab -ne 'Tool shortcuts' -or -not $pathSetting.RequiresAdmin -or -not $pathSetting.CanChoose) {

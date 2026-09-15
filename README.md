@@ -87,17 +87,24 @@ Step 2 of 2: applying and checking all 43 setting(s).
 
 A step that runs for a long time, such as a language pack or a tool download, says `still working` once a minute with the time so far. A quiet screen never means a stopped run. Full detail goes to the log either way.
 
-### Tab completion
+### Run the script directly
 
-Type `.\Dingo.ps1 -` and press Tab. PowerShell reads the switches from the script, so this works with no setup.
-
-The `.cmd` launcher needs one extra line, because PowerShell cannot read the switches of a batch file:
+`Start-Dingo.cmd` is a convenience. It picks the right PowerShell switches for you and holds the window open if a run fails. For a command-line run you can call the script instead:
 
 ```powershell
-. .\Dingo.Completion.ps1
+.\Dingo.ps1 -ApplyPreferred -Include tweaks,tools
 ```
 
-Then `.\Start-Dingo.cmd -` and Tab offers the same switches, and `-Include`, `-Exclude`, and `-OutputFormat` offer their values. Put that line in your profile (`notepad $PROFILE`) to have it in every window. The file reads the switch list from `Dingo.ps1`, so it cannot fall behind. It changes nothing about how Dingo runs.
+Everything above works the same way. Two differences:
+
+- **Tab completion works.** Type `.\Dingo.ps1 -` and press Tab. PowerShell reads the switches from the script. The `.cmd` cannot do this, because PowerShell cannot read the switches of a batch file.
+- **The window does not wait.** A failed run closes straight away, so read the exit code or the log.
+
+If PowerShell refuses to run the script, your machine blocks local scripts. Allow them for that one window:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
 
 Add `-ToolRoot` to use a different tools folder for one run, without saving it:
 
