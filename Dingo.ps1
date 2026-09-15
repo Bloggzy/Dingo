@@ -57,7 +57,7 @@ $script:PendingApply = $null
 $script:ApplyInProgress = $false
 $script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.7.6'
+$script:DingoVersion = '0.7.7'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -271,7 +271,7 @@ function Get-SettingAdvisory($Setting) {
     if (Test-SettingNeedsLanguageDownload $Setting) {
         return "This computer has no display pack for $($Setting.DesiredState), so Windows must download one from Windows Update. That one step usually takes about ten minutes, and can hold up the whole run. Dingo waits fifteen minutes at most, stops sooner if nothing is moving, and every other selected change still runs."
     }
-    if ($Setting.Id -eq 'windows-update-continuity') {
+    if ($Setting.Id -eq 'windows-update') {
         return 'Registry configuration only: automatic-restart prevention is not verified. This does not cancel pending or user-scheduled restarts, establish effective management policy, or guarantee an uninterrupted processing window. Update notifications, including restart warnings, are suppressed by this selection.'
     }
     # A caveat that Dingo cannot fix by writing the setting. Dingo still applies
@@ -2218,8 +2218,8 @@ function Get-Settings {
     $windowsUpdateAU = "$windowsUpdate\AU"
     $settings = New-Object System.Collections.ArrayList
 
-    [void]$settings.Add((New-Setting 'timezone-utc' 'Region & language' 'Time zone' 'The clock this computer runs on. UTC is preferred, because a timeline read in UTC needs no conversion.' 'UTC' $null 'TimeZone' @() $false $false -StateChoices (Get-TimeZoneChoices)))
-    [void]$settings.Add((New-Setting 'region-australia' 'Region & language' 'Region and formats' 'The country and number, currency, and date formats Windows uses for this account. Australia is preferred.' 'Australia (en-AU)' $null 'Region' @() $false $false -StateChoices (@((Get-RegionChoiceTable).Keys))))
+    [void]$settings.Add((New-Setting 'time-zone' 'Region & language' 'Time zone' 'The clock this computer runs on. UTC is preferred, because a timeline read in UTC needs no conversion.' 'UTC' $null 'TimeZone' @() $false $false -StateChoices (Get-TimeZoneChoices)))
+    [void]$settings.Add((New-Setting 'region' 'Region & language' 'Region and formats' 'The country and number, currency, and date formats Windows uses for this account. Australia is preferred.' 'Australia (en-AU)' $null 'Region' @() $false $false -StateChoices (@((Get-RegionChoiceTable).Keys))))
     [void]$settings.Add((New-Setting 'display-language' 'Region & language' 'Display language' 'The language of the Windows interface, keyboard, and spelling, and the system locale. Australian English is preferred, to match the region card above. Windows ships no separate Australian interface, so it supplies this one through the British pack and sets the language to en-AU on top of it.' 'Australian English (en-AU)' $null 'Language' @() $false $true -StateChoices (@((Get-LanguageChoiceTable).Keys))))
     # Every date and time choice sets the same seven values, so each entry
     # carries one value per choice instead of a single preferred value.
@@ -2229,7 +2229,7 @@ function Get-Settings {
         foreach ($label in @($dateTimeFormats.Keys)) { $states[$label] = [string]$dateTimeFormats[$label][$valueName] }
         New-Entry User 'Control Panel\International' $valueName $states[@($dateTimeFormats.Keys)[0]] $script:RemoveValue String -States $states
     })
-    [void]$settings.Add((New-Setting 'iso-time' 'Region & language' 'Date and time format' 'How this account writes dates and times. ISO-style is preferred, because yyyy-MM-dd sorts correctly and is never read the wrong way round.' 'ISO-style / 24-hour (yyyy-MM-dd HH:mm)' $null 'Registry' $dateTimeEntries -StateChoices (@($dateTimeFormats.Keys))))
+    [void]$settings.Add((New-Setting 'date-time-format' 'Region & language' 'Date and time format' 'How this account writes dates and times. ISO-style is preferred, because yyyy-MM-dd sorts correctly and is never read the wrong way round.' 'ISO-style / 24-hour (yyyy-MM-dd HH:mm)' $null 'Registry' $dateTimeEntries -StateChoices (@($dateTimeFormats.Keys))))
 
     [void]$settings.Add((New-Setting 'taskbar-search' 'Taskbar' 'Search box' 'Hide or show the taskbar Search box.' 'Hidden' 'Shown' 'Registry' @(
         (New-Entry User 'Software\Microsoft\Windows\CurrentVersion\Search' 'SearchboxTaskbarMode' 0 2)
@@ -2242,7 +2242,7 @@ function Get-Settings {
         (New-Entry User 'Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsResumeAllowed' 0 1),
         (New-Entry Machine 'SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume' 'value' 1 0)
     )))
-    [void]$settings.Add((New-Setting 'never-combine' 'Taskbar' 'Combine taskbar buttons' 'Choose whether taskbar buttons are combined.' 'Never combine' 'Always combine' 'Registry' @(
+    [void]$settings.Add((New-Setting 'taskbar-combine' 'Taskbar' 'Combine taskbar buttons' 'Choose whether taskbar buttons are combined.' 'Never combine' 'Always combine' 'Registry' @(
         (New-Entry User $advanced 'TaskbarGlomLevel' 2 $script:RemoveValue),
         (New-Entry User $advanced 'MMTaskbarGlomLevel' 2 $script:RemoveValue)
     ) $true))
@@ -2250,7 +2250,7 @@ function Get-Settings {
         (New-Entry User "$advanced\TaskbarDeveloperSettings" 'TaskbarEndTask' 1 $script:RemoveValue)
     ) $true))
 
-    [void]$settings.Add((New-Setting 'explorer-this-pc' 'File Explorer' 'Default landing page' 'Choose This PC or Home for new Explorer windows.' 'This PC' 'Home' 'Registry' @(
+    [void]$settings.Add((New-Setting 'explorer-landing' 'File Explorer' 'Default landing page' 'Choose This PC or Home for new Explorer windows.' 'This PC' 'Home' 'Registry' @(
         (New-Entry User $advanced 'LaunchTo' 1 $script:RemoveValue)
     ) $true))
     [void]$settings.Add((New-Setting 'hidden-files' 'File Explorer' 'Hidden files and folders' 'Show or hide items carrying the hidden attribute.' 'Shown' 'Hidden' 'Registry' @(
@@ -2280,7 +2280,7 @@ function Get-Settings {
         (New-Entry User 'SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsCopilot' 'AllowCopilotRuntime' 0 1)
     ) $true $true))
 
-    [void]$settings.Add((New-Setting 'windows-update-continuity' 'Windows Update' 'Forensic continuity: manual update configuration' 'CAUTION: configures registry policies for manual update maintenance and suppresses update notifications, including restart warnings. Dingo verifies the stored values, not effective restart prevention. Pending restarts, Windows policy prerequisites, and organisation management can affect behavior. Schedule maintenance and independently check restart conditions before processing evidence.' 'Configured; manual maintenance' 'Windows-managed/default' 'Registry' @(
+    [void]$settings.Add((New-Setting 'windows-update' 'Windows Update' 'Forensic continuity: manual update configuration' 'CAUTION: configures registry policies for manual update maintenance and suppresses update notifications, including restart warnings. Dingo verifies the stored values, not effective restart prevention. Pending restarts, Windows policy prerequisites, and organisation management can affect behavior. Schedule maintenance and independently check restart conditions before processing evidence.' 'Configured; manual maintenance' 'Windows-managed/default' 'Registry' @(
         (New-Entry Machine $windowsUpdateAU 'NoAutoUpdate' 1 $script:RemoveValue),
         (New-Entry Machine $windowsUpdateAU 'NoAutoRebootWithLoggedOnUsers' 1 $script:RemoveValue),
         (New-Entry Machine $windowsUpdate 'SetComplianceDeadlineForQU' 0 $script:RemoveValue),
@@ -2669,7 +2669,7 @@ function Get-RegistrySettingState($Setting) {
         $mismatched = @($Setting.Entries | Where-Object { -not (Test-EntryValue $_ (Get-EntryWantedValue $_ $state $Setting)) }).Count
         if ($mismatched -eq 0) { return New-StateResultForSetting $Setting $state }
     }
-    if ($Setting.Id -eq 'iso-time') {
+    if ($Setting.Id -eq 'date-time-format') {
         $shortDate = (Get-EntryValue ($Setting.Entries | Where-Object Name -eq 'sShortDate')).Value
         $shortTime = (Get-EntryValue ($Setting.Entries | Where-Object Name -eq 'sShortTime')).Value
         return New-StateResult 'Partial' "Custom: $shortDate, $shortTime"
@@ -2678,7 +2678,7 @@ function Get-RegistrySettingState($Setting) {
 }
 
 function Get-IsoTimeSetting {
-    return $script:Settings | Where-Object Id -eq 'iso-time' | Select-Object -First 1
+    return $script:Settings | Where-Object Id -eq 'date-time-format' | Select-Object -First 1
 }
 
 function Get-ConfiguredDateTimeFormatState {
@@ -3141,7 +3141,7 @@ function Set-RegistryKindPart($Setting, [string]$DesiredState, [string]$Scope, $
         Write-Log 'INFO' ("ENTRY " + (ConvertTo-Json -InputObject $component -Depth 8 -Compress))
     }
     if ($failure) { throw $failure }
-    if ($Scope -eq 'User' -and $Setting.Id -eq 'iso-time') {
+    if ($Scope -eq 'User' -and $Setting.Id -eq 'date-time-format') {
         Send-InternationalSettingChange
         $override = try { (Get-WinUILanguageOverride).Name } catch { '' }
         $uiLanguage = try { (Get-UICulture).Name } catch { '' }
@@ -3711,7 +3711,7 @@ What to include or exclude:
   -Include tools               installs, shortcuts, and file associations
   -Include tweaks,tools        everything
   -Include tools -Exclude tool-7zip    a section, less one card
-  -Include iso-time,hidden-files       named cards only
+  -Include date-time-format,hidden-files       named cards only
 
 Discovery:
   Start-Dingo.cmd -ListSettings [-OutputFormat Text|Json]
@@ -3988,7 +3988,7 @@ if ($SelfTest) {
     $preflightMock.Requirements = @{ RequiredCommands=@('Dingo-Definitely-Missing-Command') }
     $preflightResult = Test-SettingPreflight $preflightMock
     if ($preflightResult.Available -or $preflightResult.Message -notmatch 'Dingo-Definitely-Missing-Command') { throw 'Preflight did not reject an unavailable required command.' }
-    $quickSelection = @(Resolve-QuickApplySettings $script:Settings @('WIDGETS,timezone-utc') @('timezone-utc'))
+    $quickSelection = @(Resolve-QuickApplySettings $script:Settings @('WIDGETS,time-zone') @('time-zone'))
     if ($quickSelection.Count -ne 1 -or $quickSelection[0].Id -ne 'widgets') { throw 'Quick-apply include/exclude filtering is invalid.' }
     $unknownRejected = $false
     try { [void](Resolve-QuickApplySettings $script:Settings @('not-a-setting') @()) } catch { $unknownRejected = $true }
@@ -4014,7 +4014,7 @@ if ($SelfTest) {
     }
     $launcherPath = Join-Path $PSScriptRoot 'Start-Dingo.cmd'
     if (-not (Test-Path -LiteralPath $launcherPath) -or (Get-Content -LiteralPath $launcherPath -Raw) -notmatch '%\*') { throw 'Start-Dingo.cmd does not forward command-line arguments.' }
-    $updateSetting = $script:Settings | Where-Object Id -eq 'windows-update-continuity'
+    $updateSetting = $script:Settings | Where-Object Id -eq 'windows-update'
     $requiredUpdatePolicies = @{
         NoAutoUpdate=1; NoAutoRebootWithLoggedOnUsers=1
         SetComplianceDeadlineForQU=0; SetComplianceDeadlineForFU=0
@@ -4152,7 +4152,7 @@ if ($SelfTest) {
         # A tool caveat depends on what this machine has installed, so those are
         # checked separately below rather than asserted to be absent.
         foreach ($shipped in @($script:Settings | Where-Object { -not $_.Requirements.ContainsKey('RequiredTools') -or -not @($_.Requirements['RequiredTools']).Count })) {
-            if ($shipped.Id -eq 'windows-update-continuity') {
+            if ($shipped.Id -eq 'windows-update') {
                 if ((Get-SettingAdvisory $shipped) -notmatch 'not verified') { throw 'Update configuration must disclose its verification limit.' }
             } elseif (Get-SettingAdvisory $shipped) { throw "Setting '$($shipped.Id)' carries an unexpected caveat." }
         }

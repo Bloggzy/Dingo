@@ -300,7 +300,7 @@ try {
     }
     Test-Case 'Update policy reports configured values and disclaims restart guarantees' {
         function Test-EntryValue { $true }
-        $setting=$script:Settings | Where-Object Id -eq 'windows-update-continuity'
+        $setting=$script:Settings | Where-Object Id -eq 'windows-update'
         $state=Get-SettingState $setting
         Assert ($state.Status -eq 'Preferred' -and $state.DisplayText -eq 'Configured; manual maintenance') 'Old protected claim remains.'
         Assert ($state.VerificationBasis -match 'not verified' -and $state.Details -match 'automatic-restart prevention is not verified') 'Verification limit missing.'

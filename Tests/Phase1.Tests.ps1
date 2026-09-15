@@ -403,12 +403,43 @@ try {
         # Mixed spelling, spacing, and commas are all one list.
         Assert (@(Resolve-QuickApplySettings $script:Settings @('TWEAKS, Tools') @()).Count -eq $script:Settings.Count) 'Both section words did not select everything.'
         # A section word and a plain ID work together, in either argument.
-        $withOne = @(Resolve-QuickApplySettings $script:Settings @('tools','iso-time') @())
-        Assert (@($withOne | Where-Object Id -eq 'iso-time').Count -eq 1) 'A named tweak was lost beside a section word.'
+        $withOne = @(Resolve-QuickApplySettings $script:Settings @('tools','date-time-format') @())
+        Assert (@($withOne | Where-Object Id -eq 'date-time-format').Count -eq 1) 'A named tweak was lost beside a section word.'
         $lessOne = @(Resolve-QuickApplySettings $script:Settings @('tools') @('tool-7zip'))
         Assert (@($lessOne | Where-Object Id -eq 'tool-7zip').Count -eq 0) 'An excluded ID survived its section.'
         # Plain IDs behave exactly as they did before section words existed.
-        Assert (@(Resolve-QuickApplySettings $script:Settings @('iso-time','hidden-files') @()).Count -eq 2) 'Named IDs no longer select just themselves.'
+        Assert (@(Resolve-QuickApplySettings $script:Settings @('date-time-format','hidden-files') @()).Count -eq 2) 'Named IDs no longer select just themselves.'
+    }
+    Test-Case 'A card that offers a list is not named after one of its choices' {
+        # An ID names the thing that is changed, never a value it can be set to.
+        # 'timezone-utc' was fine while UTC was the only option and wrong the day
+        # a list of zones appeared. These are the cards that grow new choices, so
+        # these are the cards where the mistake happens.
+        #
+        # Two-state cards are left out on purpose: 'taskbar-combine' shares the
+        # word 'combine' with 'Never combine' because the thing and the value are
+        # named after the same action, and that is not a fault.
+        $slug = {
+            param([string]$Text)
+            @((($Text -replace '[^A-Za-z0-9]+', ' ').Trim().ToLowerInvariant() -split '\s+') | Where-Object { $_ })
+        }
+        $listCards = @($script:Settings | Where-Object { $_.StateOptions.Count -gt (Get-MaxRadioChoices) })
+        Assert ($listCards.Count -ge 4) "Expected at least four cards offering a list; found $($listCards.Count)."
+        foreach ($card in $listCards) {
+            # The preferred choice only. That is the one an ID gets named after
+            # when a card starts life with a single value. Every other choice
+            # would give false alarms: every Windows zone is called something
+            # Standard Time, and a time-zone card is allowed the word time.
+            $idWords = @(& $slug $card.Id)
+            $shared = @(@(& $slug $card.PreferredState) | Where-Object { $idWords -contains $_ })
+            Assert (-not $shared.Count) "'$($card.Id)' is named after part of its preferred choice '$($card.PreferredState)' ($($shared -join ', ')). An ID names the setting, not a value it can hold."
+        }
+        # Every ID that was renamed to name its setting must stay gone. The
+        # last one was not named after a value, only after what the change is
+        # for, which is the same habit one step further along.
+        foreach ($stale in @('timezone-utc','region-australia','iso-time','never-combine','explorer-this-pc','language-au','windows-update-continuity')) {
+            Assert (-not @($script:Settings | Where-Object Id -eq $stale).Count) "The old ID '$stale' is back."
+        }
     }
     Test-Case 'A card that offers a list leads with the preferred choice and keeps them distinct' {
         $listCards = @($script:Settings | Where-Object { $_.StateOptions.Count -gt (Get-MaxRadioChoices) })
@@ -420,7 +451,7 @@ try {
             Assert ($unique.Count -eq $card.StateOptions.Count) "'$($card.Id)' repeats a choice in its list."
             Assert ($card.DesiredState -eq $card.PreferredState) "'$($card.Id)' does not start on its preferred choice."
         }
-        foreach ($id in @('timezone-utc','region-australia','display-language','iso-time')) {
+        foreach ($id in @('time-zone','region','display-language','date-time-format')) {
             $card = $script:Settings | Where-Object Id -eq $id
             Assert ($card.Section -eq 'Tweaks') "'$id' left the Tweaks section."
             Assert ($card.StateOptions.Count -gt (Get-MaxRadioChoices)) "'$id' no longer offers a list of choices."
@@ -431,11 +462,11 @@ try {
         $auPacks = @((Get-LanguageChoiceTable)['Australian English (en-AU)'].Packs)
         Assert ($auPacks[0] -eq 'en-AU' -and $auPacks -contains 'en-GB') "Australian English must fall back to the British pack; the chain is $($auPacks -join ',')."
         Assert ((Get-LanguageChoiceTable)['Australian English (en-AU)'].Tag -eq 'en-AU') 'Australian English must ask Windows for en-AU.'
-        Assert (($script:Settings | Where-Object Id -eq 'region-australia').PreferredState -eq 'Australia (en-AU)') 'The preferred region is not Australia.'
-        Assert (($script:Settings | Where-Object Id -eq 'timezone-utc').PreferredState -eq 'UTC') 'The preferred time zone is not UTC.'
+        Assert (($script:Settings | Where-Object Id -eq 'region').PreferredState -eq 'Australia (en-AU)') 'The preferred region is not Australia.'
+        Assert (($script:Settings | Where-Object Id -eq 'time-zone').PreferredState -eq 'UTC') 'The preferred time zone is not UTC.'
     }
     Test-Case 'Every date and time choice writes a complete distinct set of values' {
-        $card = $script:Settings | Where-Object Id -eq 'iso-time'
+        $card = $script:Settings | Where-Object Id -eq 'date-time-format'
         Assert ($card.PreferredState -like 'ISO-style*') 'ISO-style is no longer the preferred date and time format.'
         # A choice that left a value out would blend into the previous choice.
         foreach ($state in $card.StateOptions) {
@@ -814,7 +845,7 @@ try {
         try {
             $entry = @([pscustomobject]@{ Scope='Machine' })
             $all = @(
-                [pscustomobject]@{ Id='timezone-utc'; Name='Time zone'; DesiredState='UTC'; Kind='Registry'; Entries=$entry }
+                [pscustomobject]@{ Id='time-zone'; Name='Time zone'; DesiredState='UTC'; Kind='Registry'; Entries=$entry }
                 [pscustomobject]@{ Id='display-language'; Name='Display language'; DesiredState='British English (en-GB)'; Kind='Language'; Entries=$entry }
                 [pscustomobject]@{ Id='onedrive'; Name='OneDrive'; DesiredState='Disabled'; Kind='Registry'; Entries=$entry }
                 [pscustomobject]@{ Id='edge-copilot'; Name='Copilot in Edge'; DesiredState='Disabled'; Kind='Registry'; Entries=$entry }
@@ -825,7 +856,7 @@ try {
             function Get-DisplayLanguagePackSource { param([string]$Language) '' }
             Clear-DisplayPackCache
             $split = Split-SlowPlanRequests $plan $all
-            Assert ((@($split.Quick) | ForEach-Object { $_.Id }) -join ',' -eq 'timezone-utc,onedrive,edge-copilot') 'The quick settings were reordered or lost.'
+            Assert ((@($split.Quick) | ForEach-Object { $_.Id }) -join ',' -eq 'time-zone,onedrive,edge-copilot') 'The quick settings were reordered or lost.'
             Assert ((@($split.Slow) | ForEach-Object { $_.Id }) -join ',' -eq 'display-language') 'The slow language step was not separated out.'
             # A pack that is already here is not slow, so nothing is moved.
             function Get-DisplayLanguagePackSource { param([string]$Language) 'en-GB' }
@@ -848,7 +879,7 @@ try {
             $results = Invoke-AdministratorPlan $plan $all
             $elapsed = $watch.Elapsed.TotalSeconds
             $ids = @(foreach ($result in $results) { [string]$result.Id })
-            Assert (($ids -join ',') -eq 'timezone-utc,onedrive,edge-copilot,display-language') "The plan ran in the order $($ids -join ',')."
+            Assert (($ids -join ',') -eq 'time-zone,onedrive,edge-copilot,display-language') "The plan ran in the order $($ids -join ',')."
             # Three quick settings of 0.7s plus a 6s download is 8.1s one after the
             # other. Overlapped it is about 6s, so anything under 7.5s proves it.
             Assert ($elapsed -lt 7.5) "The download did not overlap the quick settings: the plan took $([math]::Round($elapsed,1))s."
