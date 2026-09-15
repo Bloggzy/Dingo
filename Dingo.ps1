@@ -3334,7 +3334,7 @@ function Invoke-AdministratorPlan([array]$Plan, [array]$AllSettings, [string]$Ch
         $index++
         # Checked between settings, so a stop never lands halfway through one.
         if (Test-WorkerCancelled) {
-            Write-Log 'WARN' "Administrator worker stopped at the user's request before [$($request.Id)]; $($results.Count) of $total setting(s) were done."
+            Write-Log 'WARN' "Administrator worker stopped at the user's request before [$($request.Id)]; $($results.Count) of $total change(s) were done."
             Stop-PrestartedPackJobs
             break
         }
@@ -4345,8 +4345,13 @@ if ($SelfTest) {
     if ($trimmed.Length -gt 180) { throw "A long detail was not shortened: $($trimmed.Length) characters." }
     if ($trimmed -notmatch '\.\.\.$') { throw "A shortened detail must say it was shortened: $trimmed" }
     # Both counts must be named, so nobody has to guess what 26 and 43 mean.
-    if ($sourceText -notmatch 'Step 1 of 2: \$administratorCount of the \$planCount') { throw 'The administrator count must say what it counts.' }
-    if ($sourceText -notmatch 'Step 2 of 2: applying and checking all \$planCount') { throw 'The whole-plan count must say what it counts.' }
+    if ($sourceText -notmatch 'Step 1 of 2: \$administratorCount of the \$planCount change') { throw 'The administrator count must say what it counts.' }
+    if ($sourceText -notmatch 'Step 2 of 2: applying and checking all \$planCount change') { throw 'The whole-plan count must say what it counts.' }
+    # A plan holds tools, shortcuts, file types and the PATH as well as Windows
+    # settings, so no count may call the whole lot "settings".
+    foreach ($countedLine in @($sourceText -split "`n" | Where-Object { $_ -match 'Write-CliStatus' -and $_ -match '\$planCount|\$\(\$selected\.Count\)' })) {
+        if ($countedLine -match 'setting\(s\)') { throw "A count calls mixed changes settings: $($countedLine.Trim())" }
+    }
     # A step with nothing running must return at once rather than wait for ever.
     Wait-AdministratorChangesOnConsole $null
     Wait-AdministratorChangesOnConsole ([PSCustomObject]@{ Process=$null; ProgressPath='' })
@@ -4562,7 +4567,7 @@ if ($MachineWorker) {
 
         if ($TargetUserSid -notmatch '^S-\d(?:-\d+)+$') { throw 'The desktop user SID supplied to the administrator step is invalid.' }
         $plan = @(ConvertFrom-JsonList (Get-Content -LiteralPath $PlanPath -Raw))
-        Write-Log 'INFO' "Administrator worker received $($plan.Count) setting(s)."
+        Write-Log 'INFO' "Administrator worker received $($plan.Count) change(s)."
         Set-WorkerProgressStep 0 @($plan).Count '' '' 'Starting' 'Administrator approval accepted'
         $results = Invoke-AdministratorPlan $plan $script:Settings $ResultPath
         Write-WorkerResults $results $ResultPath
@@ -4648,19 +4653,19 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
                     Version=$script:DingoVersion; Mode='WhatIf'; Success=(-not [bool]$blocked); ExitCode=$exitCode; Changed=$false; Elevated=$elevatedDryRun; Skipped=$skipped; Plan=$plan
                 }) -Depth 7))
             } else {
-                Write-CliStatus "Dingo dry run: $($selected.Count) preferred setting(s) would be applied. No changes were made."
+                Write-CliStatus "Dingo dry run: $($selected.Count) change(s) would be made. Nothing was changed."
                 if ($skippedNotice) { Write-CliStatus $skippedNotice }
                 [Console]::Out.WriteLine(($plan | Format-Table Id,Name,Kind,Scope,RequiresAdmin,Available,CurrentStatus,CurrentState,Target -AutoSize | Out-String -Width 240).TrimEnd())
                 foreach ($advised in @($plan | Where-Object Advisory)) { [Console]::Out.WriteLine("[$($advised.Id)] Caveat: $($advised.Advisory)") }
                 foreach ($failure in $blocked) { [Console]::Error.WriteLine("[$($failure.Id)] Preflight failed: $($failure.Message)") }
             }
-            Write-Log 'INFO' "Quick-apply dry run completed for $($selected.Count) setting(s)."
+            Write-Log 'INFO' "Quick-apply dry run completed for $($selected.Count) change(s)."
         } else {
             if ($blocked) { throw "Preflight failed: $(@($blocked | ForEach-Object { "[$($_.Id)] $($_.Message)" }) -join '; ')" }
             $planCount = $selected.Count
-            Write-CliStatus "Dingo quick apply: applying $planCount preferred setting(s)."
+            Write-CliStatus "Dingo quick apply: applying $planCount change(s)."
             if ($skippedNotice) { Write-CliStatus $skippedNotice }
-            Write-Log 'INFO' "Quick apply started for $planCount setting(s)."
+            Write-Log 'INFO' "Quick apply started for $planCount change(s)."
             if ($skippedNotice) { Write-Log 'INFO' $skippedNotice }
             $administratorResults = @{}
             $administratorCount = @($selected | Where-Object RequiresAdmin).Count
@@ -4668,7 +4673,7 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
                 # Two counts appear in this output, so say what each one is for.
                 # These are the settings Windows must approve; they are applied
                 # first, by a second process, and counted out of their own total.
-                Write-CliStatus "Step 1 of 2: $administratorCount of the $planCount setting(s) need administrator approval."
+                Write-CliStatus "Step 1 of 2: $administratorCount of the $planCount change(s) need administrator approval."
                 $operation = Start-AdministratorChanges $selected
                 Wait-AdministratorChangesOnConsole $operation
                 $administratorResults = Complete-AdministratorChanges $operation
@@ -4676,7 +4681,7 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             # Every selected setting passes through here, approved ones included:
             # this is where each one is finished off and its final state read
             # back. So this count is the whole plan, not the administrator part.
-            Write-CliStatus "Step 2 of 2: applying and checking all $planCount setting(s)."
+            Write-CliStatus "Step 2 of 2: applying and checking all $planCount change(s)."
             $results = New-Object System.Collections.ArrayList
             $stepNumber = 0
             foreach ($item in $selected) {
@@ -5568,7 +5573,7 @@ $ApplyButton.Add_Click({
             return
         }
         Set-ActionButtonsEnabled $false
-        Write-Log 'INFO' "Applying $($selected.Count) setting(s) as desktop user $([Security.Principal.WindowsIdentity]::GetCurrent().Name)."
+        Write-Log 'INFO' "Applying $($selected.Count) change(s) as desktop user $([Security.Principal.WindowsIdentity]::GetCurrent().Name)."
         $adminItems = @($selected | Where-Object RequiresAdmin)
         if (-not $adminItems) {
             Complete-ApplyChanges $selected @{}

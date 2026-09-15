@@ -70,22 +70,24 @@ Add `-OutputFormat Json` to `-WhatIf`, `-ApplyPreferred`, or `-ListSettings` for
 A run has two steps, and each one counts to its own total:
 
 ```
-Dingo quick apply: applying 43 preferred setting(s).
-Step 1 of 2: 26 of the 43 setting(s) need administrator approval.
+Dingo quick apply: applying 43 change(s).
+Step 1 of 2: 26 of the 43 change(s) need administrator approval.
   1/26 Time zone
   2/26 Region and formats
   still working: Display language: Downloading - Windows is downloading the en-GB pack... [3:00 so far]
   26/26 Display language
-Step 2 of 2: applying and checking all 43 setting(s).
+Step 2 of 2: applying and checking all 43 change(s).
   1/43 [timezone-utc] Applying UTC...
   1/43 [timezone-utc] Succeeded: UTC
 ```
 
-**Step 1** is the part Windows must approve. It runs first, in a second process, so it is counted out of its own total. A line appears as each setting finishes.
+The word is **change**, not setting. A plan holds Windows settings, but also tools to install, shortcuts to write, file types to claim, and the PATH.
 
-**Step 2** is every selected setting, the approved ones included. This is where each one is finished off and its final state read back, so this count is the whole plan.
+**Step 1** is the part Windows must approve. It runs first, in a second process, so it is counted out of its own total. A line appears as each change finishes.
 
-A step that runs for a long time, such as a language pack or a tool download, says `still working` once a minute with the time so far. A quiet screen never means a stopped run. Full detail goes to the log either way.
+**Step 2** is every selected change, the approved ones included. This is where each one is finished off and its final state read back, so this count is the whole plan.
+
+A change that takes a long time, such as a language pack or a tool download, says `still working` once a minute with the time so far. A quiet screen never means a stopped run. Full detail goes to the log either way.
 
 ### Run the script directly
 
