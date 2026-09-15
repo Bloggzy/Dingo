@@ -9,6 +9,14 @@ foreach ($statement in $ast.EndBlock.Statements) {
     if ($statement -is [Management.Automation.Language.FunctionDefinitionAst]) { Invoke-Expression $statement.Extent.Text }
 }
 $script:LogFile=$null
+$script:DefaultToolRoot='C:\DFIR\Tools'
+$script:ToolRootToken='%DINGO_TOOL_ROOT%'
+$script:ToolRootVariableName='DINGO_TOOL_ROOT'
+$script:ActiveToolRoot=$script:DefaultToolRoot
+$script:ToolRootWarning=''
+$script:ToolRootRejected=$false
+# Sets the launcher folder and publishes the token, the same as a real start.
+[void](Set-DingoToolRoot $script:DefaultToolRoot)
 $script:Passed=0
 function Assert($Condition,$Message) { if (-not $Condition) { throw $Message } }
 function Test-Case($Name,[scriptblock]$Body) { & $Body; $script:Passed++; "PASS $Name" }
