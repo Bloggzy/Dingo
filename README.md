@@ -89,7 +89,17 @@ The word is **change**, not setting. A plan holds Windows settings, but also too
 
 **Step 2** is every selected change, the approved ones included. This is where each one is finished off and its final state read back, so this count is the whole plan.
 
-A change that takes a long time, such as a language pack or a tool download, says `still working` once a minute with the time so far. A quiet screen never means a stopped run. Full detail goes to the log either way.
+A change that takes a long time, such as a language pack or a tool download, says `still working` once a minute with the time so far.
+
+When the run ends, anything you still have to do is printed as a **Next** line:
+
+```
+Dingo finished: 42 succeeded; 1 partially applied; 0 failed. Log: ...
+Next: Close this terminal and open a new one before the tool commands work. A PATH change reaches new windows only. The launchers are in C:\DFIR\Tools\bin.
+Next: Display language needs you to sign out and back in, or restart Windows, before it can finish applying. Then run Dingo again to check.
+```
+
+The PATH line is left out when this terminal already has the folder, so it only appears when you really are waiting on something. A quiet screen never means a stopped run. Full detail goes to the log either way.
 
 ### Run the script directly
 

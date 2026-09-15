@@ -1222,15 +1222,17 @@ function Find-ToolDetectionRule($rule) {
     return $null
 }
 
-function Get-RestartInstruction([string[]]$SettingNames) {
+function Get-RestartInstruction([string[]]$SettingNames, [string]$ThenDo = 'Then click Read settings again.') {
+    # The last sentence differs by where it is read. A window has a button to
+    # press; a command line has a command to run again.
     $names = @($SettingNames | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)
     if ($names.Count -eq 1) {
-        return "$($names[0]) needs you to sign out and back in, or restart Windows, before it can finish applying. Then click Read settings again."
+        return "$($names[0]) needs you to sign out and back in, or restart Windows, before it can finish applying. $ThenDo"
     }
     if ($names.Count -gt 1) {
-        return "These settings need you to sign out and back in, or restart Windows, before they can finish applying: $($names -join ', '). Then click Read settings again."
+        return "These settings need you to sign out and back in, or restart Windows, before they can finish applying: $($names -join ', '). $ThenDo"
     }
-    'Sign out and back in, or restart Windows, to finish applying the selected settings. Then click Read settings again.'
+    "Sign out and back in, or restart Windows, to finish applying the selected settings. $ThenDo"
 }
 
 function Show-RestartNotice([string]$Message) {
@@ -3459,6 +3461,32 @@ function Format-WorkerStillWorkingLine($Progress, [TimeSpan]$StepElapsed, [int]$
     return "$line [$(Format-Duration $StepElapsed) so far]"
 }
 
+function Get-RunFollowUpLines($Results, $Selected, [string]$ProcessPath = $null) {
+    # What the person still has to do once the run is over. The window says this
+    # in a box; a command-line run said nothing at all, so a PATH that reaches
+    # new windows only looked like a PATH that had not worked.
+    if ($null -eq $ProcessPath) { $ProcessPath = [string]$env:Path }
+    $lines = New-Object System.Collections.ArrayList
+
+    $pathApplied = @($Results | Where-Object { $_.Id -eq 'tools-on-path' -and $_.Outcome -ne 'Failed' }).Count -gt 0
+    $pathWanted = @($Selected | Where-Object { $_.Id -eq 'tools-on-path' -and $_.DesiredState -eq 'On the PATH' }).Count -gt 0
+    # Nothing to say when this very window already has the folder. The person is
+    # not waiting on anything, and a needless instruction is worse than silence.
+    if ($pathApplied -and $pathWanted -and -not (Test-PathContainsFolder $ProcessPath $script:ShimDirectory)) {
+        [void]$lines.Add("Close this terminal and open a new one before the tool commands work. A PATH change reaches new windows only. The launchers are in $script:ShimDirectory.")
+    }
+
+    # A change that failed outright needs no sign-out; there is nothing waiting
+    # to take effect. One that is only partly applied does.
+    $restartNames = @($Results | Where-Object Outcome -ne 'Failed' | ForEach-Object {
+        $finishedId = $_.Id
+        $Selected | Where-Object { $_.Id -eq $finishedId -and $_.RestartRequired }
+    } | ForEach-Object { [string]$_.Name })
+    if ($restartNames.Count) { [void]$lines.Add((Get-RestartInstruction $restartNames 'Then run Dingo again to check.')) }
+
+    return @($lines)
+}
+
 function Wait-AdministratorChangesOnConsole($Operation, [int]$PollMilliseconds = 500, [int]$HeartbeatSeconds = 60) {
     # A command-line run would otherwise print nothing at all between the Windows
     # approval prompt and the last result, and a tool download can take half an
@@ -4347,7 +4375,7 @@ if ($SelfTest) {
     # when execution reaches it, and a quick apply exits long before the window
     # code is read, so every reader it uses must stand above that block.
     $sourceText = Get-Content -LiteralPath $PSCommandPath -Raw -ErrorAction Stop
-    $quickApplyOffset = $sourceText.IndexOf('Dingo quick apply: applying')
+    $quickApplyOffset = $sourceText.LastIndexOf('Dingo quick apply: applying')
     if ($quickApplyOffset -lt 0) { throw 'The quick-apply block could not be found in the source.' }
     foreach ($needed in @('Format-Duration','Read-WorkerProgressFile','Read-WorkerFinishedIds','Format-WorkerStillWorkingLine','Wait-AdministratorChangesOnConsole')) {
         $definedAt = $sourceText.IndexOf("function $needed")
@@ -4379,8 +4407,8 @@ if ($SelfTest) {
     # A caveat has to reach the screen before the work starts, or a ten minute
     # download is just an unexplained wait. A dry run has always printed them;
     # so must a real run, and before the administrator step is started.
-    $noteOffset = $sourceText.IndexOf('Write-CliStatus "  Note [$($item.Id)]: $advisory"')
-    $adminStartOffset = $sourceText.IndexOf('$operation = Start-AdministratorChanges $selected')
+    $noteOffset = $sourceText.LastIndexOf('Write-CliStatus "  Note [$($item.Id)]: $advisory"')
+    $adminStartOffset = $sourceText.LastIndexOf('$operation = Start-AdministratorChanges $selected')
     if ($noteOffset -lt 0) { throw 'A quick apply must print the caveats it knows about.' }
     if ($adminStartOffset -lt 0 -or $noteOffset -gt $adminStartOffset) { throw 'Caveats must be printed before the administrator step starts.' }
     if ($noteOffset -lt $quickApplyOffset) { throw 'The caveats must belong to the quick-apply block.' }
@@ -4389,6 +4417,47 @@ if ($SelfTest) {
     foreach ($mustSay in @('about ten minutes', 'Windows Update', 'every other selected change still runs')) {
         if ($sourceText -notmatch [regex]::Escape($mustSay)) { throw "The display language caveat no longer says '$mustSay'." }
     }
+    # A run that changes the PATH or needs a sign-out has to say so at the end.
+    # The window puts it in a box; a command-line run has only this line.
+    # Searched from the end: every phrase below also appears in the line that
+    # searches for it, and the code being checked comes after the self-test.
+    $followUpOffset = $sourceText.LastIndexOf('Write-CliStatus "Next: $line"')
+    if ($followUpOffset -lt 0) { throw 'A command-line run must say what is still needed when it finishes.' }
+    if ($followUpOffset -lt $sourceText.LastIndexOf('Dingo finished: $succeeded succeeded')) { throw 'The follow-up must come after the results, not before them.' }
+    # The PATH line, driven rather than read out of the source. The folder is on
+    # the stand-in PATH in one case and absent in the other, and nothing here
+    # touches the real environment.
+    $pathPlan = @([PSCustomObject]@{ Id='tools-on-path'; DesiredState='On the PATH'; Name='Run tools from anywhere'; RestartRequired=$false })
+    $pathDone = @([PSCustomObject]@{ Id='tools-on-path'; Outcome='Succeeded' })
+    $pathLines = @(Get-RunFollowUpLines $pathDone $pathPlan 'C:\Windows;C:\Windows\System32')
+    if ($pathLines.Count -ne 1) { throw "A PATH change must produce one instruction; got $($pathLines.Count)." }
+    if ($pathLines[0] -notmatch 'Close this terminal and open a new one') { throw "The PATH instruction reads wrong: $($pathLines[0])" }
+    if ($pathLines[0] -notmatch [regex]::Escape($script:ShimDirectory)) { throw 'The PATH instruction must name the launcher folder.' }
+    $alreadyOnPath = @(Get-RunFollowUpLines $pathDone $pathPlan "C:\Windows;$($script:ShimDirectory)")
+    if ($alreadyOnPath.Count) { throw "A terminal that already has the folder needs no instruction: $($alreadyOnPath[0])" }
+    $pathFailed = @(Get-RunFollowUpLines @([PSCustomObject]@{ Id='tools-on-path'; Outcome='Failed' }) $pathPlan 'C:\Windows')
+    if ($pathFailed.Count) { throw 'A PATH change that failed must not claim a new terminal will help.' }
+    $pathRemoved = @(Get-RunFollowUpLines $pathDone @([PSCustomObject]@{ Id='tools-on-path'; DesiredState='Not on the PATH'; Name='Run tools from anywhere'; RestartRequired=$false }) 'C:\Windows')
+    if ($pathRemoved.Count) { throw 'Taking the folder off the PATH must not ask for a new terminal.' }
+    # The sign-out line, and both together.
+    $signOutPlan = @([PSCustomObject]@{ Id='display-language'; DesiredState='Australian English (en-AU)'; Name='Display language'; RestartRequired=$true })
+    $signOutLines = @(Get-RunFollowUpLines @([PSCustomObject]@{ Id='display-language'; Outcome='PartiallyApplied' }) $signOutPlan 'C:\Windows')
+    if ($signOutLines.Count -ne 1 -or $signOutLines[0] -notmatch 'sign out and back in') { throw "A change needing a sign-out must say so: $($signOutLines -join ' | ')" }
+    if ($signOutLines[0] -match 'click') { throw 'A command line has no button to click.' }
+    $bothLines = @(Get-RunFollowUpLines ($pathDone + @([PSCustomObject]@{ Id='display-language'; Outcome='Succeeded' })) ($pathPlan + $signOutPlan) 'C:\Windows')
+    if ($bothLines.Count -ne 2) { throw "Two outstanding jobs must produce two lines; got $($bothLines.Count)." }
+    # A quiet run says nothing at all.
+    $quietLines = @(Get-RunFollowUpLines @([PSCustomObject]@{ Id='hidden-files'; Outcome='Succeeded' }) @([PSCustomObject]@{ Id='hidden-files'; DesiredState='Shown'; Name='Hidden files'; RestartRequired=$false }) 'C:\Windows')
+    if ($quietLines.Count) { throw "A run with nothing outstanding must stay quiet: $($quietLines[0])" }
+    # The closing sentence has to suit where it is read.
+    $windowRestart = Get-RestartInstruction @('Display language')
+    if ($windowRestart -notmatch 'Then click Read settings again\.$') { throw "The window wording changed: $windowRestart" }
+    $consoleRestart = Get-RestartInstruction @('Display language') 'Then run Dingo again to check.'
+    if ($consoleRestart -notmatch 'Then run Dingo again to check\.$') { throw "The command-line wording is wrong: $consoleRestart" }
+    if ($consoleRestart -match 'click') { throw "A command line has no button to click: $consoleRestart" }
+    if ($consoleRestart -notmatch 'Display language') { throw 'The restart line must name the setting that needs it.' }
+    $manyRestart = Get-RestartInstruction @('Display language','Region and formats') 'Then run Dingo again to check.'
+    if ($manyRestart -notmatch 'Display language, Region and formats') { throw "Two settings did not both get named: $manyRestart" }
     # A plan holds tools, shortcuts, file types and the PATH as well as Windows
     # settings, so no count may call the whole lot "settings".
     foreach ($countedLine in @($sourceText -split "`n" | Where-Object { $_ -match 'Write-CliStatus' -and $_ -match '\$planCount|\$\(\$selected\.Count\)' })) {
@@ -4400,8 +4469,8 @@ if ($SelfTest) {
     # Closing File Explorer repaints every console on the desktop, so a command
     # line run must have finished printing before it happens. Otherwise stale
     # lines are redrawn over the results and a good run looks like a bad one.
-    $finishedOffset = $sourceText.IndexOf('Dingo finished: $succeeded succeeded')
-    $restartOffset = $sourceText.IndexOf('if ($restartExplorer -and -not $NoRestartExplorer)')
+    $finishedOffset = $sourceText.LastIndexOf('Dingo finished: $succeeded succeeded')
+    $restartOffset = $sourceText.LastIndexOf('if ($restartExplorer -and -not $NoRestartExplorer)')
     if ($finishedOffset -lt 0 -or $restartOffset -lt 0) { throw 'The quick-apply ending could not be found in the source.' }
     if ($restartOffset -lt $finishedOffset) { throw 'A command-line run must print its results before File Explorer is restarted.' }
     $pathSetting = $script:Settings | Where-Object Id -eq 'tools-on-path' | Select-Object -First 1
@@ -4767,6 +4836,10 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             } else {
                 [Console]::Out.WriteLine(($resultRows | Format-Table Id,Outcome,CurrentState,Message -AutoSize | Out-String -Width 220).TrimEnd())
                 Write-CliStatus "Dingo finished: $succeeded succeeded; $partial partially applied; $failed failed. Log: $script:LogFile"
+            }
+            foreach ($line in @(Get-RunFollowUpLines $results $selected)) {
+                Write-CliStatus "Next: $line"
+                Write-Log 'INFO' "Follow-up: $line"
             }
             # Last of all, because closing File Explorer repaints every console
             # on the desktop. Doing it earlier redraws stale lines over the
