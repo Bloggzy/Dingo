@@ -65,7 +65,39 @@ Start-Dingo.cmd -Version
 
 Add `-OutputFormat Json` to `-WhatIf`, `-ApplyPreferred`, or `-ListSettings` for machine-readable output. Add `-NoRestartExplorer` to skip the File Explorer restart.
 
-While the administrator step runs, Dingo names each card as it reaches it, and repeats the line once a minute for a step that is still running. A tool download can take half an hour, so a quiet screen never means a stopped run. Full detail goes to the log either way.
+### What a run prints
+
+A run has two steps, and each one counts to its own total:
+
+```
+Dingo quick apply: applying 43 preferred setting(s).
+Step 1 of 2: 26 of the 43 setting(s) need administrator approval.
+  1/26 Time zone
+  2/26 Region and formats
+  still working: Display language: Downloading - Windows is downloading the en-GB pack... [3:00 so far]
+  26/26 Display language
+Step 2 of 2: applying and checking all 43 setting(s).
+  1/43 [timezone-utc] Applying UTC...
+  1/43 [timezone-utc] Succeeded: UTC
+```
+
+**Step 1** is the part Windows must approve. It runs first, in a second process, so it is counted out of its own total. A line appears as each setting finishes.
+
+**Step 2** is every selected setting, the approved ones included. This is where each one is finished off and its final state read back, so this count is the whole plan.
+
+A step that runs for a long time, such as a language pack or a tool download, says `still working` once a minute with the time so far. A quiet screen never means a stopped run. Full detail goes to the log either way.
+
+### Tab completion
+
+Type `.\Dingo.ps1 -` and press Tab. PowerShell reads the switches from the script, so this works with no setup.
+
+The `.cmd` launcher needs one extra line, because PowerShell cannot read the switches of a batch file:
+
+```powershell
+. .\Dingo.Completion.ps1
+```
+
+Then `.\Start-Dingo.cmd -` and Tab offers the same switches, and `-Include`, `-Exclude`, and `-OutputFormat` offer their values. Put that line in your profile (`notepad $PROFILE`) to have it in every window. The file reads the switch list from `Dingo.ps1`, so it cannot fall behind. It changes nothing about how Dingo runs.
 
 Add `-ToolRoot` to use a different tools folder for one run, without saving it:
 

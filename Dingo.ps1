@@ -3421,17 +3421,20 @@ function Read-WorkerFinishedIds([string]$Path) {
     } catch { return @() }
 }
 
-function Format-WorkerProgressLine($Progress, [TimeSpan]$StepElapsed) {
-    $index = [int](Get-JsonField $Progress 'Index' 0)
-    $total = [int](Get-JsonField $Progress 'Total' 0)
+function Format-WorkerStillWorkingLine($Progress, [TimeSpan]$StepElapsed, [int]$DetailLimit = 110) {
+    # Said about a step that has been running a while. It carries no number: the
+    # numbered lines count settings that have finished, and this one has not.
     $name = [string](Get-JsonField $Progress 'Name' '')
     $phase = [string](Get-JsonField $Progress 'Phase' '')
     $detail = [string](Get-JsonField $Progress 'Detail' '')
-    $counter = if ($total -gt 0) { "$index/$total " } else { '' }
     $words = @($name, $phase) | Where-Object { $_ }
-    $line = "  $counter$($words -join ': ')"
-    if ($detail -and $detail -ne $phase) { $line += " - $detail" }
-    # The time is only worth printing once a step has been running a while.
+    $line = "  still working: $($words -join ': ')"
+    if ($detail -and $detail -ne $phase) {
+        # Some steps write a paragraph. A console line that wraps three times is
+        # harder to read than a short one, and the log keeps the whole thing.
+        if ($detail.Length -gt $DetailLimit) { $detail = $detail.Substring(0, $DetailLimit).TrimEnd() + '...' }
+        $line += " - $detail"
+    }
     if ($StepElapsed.TotalSeconds -lt 1) { return $line }
     return "$line [$(Format-Duration $StepElapsed) so far]"
 }
@@ -3439,39 +3442,51 @@ function Format-WorkerProgressLine($Progress, [TimeSpan]$StepElapsed) {
 function Wait-AdministratorChangesOnConsole($Operation, [int]$PollMilliseconds = 500, [int]$HeartbeatSeconds = 60) {
     # A command-line run would otherwise print nothing at all between the Windows
     # approval prompt and the last result, and a tool download can take half an
-    # hour. The worker already writes down every step for the window, so read the
-    # same file and say what it says.
+    # hour.
+    #
+    # One line per setting, printed when that setting finishes. The count comes
+    # from the worker's result file, which only ever grows, so no setting is
+    # missed however fast it runs. The progress file says what is running right
+    # now, and that is used only for the "still working" line, because a step
+    # such as a language pack rewrites it every few seconds.
     if (-not $Operation -or -not $Operation.Process) { return }
-    $waiting = $true
-    $lastKey = ''
+    $names = @{}
+    $planned = @($Operation.Selected | Where-Object RequiresAdmin)
+    foreach ($item in $planned) { $names[[string]$item.Id] = [string]$item.Name }
+    $total = $planned.Count
+    $announced = @{}
+    $done = 0
+    $approvalSeen = $false
+    $currentKey = ''
     $stepStarted = Get-Date
     $lastHeartbeat = Get-Date
-    while (-not $Operation.Process.HasExited) {
-        Start-Sleep -Milliseconds $PollMilliseconds
-        $progress = Read-WorkerProgressFile $Operation.ProgressPath
-        if (-not $progress) {
-            # Nothing has ever been published, which almost always means the
-            # Windows approval prompt is still on screen.
-            if ($waiting -and ((Get-Date) - $lastHeartbeat).TotalSeconds -ge $HeartbeatSeconds) {
-                Write-CliStatus '  Still waiting for administrator approval. Accept the Windows prompt to let Dingo continue.'
-                $lastHeartbeat = Get-Date
-            }
-            continue
-        }
-        $waiting = $false
-        $key = '{0}|{1}|{2}' -f [string](Get-JsonField $progress 'Id' ''), [string](Get-JsonField $progress 'Phase' ''), [string](Get-JsonField $progress 'Detail' '')
-        if ($key -ne $lastKey) {
-            $lastKey = $key
-            $stepStarted = Get-Date
+    while ($true) {
+        $running = -not $Operation.Process.HasExited
+        foreach ($finishedId in @(Read-WorkerFinishedIds $Operation.ResultPath)) {
+            if ($announced.ContainsKey($finishedId)) { continue }
+            $announced[$finishedId] = $true
+            $done++
+            $label = if ($names.ContainsKey($finishedId)) { $names[$finishedId] } else { $finishedId }
+            Write-CliStatus ("  {0}/{1} {2}" -f $done, $total, $label)
+            $approvalSeen = $true
             $lastHeartbeat = Get-Date
-            Write-CliStatus (Format-WorkerProgressLine $progress ([TimeSpan]::Zero))
-            continue
         }
-        # One step can run for many minutes. Say so, rather than look stopped.
+        $progress = Read-WorkerProgressFile $Operation.ProgressPath
+        if ($progress) {
+            $approvalSeen = $true
+            $key = '{0}|{1}' -f [string](Get-JsonField $progress 'Id' ''), [string](Get-JsonField $progress 'Phase' '')
+            if ($key -ne $currentKey) { $currentKey = $key; $stepStarted = Get-Date }
+        }
+        if (-not $running) { break }
         if (((Get-Date) - $lastHeartbeat).TotalSeconds -ge $HeartbeatSeconds) {
             $lastHeartbeat = Get-Date
-            Write-CliStatus (Format-WorkerProgressLine $progress ((Get-Date) - $stepStarted))
+            if (-not $approvalSeen) {
+                Write-CliStatus '  Still waiting for administrator approval. Accept the Windows prompt to let Dingo continue.'
+            } elseif ($progress) {
+                Write-CliStatus (Format-WorkerStillWorkingLine $progress ((Get-Date) - $stepStarted))
+            }
         }
+        Start-Sleep -Milliseconds $PollMilliseconds
     }
 }
 
@@ -4305,24 +4320,33 @@ if ($SelfTest) {
     $sourceText = Get-Content -LiteralPath $PSCommandPath -Raw -ErrorAction Stop
     $quickApplyOffset = $sourceText.IndexOf('Dingo quick apply: applying')
     if ($quickApplyOffset -lt 0) { throw 'The quick-apply block could not be found in the source.' }
-    foreach ($needed in @('Format-Duration','Read-WorkerProgressFile','Read-WorkerFinishedIds','Format-WorkerProgressLine','Wait-AdministratorChangesOnConsole')) {
+    foreach ($needed in @('Format-Duration','Read-WorkerProgressFile','Read-WorkerFinishedIds','Format-WorkerStillWorkingLine','Wait-AdministratorChangesOnConsole')) {
         $definedAt = $sourceText.IndexOf("function $needed")
         if ($definedAt -lt 0) { throw "'$needed' is missing." }
         if ($definedAt -gt $quickApplyOffset) { throw "'$needed' is defined after the quick-apply block, so a command-line run could never call it." }
     }
     if ($sourceText.IndexOf('Wait-AdministratorChangesOnConsole $operation') -lt 0) { throw 'A command-line run must watch the administrator step.' }
-    # A progress reading turns into one readable line, and a missing field is
-    # left out rather than printed as an empty word.
-    $progressLine = Format-WorkerProgressLine ([PSCustomObject]@{
+    # The "still working" line names the step and how long it has run, and it
+    # carries no counter: the numbered lines count settings that have finished.
+    $workingLine = Format-WorkerStillWorkingLine ([PSCustomObject]@{
         Index=2; Total=5; Id='tool-eztools'; Name="Eric Zimmerman's tools"; Phase='Installing'; Detail='Downloading'
     }) ([TimeSpan]::FromSeconds(90))
-    foreach ($part in @('2/5', "Eric Zimmerman's tools", 'Installing', 'Downloading', '1:30 so far')) {
-        if ($progressLine -notmatch [regex]::Escape($part)) { throw "A progress line lost '$part': $progressLine" }
+    foreach ($part in @('still working', "Eric Zimmerman's tools", 'Installing', 'Downloading', '1:30 so far')) {
+        if ($workingLine -notmatch [regex]::Escape($part)) { throw "A working line lost '$part': $workingLine" }
     }
-    $sparseLine = Format-WorkerProgressLine ([PSCustomObject]@{ Name='Widgets'; Phase='Applying' }) ([TimeSpan]::Zero)
-    if ($sparseLine -notmatch 'Widgets: Applying') { throw "A progress reading with no counter read badly: $sparseLine" }
+    if ($workingLine -match '2/5') { throw "A working line must carry no counter: $workingLine" }
+    $sparseLine = Format-WorkerStillWorkingLine ([PSCustomObject]@{ Name='Widgets'; Phase='Applying' }) ([TimeSpan]::Zero)
+    if ($sparseLine -notmatch 'Widgets: Applying') { throw "A working line with no detail read badly: $sparseLine" }
     if ($sparseLine -match ' - ') { throw "An absent detail must not be printed: $sparseLine" }
     if ($sparseLine -match 'so far') { throw "A step that just started must not print a time: $sparseLine" }
+    # A step that writes a paragraph must not wrap the console three times.
+    $longDetail = 'Windows is downloading and installing the en-GB language pack. ' * 6
+    $trimmed = Format-WorkerStillWorkingLine ([PSCustomObject]@{ Name='Display language'; Phase='Downloading'; Detail=$longDetail }) ([TimeSpan]::Zero)
+    if ($trimmed.Length -gt 180) { throw "A long detail was not shortened: $($trimmed.Length) characters." }
+    if ($trimmed -notmatch '\.\.\.$') { throw "A shortened detail must say it was shortened: $trimmed" }
+    # Both counts must be named, so nobody has to guess what 26 and 43 mean.
+    if ($sourceText -notmatch 'Step 1 of 2: \$administratorCount of the \$planCount') { throw 'The administrator count must say what it counts.' }
+    if ($sourceText -notmatch 'Step 2 of 2: applying and checking all \$planCount') { throw 'The whole-plan count must say what it counts.' }
     # A step with nothing running must return at once rather than wait for ever.
     Wait-AdministratorChangesOnConsole $null
     Wait-AdministratorChangesOnConsole ([PSCustomObject]@{ Process=$null; ProgressPath='' })
@@ -4333,6 +4357,48 @@ if ($SelfTest) {
     $restartOffset = $sourceText.IndexOf('if ($restartExplorer -and -not $NoRestartExplorer)')
     if ($finishedOffset -lt 0 -or $restartOffset -lt 0) { throw 'The quick-apply ending could not be found in the source.' }
     if ($restartOffset -lt $finishedOffset) { throw 'A command-line run must print its results before File Explorer is restarted.' }
+    # Tab completion for the .cmd launcher lives in its own opt-in file. Its
+    # switch list is read from this script, so the only thing that can rot is
+    # the list of names it hides. Check it here, where a new parameter is added.
+    $completionPath = Join-Path $PSScriptRoot 'Dingo.Completion.ps1'
+    if (Test-Path -LiteralPath $completionPath -PathType Leaf) {
+        $completionErrors = $null
+        $completionTokens = $null
+        $completionAst = [Management.Automation.Language.Parser]::ParseFile($completionPath, [ref]$completionTokens, [ref]$completionErrors)
+        if ($completionErrors.Count) { throw "Dingo.Completion.ps1 does not parse: $($completionErrors[0].Message)" }
+        # Take the reader function alone. Loading the whole file would replace
+        # TabExpansion2 in this process, and a self-test changes nothing.
+        $readerAst = @($completionAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-DingoCompletionSwitch'
+        }, $true))
+        if ($readerAst.Count -ne 1) { throw 'Dingo.Completion.ps1 must define Get-DingoCompletionSwitch once.' }
+        Invoke-Expression $readerAst[0].Extent.Text
+        $offered = @(Get-DingoCompletionSwitch $PSCommandPath)
+        $offeredNames = @($offered | ForEach-Object { $_.Name })
+        # Every switch a person is told to type must be offered.
+        foreach ($public in @('ApplyPreferred','WhatIf','ListSettings','RecoveryReport','Help','Version','Include','Exclude','OutputFormat','NoRestartExplorer','ToolRoot')) {
+            if ($offeredNames -notcontains $public) { throw "Tab completion does not offer -$public." }
+        }
+        # Nothing Dingo passes to its own elevated worker may be offered.
+        foreach ($private in @('MachineWorker','ElevationBroker','WpfHost','PlanPath','ResultPath','WorkerLogPath','ProgressPath','CancelPath','TargetUserSid','UnexpectedArguments')) {
+            if ($offeredNames -contains $private) { throw "Tab completion offers -$private, which is internal plumbing." }
+        }
+        # A parameter that takes a value is marked as such, so the tip reads right.
+        if (-not (@($offered | Where-Object { $_.Name -eq 'Include' }).TakesValue)) { throw '-Include takes a value, and completion must say so.' }
+        if (@($offered | Where-Object { $_.Name -eq 'WhatIf' }).TakesValue) { throw '-WhatIf is a switch, and completion must say so.' }
+        # A name hidden by the file must still be a real parameter of this script.
+        $realNames = @(([Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null)).ParamBlock.Parameters |
+            ForEach-Object { $_.Name.VariablePath.UserPath })
+        $hiddenListAst = @($completionAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$internal'
+        }, $true))
+        if ($hiddenListAst.Count -ne 1) { throw 'Dingo.Completion.ps1 must name the hidden switches once.' }
+        foreach ($hidden in @([regex]::Matches($hiddenListAst[0].Right.Extent.Text, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })) {
+            if ($realNames -notcontains $hidden) { throw "Tab completion hides '$hidden', which is not a parameter of Dingo.ps1 any more." }
+        }
+    }
     $pathSetting = $script:Settings | Where-Object Id -eq 'tools-on-path' | Select-Object -First 1
     if (-not $pathSetting) { throw 'The command-line access setting is missing.' }
     if ($pathSetting.Tab -ne 'Tool shortcuts' -or -not $pathSetting.RequiresAdmin -or -not $pathSetting.CanChoose) {
@@ -4633,23 +4699,34 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             Write-Log 'INFO' "Quick-apply dry run completed for $($selected.Count) setting(s)."
         } else {
             if ($blocked) { throw "Preflight failed: $(@($blocked | ForEach-Object { "[$($_.Id)] $($_.Message)" }) -join '; ')" }
-            Write-CliStatus "Dingo quick apply: applying $($selected.Count) preferred setting(s)."
+            $planCount = $selected.Count
+            Write-CliStatus "Dingo quick apply: applying $planCount preferred setting(s)."
             if ($skippedNotice) { Write-CliStatus $skippedNotice }
-            Write-Log 'INFO' "Quick apply started for $($selected.Count) setting(s)."
+            Write-Log 'INFO' "Quick apply started for $planCount setting(s)."
             if ($skippedNotice) { Write-Log 'INFO' $skippedNotice }
             $administratorResults = @{}
-            if ($selected | Where-Object RequiresAdmin) {
-                Write-CliStatus 'Administrator approval is required for part of this plan.'
+            $administratorCount = @($selected | Where-Object RequiresAdmin).Count
+            if ($administratorCount) {
+                # Two counts appear in this output, so say what each one is for.
+                # These are the settings Windows must approve; they are applied
+                # first, by a second process, and counted out of their own total.
+                Write-CliStatus "Step 1 of 2: $administratorCount of the $planCount setting(s) need administrator approval."
                 $operation = Start-AdministratorChanges $selected
                 Wait-AdministratorChangesOnConsole $operation
                 $administratorResults = Complete-AdministratorChanges $operation
             }
+            # Every selected setting passes through here, approved ones included:
+            # this is where each one is finished off and its final state read
+            # back. So this count is the whole plan, not the administrator part.
+            Write-CliStatus "Step 2 of 2: applying and checking all $planCount setting(s)."
             $results = New-Object System.Collections.ArrayList
+            $stepNumber = 0
             foreach ($item in $selected) {
-                Write-CliStatus "[$($item.Id)] Applying $($item.PreferredState)..."
+                $stepNumber++
+                Write-CliStatus "  $stepNumber/$planCount [$($item.Id)] Applying $($item.PreferredState)..."
                 $result = Invoke-SettingChange $item $administratorResults
                 [void]$results.Add($result)
-                Write-CliStatus "[$($item.Id)] $($result.Outcome): $($item.CurrentState.DisplayText)"
+                Write-CliStatus "  $stepNumber/$planCount [$($item.Id)] $($result.Outcome): $($item.CurrentState.DisplayText)"
             }
             $restartExplorer = @($results | Where-Object Outcome -ne 'Failed' | ForEach-Object {
                 $resultId = $_.Id
