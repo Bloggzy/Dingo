@@ -12,7 +12,7 @@ Nothing is applied until you select it. Every change is shown on a card first, a
 
 ![Dingo main window: the Tweaks section open on the Whole computer tab, showing setting cards and the Tweaks, Tools, and Options sections](Assets/Dingo-main-screen-redacted.png)
 
-Current version: **0.7.5**.
+Current version: **0.7.6**.
 
 ## Use the window
 
@@ -65,6 +65,61 @@ Start-Dingo.cmd -Version
 
 Add `-OutputFormat Json` to `-WhatIf`, `-ApplyPreferred`, or `-ListSettings` for machine-readable output. Add `-NoRestartExplorer` to skip the File Explorer restart.
 
+### What a run prints
+
+A run has two steps, and each one counts to its own total:
+
+```
+Dingo quick apply: applying 43 change(s).
+Step 1 of 2: 26 of the 43 change(s) need administrator approval.
+  1/26 Time zone
+  2/26 Region and formats
+  still working: Display language: Downloading - Windows is downloading the en-GB pack... [3:00 so far]
+  26/26 Display language
+Step 2 of 2: applying and checking all 43 change(s).
+  1/43 [timezone-utc] Applying UTC...
+  1/43 [timezone-utc] Succeeded: UTC
+```
+
+A change that is going to cost real time says so before the work starts, as a **Note** line. The display language is the one that matters: if this computer has no pack for the language you chose, Windows must fetch it from Windows Update, and that one step usually takes about ten minutes. Every other selected change still runs. Deselect the display language, or pick a language whose pack is already on the machine, to keep a run to a minute or two.
+
+The word is **change**, not setting. A plan holds Windows settings, but also tools to install, shortcuts to write, file types to claim, and the PATH.
+
+**Step 1** is the part Windows must approve. It runs first, in a second process, so it is counted out of its own total. A line appears as each change finishes.
+
+**Step 2** is every selected change, the approved ones included. This is where each one is finished off and its final state read back, so this count is the whole plan.
+
+A change that takes a long time, such as a language pack or a tool download, says `still working` once a minute with the time so far.
+
+When the run ends, anything you still have to do is printed as a **Next** line:
+
+```
+Dingo finished: 42 succeeded; 1 partially applied; 0 failed. Log: ...
+Next: Close this terminal and open a new one before the tool commands work. A PATH change reaches new windows only. The launchers are in C:\DFIR\Tools\bin.
+Next: Display language needs you to sign out and back in, or restart Windows, before it can finish applying. Then run Dingo again to check.
+```
+
+The PATH line is left out when this terminal already has the folder, so it only appears when you really are waiting on something. A quiet screen never means a stopped run. Full detail goes to the log either way.
+
+### Run the script directly
+
+`Start-Dingo.cmd` is a convenience. It picks the right PowerShell switches for you and holds the window open if a run fails. For a command-line run you can call the script instead:
+
+```powershell
+.\Dingo.ps1 -ApplyPreferred -Include tweaks,tools
+```
+
+Everything above works the same way. Two differences:
+
+- **Tab completion works.** Type `.\Dingo.ps1 -` and press Tab. PowerShell reads the switches from the script. The `.cmd` cannot do this, because PowerShell cannot read the switches of a batch file.
+- **The window does not wait.** A failed run closes straight away, so read the exit code or the log.
+
+If PowerShell refuses to run the script, your machine blocks local scripts. Allow them for that one window:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
 Add `-ToolRoot` to use a different tools folder for one run, without saving it:
 
 ```bat
@@ -79,7 +134,7 @@ Do not apply changes from an elevated console. Dingo must stay in your signed-in
 
 ## What it changes
 
-Thirty-nine cards. The ID is what `-Include` and `-Exclude` accept. **Admin** means Windows asks for approval.
+Forty-three cards. The ID is what `-Include` and `-Exclude` accept. **Admin** means Windows asks for approval.
 
 ### Region and language
 
@@ -89,7 +144,7 @@ Each card offers a list to choose from.
 | --- | --- | --- | --- |
 | `timezone-utc` | Time zone | yes | UTC |
 | `region-australia` | Region and formats | no | Australia (en-AU) |
-| `language-au` | Display language | yes | British English (en-GB) |
+| `display-language` | Display language | yes | Australian English (en-AU) |
 | `iso-time` | Date and time format | no | yyyy-MM-dd HH:mm |
 
 ### Taskbar
@@ -154,10 +209,29 @@ Each tool card has two choices: **Installed** (install it if missing, leave it a
 | `tool-sqlitebrowser` | DB Browser for SQLite | yes |
 | `tool-dotnet-desktop-9` | .NET 9 Desktop Runtime | yes |
 | `tool-eztools` | Eric Zimmerman's tools | yes |
+| `tool-memprocfs` | MemProcFS | yes |
+| `tool-volatility3` | Volatility 3 | yes |
+| `tool-hayabusa` | Hayabusa | yes |
+| `tool-duckdb` | DuckDB | yes |
 
 Select .NET 9 as well as Eric Zimmerman's tools. Those tools need it, and a fresh Windows 11 does not have it. Dingo lists it first, so one run installs both in the right order.
 
 Most tools come from winget, so you need a network connection. Eric Zimmerman's tools are not in winget. Dingo runs the author's own `Get-ZimmermanTools.ps1` over HTTPS and checks its SHA256 before running it. They install to `EZTools` inside the tools folder, `C:\DFIR\Tools` by default, and the download is several hundred megabytes.
+
+MemProcFS, Volatility 3, Hayabusa, and DuckDB are not in winget either. Each one ships a zip on its own GitHub releases page, so Dingo reads the latest release, downloads the Windows file, and unpacks it into its own folder inside the tools folder:
+
+| Tool | Folder | Command |
+| --- | --- | --- |
+| MemProcFS | `MemProcFS` | `MemProcFS` |
+| Volatility 3 | `Volatility3` | `vol`, `volshell` |
+| Hayabusa | `Hayabusa` | `hayabusa` |
+| DuckDB | `DuckDB` | `duckdb` |
+
+All four are command-line tools, so they get no Start menu or Desktop shortcut. Select **Run tools from anywhere** to type the commands above from any folder. Volatility 3 is the standalone Windows build, so no Python install is needed.
+
+Hayabusa puts its version in the program name, such as `hayabusa-4.1.0-win-x64.exe`. Dingo always names the launcher `hayabusa` and points it at the newest copy in the folder, so the command never changes when you update.
+
+Dingo builds the download address itself from the repository name, so a catalog entry can never send the download to another site. A release file is rebuilt for every version, so no SHA256 can be pinned in advance; Dingo records the hash of what it actually fetched in the log and the journal. Choose **Update installed tool** to fetch the newest release again.
 
 ### Where tools are installed
 
@@ -211,7 +285,7 @@ Turning a card off puts back whatever the type pointed at before.
 - Widgets removal is the one change with no way back.
 - Logs go to the `Logs` folder beside the script. Dingo keeps the 20 newest.
 - Windows Terminal must have been opened once, so its settings file exists.
-- A display language with no pack on the machine is a download of about ten minutes.
+- A display language with no pack on the machine is a download of about ten minutes. Windows ships no Australian interface, so Australian English is supplied through the British pack with the language set to en-AU on top. Pick a language whose pack is already on the machine to skip the wait.
 - Only one Dingo run per Windows account at a time.
 
 Inspect a run that was interrupted:
@@ -249,13 +323,15 @@ Any path may hold `%DINGO_TOOL_ROOT%`, which Dingo replaces with the tools folde
 | `name` | yes | Shown on the card |
 | `category` | no | Defaults to `Tools` |
 | `description` | no | Defaults to "Install \<name\>" |
-| `install.kind` | no | `winget` (default) or `script` |
+| `install.kind` | no | `winget` (default), `script`, or `github-release` |
 | `install.package` | winget only | The exact winget package id |
 | `install.url` | script only | `https://` address. Plain `http` is refused |
 | `install.sha256` | no | Expected SHA256 for a script. A mismatch blocks it |
-| `install.dest` | script only | Folder to install into |
+| `install.repo` | github-release only | The repository as `owner/name`. Dingo builds the address from it |
+| `install.assetPattern` | github-release only | Wildcard for the release file, such as `duckdb_cli-windows-amd64.zip`. It must be a `.zip`, and must match exactly one file |
+| `install.dest` | script and github-release | Folder to install into |
 | `install.arguments` | no | Extra arguments. `-Dest` is always passed for you |
-| `install.timeoutMinutes` | no | 1 to 240. Default 15 (winget) or 45 (script) |
+| `install.timeoutMinutes` | no | 1 to 240. Default 15 (winget), 30 (github-release), or 45 (script) |
 | `install.scope` | no | `machine` (default) or `user` |
 | `install.source` | no | winget only. Defaults to `winget` |
 | `detect` | yes | One or more detect rules |
@@ -264,6 +340,7 @@ Any path may hold `%DINGO_TOOL_ROOT%`, which Dingo replaces with the tools folde
 | `shims.from` | no | Folder to scan for command-line programs, for the PATH card |
 | `shims.pattern` | no | Defaults to `*.exe` |
 | `shims.recurse` | no | Defaults to `true` |
+| `shims.name` | no | One steady launcher name. Use it when the program name holds its version. Dingo then writes one launcher, pointing at the newest matching file |
 | `shortcuts[].name` | yes, in the list | Becomes a file name, so slashes and colons are refused |
 | `shortcuts[].target` | yes, in the list | The program. Use forward slashes |
 | `shortcuts[].arguments` | no | Extra arguments |

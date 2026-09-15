@@ -57,7 +57,7 @@ $script:PendingApply = $null
 $script:ApplyInProgress = $false
 $script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.7.5'
+$script:DingoVersion = '0.7.6'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -250,6 +250,20 @@ function Test-SettingNeedsLanguageDownload($Setting) {
     return $true
 }
 
+function Get-PlannedSettingIds {
+    # What this run is going to apply. A caveat about a missing prerequisite is
+    # wrong when that prerequisite is in the same run, so the advisory asks here
+    # first. A command-line run sets the list from its plan. In the window there
+    # is no plan until Apply is pressed, so the ticked cards are the answer.
+    # Read with Get-Variable: the test suites load Dingo one function at a time
+    # and never run a bare assignment at the top of the file.
+    $planned = Get-Variable -Name PlannedSettingIds -Scope Script -ErrorAction SilentlyContinue
+    if ($planned -and @($planned.Value).Count) { return @($planned.Value) }
+    $all = Get-Variable -Name Settings -Scope Script -ErrorAction SilentlyContinue
+    if (-not $all -or -not $all.Value) { return @() }
+    return @($all.Value | Where-Object { $_.Selected } | ForEach-Object { [string]$_.Id })
+}
+
 function Get-SettingAdvisory($Setting) {
     # A language with no display pack on this computer has to be fetched from
     # Windows Update. That is minutes, not seconds, so say so before the person
@@ -272,7 +286,13 @@ function Get-SettingAdvisory($Setting) {
     # depends on is absent. Say so rather than reporting an unqualified success.
     if ($Setting.Requirements.ContainsKey('RequiredTools')) {
         $missing = New-Object System.Collections.ArrayList
+        $planned = @(Get-PlannedSettingIds)
         foreach ($requiredId in @($Setting.Requirements['RequiredTools'])) {
+            # Already in this run. Dingo lists a runtime before the tools that
+            # need it and applies the plan in that order, so it will be there by
+            # the time this one installs. Telling someone to select a card they
+            # have already selected reads like they got something wrong.
+            if ($planned -contains $requiredId) { continue }
             $required = @(Get-ToolCatalog | Where-Object Id -eq $requiredId)[0]
             if (-not $required) { [void]$missing.Add($requiredId); continue }
             if (-not (Find-InstalledTool $required)) { [void]$missing.Add($required.Name) }
@@ -502,8 +522,8 @@ function Get-LanguageChoiceTable {
     # the tag needs, best first. Windows localises some English variants only
     # through a parent pack, so those name the parent as a fallback and Dingo
     # installs the first pack Windows actually offers.
-    'British English (en-GB)'      = @{ Tag='en-GB'; Packs=@('en-GB') }
     'Australian English (en-AU)'   = @{ Tag='en-AU'; Packs=@('en-AU','en-GB') }
+    'British English (en-GB)'      = @{ Tag='en-GB'; Packs=@('en-GB') }
     'American English (en-US)'     = @{ Tag='en-US'; Packs=@('en-US') }
     'Canadian English (en-CA)'     = @{ Tag='en-CA'; Packs=@('en-CA','en-US','en-GB') }
     'New Zealand English (en-NZ)'  = @{ Tag='en-NZ'; Packs=@('en-NZ','en-GB') }
@@ -791,14 +811,26 @@ function ConvertTo-ToolDefinition($Raw) {
 
     $install = Get-JsonField $Raw 'install' $null
     $installKind = [string](Get-JsonField $install 'kind' 'winget')
-    if ($installKind -notin @('winget','script')) { throw "Tool '$id' uses install kind '$installKind', which this version of Dingo cannot run." }
+    if ($installKind -notin @('winget','script','github-release')) { throw "Tool '$id' uses install kind '$installKind', which this version of Dingo cannot run." }
     $package = [string](Get-JsonField $install 'package' '')
     $url = [string](Get-JsonField $install 'url' '')
     $dest = [string](Get-JsonField $install 'dest' '')
+    $repo = [string](Get-JsonField $install 'repo' '')
+    $assetPattern = [string](Get-JsonField $install 'assetPattern' '')
     $expectedHash = [string](Get-JsonField $install 'sha256' '')
     if ($expectedHash -and $expectedHash -notmatch '^[0-9a-fA-F]{64}$') { throw "Tool '$id' needs a 64-character SHA256 hash." }
     if ($installKind -eq 'winget') {
         if ([string]::IsNullOrWhiteSpace($package)) { throw "Tool '$id' has no winget package id." }
+    } elseif ($installKind -eq 'github-release') {
+        # Dingo builds the address itself from the repository name, so a release
+        # download can never be pointed at another host by the catalog.
+        if ($repo -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,98}/[A-Za-z0-9][A-Za-z0-9._-]{0,98}$') { throw "Tool '$id' needs a GitHub repository written as 'owner/name'." }
+        if ([string]::IsNullOrWhiteSpace($assetPattern)) { throw "Tool '$id' needs an assetPattern naming the release file to download." }
+        # A pattern may hold * and ?, because a release file carries its version.
+        # Anything that could turn it into a path is refused.
+        if ($assetPattern -match '[\\/:"<>|]' -or $assetPattern -match '[\x00-\x1f]') { throw "Tool '$id' has an assetPattern that is not a usable file name." }
+        if ($assetPattern -notlike '*.zip') { throw "Tool '$id' must name a .zip release file, because Dingo unpacks nothing else." }
+        if ([string]::IsNullOrWhiteSpace($dest)) { throw "Tool '$id' needs a dest folder for its release download." }
     } else {
         # A downloaded installer script runs with administrator rights, so refuse
         # anything that is not fetched over TLS from a named host.
@@ -807,7 +839,8 @@ function ConvertTo-ToolDefinition($Raw) {
     }
     $scope = [string](Get-JsonField $install 'scope' 'machine')
     if ($scope -notin @('machine','user')) { throw "Tool '$id' has scope '$scope'; use 'machine' or 'user'." }
-    $timeoutMinutes = [int](Get-JsonField $install 'timeoutMinutes' $(if ($installKind -eq 'script') { 45 } else { 15 }))
+    $defaultTimeout = switch ($installKind) { 'script' { 45 }; 'github-release' { 30 }; default { 15 } }
+    $timeoutMinutes = [int](Get-JsonField $install 'timeoutMinutes' $defaultTimeout)
     if ($timeoutMinutes -lt 1 -or $timeoutMinutes -gt 240) { throw "Tool '$id' has a timeout of $timeoutMinutes minutes; use 1 to 240." }
 
     $rules = New-Object System.Collections.ArrayList
@@ -836,10 +869,17 @@ function ConvertTo-ToolDefinition($Raw) {
     if ($rawShims) {
         $from = [string](Get-JsonField $rawShims 'from' '')
         if ([string]::IsNullOrWhiteSpace($from)) { throw "Tool '$id' has a shims block with no 'from' folder." }
+        # A tool whose program carries its version in the file name, such as
+        # hayabusa-4.1.0-win-x64.exe, needs one steady launcher name instead.
+        $shimName = [string](Get-JsonField $rawShims 'name' '')
+        if ($shimName -and $shimName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+            throw "Tool '$id' has a shim named '$shimName', which is not a usable file name."
+        }
         $shims = [PSCustomObject]@{
             From = $from
             Pattern = [string](Get-JsonField $rawShims 'pattern' '*.exe')
             Recurse = [bool](Get-JsonField $rawShims 'recurse' $true)
+            Name = $shimName
         }
     }
 
@@ -894,6 +934,8 @@ function ConvertTo-ToolDefinition($Raw) {
         Url = $url
         Sha256 = $expectedHash
         Dest = $dest
+        Repo = $repo
+        AssetPattern = $assetPattern
         Arguments = @(Get-JsonField $install 'arguments' @())
         Shims = $shims
         Shortcuts = @($shortcuts)
@@ -1008,6 +1050,62 @@ function Get-BuiltInToolCatalog {
             detect=@(
                 [PSCustomObject]@{ kind='uninstall-key'; match='DB Browser for SQLite*' },
                 [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\DB Browser for SQLite\DB Browser for SQLite.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-memprocfs'; name='MemProcFS'; category='Memory'
+            description='Reads a memory image as a file system you can browse, and runs a forensic analysis over it. Command-line tool. Downloaded from the author''s own GitHub releases and unpacked into the tools folder.'
+            install=[PSCustomObject]@{
+                kind='github-release'; scope='machine'
+                repo='ufrisk/MemProcFS'
+                assetPattern='MemProcFS_files_and_binaries_v*-win_x64-*.zip'
+                dest='%DINGO_TOOL_ROOT%\MemProcFS'
+            }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/MemProcFS'; pattern='MemProcFS.exe'; recurse=$false }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/MemProcFS/MemProcFS.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-volatility3'; name='Volatility 3'; category='Memory'
+            description='Memory image analysis framework. Dingo takes the standalone Windows programs, so no Python install is needed. Command-line tools vol and volshell.'
+            install=[PSCustomObject]@{
+                kind='github-release'; scope='machine'
+                repo='volatilityfoundation/volatility3'
+                assetPattern='volatility3-win-exes-*.zip'
+                dest='%DINGO_TOOL_ROOT%\Volatility3'
+            }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/Volatility3'; pattern='*.exe'; recurse=$false }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/Volatility3/vol.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-hayabusa'; name='Hayabusa'; category='Event logs'
+            description='Scans Windows event logs with Sigma rules and writes a timeline. Command-line tool. The program file carries its version, so Dingo makes one launcher called hayabusa that points at the newest copy.'
+            install=[PSCustomObject]@{
+                kind='github-release'; scope='machine'
+                repo='Yamato-Security/hayabusa'
+                assetPattern='hayabusa-*-win-x64.zip'
+                dest='%DINGO_TOOL_ROOT%\Hayabusa'
+            }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/Hayabusa'; pattern='hayabusa-*-win-x64.exe'; recurse=$false; name='hayabusa' }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/Hayabusa/hayabusa-*-win-x64.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-duckdb'; name='DuckDB'; category='Text and data'
+            description='Runs SQL over csv, json, and parquet files straight from disk, with no database to load first. Command-line tool.'
+            install=[PSCustomObject]@{
+                kind='github-release'; scope='machine'
+                repo='duckdb/duckdb'
+                assetPattern='duckdb_cli-windows-amd64.zip'
+                dest='%DINGO_TOOL_ROOT%\DuckDB'
+            }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/DuckDB'; pattern='duckdb.exe'; recurse=$false }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/DuckDB/duckdb.exe' }
             )
         }
     )
@@ -1124,15 +1222,17 @@ function Find-ToolDetectionRule($rule) {
     return $null
 }
 
-function Get-RestartInstruction([string[]]$SettingNames) {
+function Get-RestartInstruction([string[]]$SettingNames, [string]$ThenDo = 'Then click Read settings again.') {
+    # The last sentence differs by where it is read. A window has a button to
+    # press; a command line has a command to run again.
     $names = @($SettingNames | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)
     if ($names.Count -eq 1) {
-        return "$($names[0]) needs you to sign out and back in, or restart Windows, before it can finish applying. Then click Read settings again."
+        return "$($names[0]) needs you to sign out and back in, or restart Windows, before it can finish applying. $ThenDo"
     }
     if ($names.Count -gt 1) {
-        return "These settings need you to sign out and back in, or restart Windows, before they can finish applying: $($names -join ', '). Then click Read settings again."
+        return "These settings need you to sign out and back in, or restart Windows, before they can finish applying: $($names -join ', '). $ThenDo"
     }
-    'Sign out and back in, or restart Windows, to finish applying the selected settings. Then click Read settings again.'
+    "Sign out and back in, or restart Windows, to finish applying the selected settings. $ThenDo"
 }
 
 function Show-RestartNotice([string]$Message) {
@@ -1391,6 +1491,104 @@ function Install-ScriptPackage($Tool) {
     }
 }
 
+function Expand-DingoZipArchive([string]$ArchivePath, [string]$Destination) {
+    # Windows PowerShell 5.1 ships Expand-Archive, but it neither overwrites an
+    # existing file nor refuses an entry whose name climbs out of the folder.
+    # So every entry is checked first, and only then is anything written.
+    Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $root = ([IO.Path]::GetFullPath($Destination)).TrimEnd('\')
+    $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $planned = New-Object System.Collections.ArrayList
+        foreach ($entry in $archive.Entries) {
+            $relative = ([string]$entry.FullName).Replace('/', '\')
+            if ([string]::IsNullOrWhiteSpace($relative)) { continue }
+            if ([IO.Path]::IsPathRooted($relative) -or $relative.Contains(':')) {
+                throw "The archive entry '$($entry.FullName)' carries a full path, so nothing was unpacked."
+            }
+            $target = [IO.Path]::GetFullPath((Join-Path $root $relative))
+            if (-not $target.StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase)) {
+                throw "The archive entry '$($entry.FullName)' points outside $root, so nothing was unpacked."
+            }
+            [void]$planned.Add([PSCustomObject]@{ Entry = $entry; Target = $target; IsFolder = [string]::IsNullOrEmpty($entry.Name) })
+        }
+        $written = 0
+        foreach ($item in $planned) {
+            if ($item.IsFolder) {
+                if (-not (Test-Path -LiteralPath $item.Target -PathType Container)) {
+                    New-Item -ItemType Directory -Path $item.Target -Force -ErrorAction Stop | Out-Null
+                }
+                continue
+            }
+            $parent = [IO.Path]::GetDirectoryName($item.Target)
+            if ($parent -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+                New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+            }
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($item.Entry, $item.Target, $true)
+            $written++
+        }
+        return $written
+    } finally { $archive.Dispose() }
+}
+
+function Get-GitHubLatestRelease([string]$Repo, [int]$TimeoutSeconds = 60) {
+    # Windows PowerShell 5.1 can still default to an older protocol.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $uri = "https://api.github.com/repos/$Repo/releases/latest"
+    $headers = @{ 'Accept' = 'application/vnd.github+json'; 'User-Agent' = "Dingo/$script:DingoVersion" }
+    return Invoke-RestMethod -Uri $uri -Headers $headers -UseBasicParsing -TimeoutSec $TimeoutSeconds -ErrorAction Stop
+}
+
+function Install-GitHubReleasePackage($Tool) {
+    # The catalog names a repository and a file pattern, never an address. Dingo
+    # builds the address itself, so a catalog entry cannot send the download
+    # somewhere else.
+    Write-Log 'INFO' "Reading the latest $($Tool.Name) release from github.com/$($Tool.Repo)."
+    $release = Get-GitHubLatestRelease $Tool.Repo
+    $tag = [string](Get-JsonField $release 'tag_name' '')
+    $assets = @(@(Get-JsonField $release 'assets' @()) | Where-Object { ([string](Get-JsonField $_ 'name' '')) -like $Tool.AssetPattern })
+    if (-not $assets.Count) { throw "The latest $($Tool.Name) release ($tag) holds no file matching '$($Tool.AssetPattern)'." }
+    if ($assets.Count -gt 1) {
+        $names = (@($assets | ForEach-Object { [string](Get-JsonField $_ 'name' '') }) -join ', ')
+        throw "'$($Tool.AssetPattern)' matches more than one file in the latest $($Tool.Name) release ($tag): $names."
+    }
+    $assetName = [string](Get-JsonField $assets[0] 'name' '')
+    $downloadUrl = [string](Get-JsonField $assets[0] 'browser_download_url' '')
+    $expectedPrefix = "https://github.com/$($Tool.Repo)/releases/download/"
+    if (-not $downloadUrl.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The download address for $assetName is '$downloadUrl', which is not a release file of $($Tool.Repo)."
+    }
+
+    $archivePath = Join-Path $env:TEMP ("Dingo-release-{0}.zip" -f [Guid]::NewGuid().ToString('N'))
+    $progress = $ProgressPreference
+    try {
+        # The progress bar makes Invoke-WebRequest many times slower on a large file.
+        $ProgressPreference = 'SilentlyContinue'
+        Write-Log 'INFO' "Downloading $assetName from $downloadUrl."
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -UseBasicParsing -TimeoutSec ([Math]::Min($Tool.TimeoutSeconds, 3600)) -ErrorAction Stop
+        # A release file is built fresh for every version, so no hash can be kept
+        # in the catalog. Record what was fetched, so a run can be audited later.
+        $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256 -ErrorAction Stop).Hash
+        Write-Log 'INFO' "Release file SHA256 $hash for $($Tool.Name) $tag."
+        Write-OperationJournal 'InstallerProvenance' ([Guid]::NewGuid().ToString('N')) $Tool.Id $Tool.Scope @{
+            Url=$downloadUrl; Sha256=$hash; ExpectedSha256=''; Repository=$Tool.Repo; Tag=$tag; Asset=$assetName
+        }
+
+        $destination = Expand-ToolRootPath $Tool.Dest
+        if (-not (Test-PathIsOnLocalDrive $destination)) { throw "The install folder '$destination' for $($Tool.Name) is not a full path on a drive of this computer." }
+        if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
+            New-Item -ItemType Directory -Path $destination -Force -ErrorAction Stop | Out-Null
+            Write-Log 'INFO' "Created $destination."
+        }
+        $written = Expand-DingoZipArchive $archivePath $destination
+        Write-Log 'INFO' "Unpacked $written file(s) of $($Tool.Name) $tag into $destination."
+    } finally {
+        $ProgressPreference = $progress
+        Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Send-EnvironmentChange {
     if (-not ('Dingo.NativeMethods' -as [type])) { Send-InternationalSettingChange | Out-Null }
     $result = [IntPtr]::Zero
@@ -1464,8 +1662,14 @@ function Get-ExpectedShims {
         if (-not $tool.Shims) { continue }
         $from = Expand-ToolRootPath $tool.Shims.From
         if (-not (Test-Path -LiteralPath $from -PathType Container)) { continue }
-        foreach ($file in @(Get-ChildItem -LiteralPath $from -Filter $tool.Shims.Pattern -File -Recurse:$tool.Shims.Recurse -ErrorAction SilentlyContinue)) {
-            $name = [IO.Path]::GetFileNameWithoutExtension($file.Name)
+        $files = @(Get-ChildItem -LiteralPath $from -Filter $tool.Shims.Pattern -File -Recurse:$tool.Shims.Recurse -ErrorAction SilentlyContinue)
+        # A tool that keeps its version in the program name, such as
+        # hayabusa-4.1.0-win-x64.exe, leaves the older copies behind when it is
+        # updated. One launcher under a steady name points at the newest one.
+        if ([string](Get-JsonField $tool.Shims 'Name' '')) { $files = @($files | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1) }
+        foreach ($file in $files) {
+            $name = [string](Get-JsonField $tool.Shims 'Name' '')
+            if (-not $name) { $name = [IO.Path]::GetFileNameWithoutExtension($file.Name) }
             if ($shims.Contains($name)) {
                 Write-Log 'WARN' "Two tools both provide '$name'; keeping $($shims[$name])."
                 continue
@@ -2003,6 +2207,7 @@ function Set-PackageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     if ($update -and -not $installed) { throw "$($tool.Name) is not installed. Choose Installed to install it first." }
     if ($tool.InstallKind -eq 'winget') { Install-WingetPackage $tool $update }
     elseif ($tool.InstallKind -eq 'script') { Install-ScriptPackage $tool }
+    elseif ($tool.InstallKind -eq 'github-release') { Install-GitHubReleasePackage $tool }
     else { throw "Install kind '$($tool.InstallKind)' is not supported in this version of Dingo." }
 }
 
@@ -2015,7 +2220,7 @@ function Get-Settings {
 
     [void]$settings.Add((New-Setting 'timezone-utc' 'Region & language' 'Time zone' 'The clock this computer runs on. UTC is preferred, because a timeline read in UTC needs no conversion.' 'UTC' $null 'TimeZone' @() $false $false -StateChoices (Get-TimeZoneChoices)))
     [void]$settings.Add((New-Setting 'region-australia' 'Region & language' 'Region and formats' 'The country and number, currency, and date formats Windows uses for this account. Australia is preferred.' 'Australia (en-AU)' $null 'Region' @() $false $false -StateChoices (@((Get-RegionChoiceTable).Keys))))
-    [void]$settings.Add((New-Setting 'language-au' 'Region & language' 'Display language' 'The language of the Windows interface, keyboard, and spelling, and the system locale. British English is preferred. Some choices, such as Australian English, are supplied through another language pack, because Windows ships no separate interface for them.' 'British English (en-GB)' $null 'Language' @() $false $true -StateChoices (@((Get-LanguageChoiceTable).Keys))))
+    [void]$settings.Add((New-Setting 'display-language' 'Region & language' 'Display language' 'The language of the Windows interface, keyboard, and spelling, and the system locale. Australian English is preferred, to match the region card above. Windows ships no separate Australian interface, so it supplies this one through the British pack and sets the language to en-AU on top of it.' 'Australian English (en-AU)' $null 'Language' @() $false $true -StateChoices (@((Get-LanguageChoiceTable).Keys))))
     # Every date and time choice sets the same seven values, so each entry
     # carries one value per choice instead of a single preferred value.
     $dateTimeFormats = Get-DateTimeFormatChoices
@@ -3151,7 +3356,7 @@ function Invoke-AdministratorPlan([array]$Plan, [array]$AllSettings, [string]$Ch
         $index++
         # Checked between settings, so a stop never lands halfway through one.
         if (Test-WorkerCancelled) {
-            Write-Log 'WARN' "Administrator worker stopped at the user's request before [$($request.Id)]; $($results.Count) of $total setting(s) were done."
+            Write-Log 'WARN' "Administrator worker stopped at the user's request before [$($request.Id)]; $($results.Count) of $total change(s) were done."
             Stop-PrestartedPackJobs
             break
         }
@@ -3206,6 +3411,130 @@ function Start-AdministratorChanges([array]$Selected) {
     } catch {
         Remove-Item -LiteralPath $planPath,$resultPath,$progressPath,$cancelPath -Force -ErrorAction SilentlyContinue
         return [PSCustomObject]@{ Process=$null; PlanPath=$null; ResultPath=$null; ProgressPath=$null; CancelPath=$null; Selected=$Selected; Started=Get-Date; StartError="The elevation broker could not start: $($_.Exception.Message)" }
+    }
+}
+
+function Format-Duration([TimeSpan]$Span) {
+    if ($Span.TotalSeconds -lt 0) { return '0:00' }
+    '{0}:{1:00}' -f [math]::Floor($Span.TotalMinutes),$Span.Seconds
+}
+
+function Read-WorkerProgressFile([string]$Path) {
+    # Read failures are normal: the worker replaces this file about twice a
+    # second. The caller keeps showing the last good reading instead.
+    if (-not $Path) { return $null }
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+        return ConvertFrom-Json $raw
+    } catch { return $null }
+}
+
+function Read-WorkerFinishedIds([string]$Path) {
+    # The worker rewrites its result file after every setting, so the window can
+    # tell which cards are already done long before the process exits.
+    if (-not $Path) { return @() }
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+        return @(@(ConvertFrom-JsonList $raw) | ForEach-Object { [string]$_.Id } | Where-Object { $_ })
+    } catch { return @() }
+}
+
+function Format-WorkerStillWorkingLine($Progress, [TimeSpan]$StepElapsed, [int]$DetailLimit = 110) {
+    # Said about a step that has been running a while. It carries no number: the
+    # numbered lines count settings that have finished, and this one has not.
+    $name = [string](Get-JsonField $Progress 'Name' '')
+    $phase = [string](Get-JsonField $Progress 'Phase' '')
+    $detail = [string](Get-JsonField $Progress 'Detail' '')
+    $words = @($name, $phase) | Where-Object { $_ }
+    $line = "  still working: $($words -join ': ')"
+    if ($detail -and $detail -ne $phase) {
+        # Some steps write a paragraph. A console line that wraps three times is
+        # harder to read than a short one, and the log keeps the whole thing.
+        if ($detail.Length -gt $DetailLimit) { $detail = $detail.Substring(0, $DetailLimit).TrimEnd() + '...' }
+        $line += " - $detail"
+    }
+    if ($StepElapsed.TotalSeconds -lt 1) { return $line }
+    return "$line [$(Format-Duration $StepElapsed) so far]"
+}
+
+function Get-RunFollowUpLines($Results, $Selected, [string]$ProcessPath = $null) {
+    # What the person still has to do once the run is over. The window says this
+    # in a box; a command-line run said nothing at all, so a PATH that reaches
+    # new windows only looked like a PATH that had not worked.
+    if ($null -eq $ProcessPath) { $ProcessPath = [string]$env:Path }
+    $lines = New-Object System.Collections.ArrayList
+
+    $pathApplied = @($Results | Where-Object { $_.Id -eq 'tools-on-path' -and $_.Outcome -ne 'Failed' }).Count -gt 0
+    $pathWanted = @($Selected | Where-Object { $_.Id -eq 'tools-on-path' -and $_.DesiredState -eq 'On the PATH' }).Count -gt 0
+    # Nothing to say when this very window already has the folder. The person is
+    # not waiting on anything, and a needless instruction is worse than silence.
+    if ($pathApplied -and $pathWanted -and -not (Test-PathContainsFolder $ProcessPath $script:ShimDirectory)) {
+        [void]$lines.Add("Close this terminal and open a new one before the tool commands work. A PATH change reaches new windows only. The launchers are in $script:ShimDirectory.")
+    }
+
+    # A change that failed outright needs no sign-out; there is nothing waiting
+    # to take effect. One that is only partly applied does.
+    $restartNames = @($Results | Where-Object Outcome -ne 'Failed' | ForEach-Object {
+        $finishedId = $_.Id
+        $Selected | Where-Object { $_.Id -eq $finishedId -and $_.RestartRequired }
+    } | ForEach-Object { [string]$_.Name })
+    if ($restartNames.Count) { [void]$lines.Add((Get-RestartInstruction $restartNames 'Then run Dingo again to check.')) }
+
+    return @($lines)
+}
+
+function Wait-AdministratorChangesOnConsole($Operation, [int]$PollMilliseconds = 500, [int]$HeartbeatSeconds = 60) {
+    # A command-line run would otherwise print nothing at all between the Windows
+    # approval prompt and the last result, and a tool download can take half an
+    # hour.
+    #
+    # One line per setting, printed when that setting finishes. The count comes
+    # from the worker's result file, which only ever grows, so no setting is
+    # missed however fast it runs. The progress file says what is running right
+    # now, and that is used only for the "still working" line, because a step
+    # such as a language pack rewrites it every few seconds.
+    if (-not $Operation -or -not $Operation.Process) { return }
+    $names = @{}
+    $planned = @($Operation.Selected | Where-Object RequiresAdmin)
+    foreach ($item in $planned) { $names[[string]$item.Id] = [string]$item.Name }
+    $total = $planned.Count
+    $announced = @{}
+    $done = 0
+    $approvalSeen = $false
+    $currentKey = ''
+    $stepStarted = Get-Date
+    $lastHeartbeat = Get-Date
+    while ($true) {
+        $running = -not $Operation.Process.HasExited
+        foreach ($finishedId in @(Read-WorkerFinishedIds $Operation.ResultPath)) {
+            if ($announced.ContainsKey($finishedId)) { continue }
+            $announced[$finishedId] = $true
+            $done++
+            $label = if ($names.ContainsKey($finishedId)) { $names[$finishedId] } else { $finishedId }
+            Write-CliStatus ("  {0}/{1} {2}" -f $done, $total, $label)
+            $approvalSeen = $true
+            $lastHeartbeat = Get-Date
+        }
+        $progress = Read-WorkerProgressFile $Operation.ProgressPath
+        if ($progress) {
+            $approvalSeen = $true
+            $key = '{0}|{1}' -f [string](Get-JsonField $progress 'Id' ''), [string](Get-JsonField $progress 'Phase' '')
+            if ($key -ne $currentKey) { $currentKey = $key; $stepStarted = Get-Date }
+        }
+        if (-not $running) { break }
+        if (((Get-Date) - $lastHeartbeat).TotalSeconds -ge $HeartbeatSeconds) {
+            $lastHeartbeat = Get-Date
+            if (-not $approvalSeen) {
+                Write-CliStatus '  Still waiting for administrator approval. Accept the Windows prompt to let Dingo continue.'
+            } elseif ($progress) {
+                Write-CliStatus (Format-WorkerStillWorkingLine $progress ((Get-Date) - $stepStarted))
+            }
+        }
+        Start-Sleep -Milliseconds $PollMilliseconds
     }
 }
 
@@ -3832,6 +4161,15 @@ if ($SelfTest) {
         $dependentMock = ($script:Settings | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1).PSObject.Copy()
         $dependentMock.Requirements = @{ RequiredTools = @('tool-definitely-not-in-the-catalog') }
         if ((Get-SettingAdvisory $dependentMock) -notmatch 'will not start') { throw 'A tool with a missing dependency must produce a caveat.' }
+        # The same tool, with that dependency in the same run. Dingo installs the
+        # runtime first, so telling the person to select it would be wrong.
+        $savedPlanned = @(Get-Variable -Name PlannedSettingIds -Scope Script -ErrorAction SilentlyContinue | ForEach-Object { $_.Value })
+        try {
+            $script:PlannedSettingIds = @('tool-definitely-not-in-the-catalog')
+            if (Get-SettingAdvisory $dependentMock) { throw 'A dependency that is in the same run must produce no caveat.' }
+            $script:PlannedSettingIds = @('something-else-entirely')
+            if ((Get-SettingAdvisory $dependentMock) -notmatch 'will not start') { throw 'A dependency left out of the run must still produce a caveat.' }
+        } finally { $script:PlannedSettingIds = $savedPlanned }
         if (-not (Test-SettingPreflight $dependentMock).Available) { throw 'A dependency caveat must never fail preflight.' }
         $dependentMock.Requirements = @{ RequiredTools = @() }
         if (Get-SettingAdvisory $dependentMock) { throw 'A tool with no dependencies must produce no caveat.' }
@@ -3842,8 +4180,61 @@ if ($SelfTest) {
     }
     # Tool cards offer an explicit update action, but never uninstall.
     $builtInTools = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
-    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9')) {
+    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9','tool-memprocfs','tool-volatility3','tool-hayabusa','tool-duckdb')) {
         if (@($builtInTools | Where-Object Id -eq $expectedId).Count -ne 1) { throw "The built-in tool catalog is missing '$expectedId'." }
+    }
+    # The tools that come straight from a GitHub release. Each one must name a
+    # repository rather than an address, must ask for a zip, must unpack inside
+    # the tools folder, and must offer its program to the PATH card.
+    foreach ($releaseId in @('tool-memprocfs','tool-volatility3','tool-hayabusa','tool-duckdb')) {
+        $releaseTool = $builtInTools | Where-Object Id -eq $releaseId | Select-Object -First 1
+        if ($releaseTool.InstallKind -ne 'github-release') { throw "'$releaseId' must use the github-release install kind." }
+        if ($releaseTool.Url) { throw "'$releaseId' must not name a download address; Dingo builds it from the repository." }
+        if ($releaseTool.Repo -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$') { throw "'$releaseId' must name a GitHub repository as owner/name." }
+        if ($releaseTool.AssetPattern -notlike '*.zip') { throw "'$releaseId' must ask for a zip file." }
+        if ($releaseTool.Dest -notlike "$($script:ToolRootToken)\*") { throw "'$releaseId' must unpack inside the tools folder." }
+        if ($releaseTool.Scope -ne 'machine') { throw "Writing to the tools folder needs administrator approval, so '$releaseId' must be machine scope." }
+        if (-not $releaseTool.Shims -or $releaseTool.Shims.From -notlike "$($script:ToolRootToken)/*") { throw "'$releaseId' must offer its command-line program from the tools folder." }
+        $releaseSetting = $script:Settings | Where-Object Id -eq $releaseId | Select-Object -First 1
+        if (-not $releaseSetting) { throw "'$releaseId' produced no card." }
+        if (-not $releaseSetting.RequiresAdmin) { throw "'$releaseId' must request administrator approval." }
+        if ([bool]$releaseSetting.Requirements['WingetRequired']) { throw "A release download must not be blocked by a missing winget." }
+    }
+    # Hayabusa stamps its version into the program name, so its launcher is named
+    # by hand. Every other tool takes the name from the file.
+    $hayabusaTool = $builtInTools | Where-Object Id -eq 'tool-hayabusa' | Select-Object -First 1
+    if ($hayabusaTool.Shims.Name -ne 'hayabusa') { throw 'The Hayabusa launcher must be called hayabusa.' }
+    if ((($builtInTools | Where-Object Id -eq 'tool-duckdb' | Select-Object -First 1).Shims.Name)) { throw 'DuckDB names its own launcher, so no override is needed.' }
+    # An archive must never write outside the folder it was told to fill.
+    $zipTestRoot = Join-Path $env:TEMP ("Dingo-zip-test-{0}" -f [Guid]::NewGuid().ToString('N'))
+    try {
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        New-Item -ItemType Directory -Path $zipTestRoot -Force -ErrorAction Stop | Out-Null
+        $goodZip = Join-Path $zipTestRoot 'good.zip'
+        $escapeZip = Join-Path $zipTestRoot 'escape.zip'
+        foreach ($case in @(
+            [PSCustomObject]@{ Path=$goodZip; Entry='inner/tool.txt' },
+            [PSCustomObject]@{ Path=$escapeZip; Entry='../escaped.txt' }
+        )) {
+            $archive = [IO.Compression.ZipFile]::Open($case.Path, [IO.Compression.ZipArchiveMode]::Create)
+            try {
+                $writer = New-Object IO.StreamWriter (($archive.CreateEntry($case.Entry)).Open())
+                try { $writer.Write('dingo') } finally { $writer.Dispose() }
+            } finally { $archive.Dispose() }
+        }
+        $unpackRoot = Join-Path $zipTestRoot 'unpack'
+        New-Item -ItemType Directory -Path $unpackRoot -Force -ErrorAction Stop | Out-Null
+        if ((Expand-DingoZipArchive $goodZip $unpackRoot) -ne 1) { throw 'A plain archive did not unpack one file.' }
+        if (-not (Test-Path -LiteralPath (Join-Path $unpackRoot 'inner\tool.txt') -PathType Leaf)) { throw 'A plain archive did not land where it was told.' }
+        # Unpacking the same archive again must overwrite rather than fail.
+        if ((Expand-DingoZipArchive $goodZip $unpackRoot) -ne 1) { throw 'Unpacking the same archive twice must overwrite.' }
+        $escapeRefused = $false
+        try { [void](Expand-DingoZipArchive $escapeZip $unpackRoot) } catch { $escapeRefused = $true }
+        if (-not $escapeRefused) { throw 'An archive entry pointing outside the folder was accepted.' }
+        if (Test-Path -LiteralPath (Join-Path $zipTestRoot 'escaped.txt')) { throw 'An archive entry escaped the folder it was given.' }
+    } finally {
+        Remove-Item -LiteralPath $zipTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
     $toolSettings = @($script:Settings | Where-Object Kind -eq 'Package')
     if ($toolSettings.Count -ne @(Get-ToolCatalog).Count) { throw "Every catalog tool must become a setting; found $($toolSettings.Count)." }
@@ -3882,7 +4273,16 @@ if ($SelfTest) {
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; url='http://example.com/a.ps1'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; url='file:///c:/a.ps1'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
-        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; url='https://example.com/a.ps1' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) }
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; url='https://example.com/a.ps1' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        # A release download builds its own address, so the repository name must
+        # be a plain owner/name, the file must be a zip, and the folder is needed.
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; assetPattern='a.zip'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='https://evil.example.com/o/r'; assetPattern='a.zip'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name/extra'; assetPattern='a.zip'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name'; assetPattern='..\\a.zip'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name'; assetPattern='a.exe'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name'; assetPattern='a.zip' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) }
     )) {
         $rejected = $false
         try { [void](ConvertTo-ToolDefinition $badTool) } catch { $rejected = $true }
@@ -3970,6 +4370,109 @@ if ($SelfTest) {
     if (-not $wildcardFound -or -not $wildcardFound.Version) { throw 'A wildcard rule did not match a folder that does exist.' }
     # PATH damage is the worst thing this tool could do, so prove the string
     # handling on a stand-in value before it is ever written to the registry.
+    # A command-line run reads the worker's progress file and says what it says,
+    # so a long step never looks like a hang. PowerShell defines a function only
+    # when execution reaches it, and a quick apply exits long before the window
+    # code is read, so every reader it uses must stand above that block.
+    $sourceText = Get-Content -LiteralPath $PSCommandPath -Raw -ErrorAction Stop
+    $quickApplyOffset = $sourceText.LastIndexOf('Dingo quick apply: applying')
+    if ($quickApplyOffset -lt 0) { throw 'The quick-apply block could not be found in the source.' }
+    foreach ($needed in @('Format-Duration','Read-WorkerProgressFile','Read-WorkerFinishedIds','Format-WorkerStillWorkingLine','Wait-AdministratorChangesOnConsole')) {
+        $definedAt = $sourceText.IndexOf("function $needed")
+        if ($definedAt -lt 0) { throw "'$needed' is missing." }
+        if ($definedAt -gt $quickApplyOffset) { throw "'$needed' is defined after the quick-apply block, so a command-line run could never call it." }
+    }
+    if ($sourceText.IndexOf('Wait-AdministratorChangesOnConsole $operation') -lt 0) { throw 'A command-line run must watch the administrator step.' }
+    # The "still working" line names the step and how long it has run, and it
+    # carries no counter: the numbered lines count settings that have finished.
+    $workingLine = Format-WorkerStillWorkingLine ([PSCustomObject]@{
+        Index=2; Total=5; Id='tool-eztools'; Name="Eric Zimmerman's tools"; Phase='Installing'; Detail='Downloading'
+    }) ([TimeSpan]::FromSeconds(90))
+    foreach ($part in @('still working', "Eric Zimmerman's tools", 'Installing', 'Downloading', '1:30 so far')) {
+        if ($workingLine -notmatch [regex]::Escape($part)) { throw "A working line lost '$part': $workingLine" }
+    }
+    if ($workingLine -match '2/5') { throw "A working line must carry no counter: $workingLine" }
+    $sparseLine = Format-WorkerStillWorkingLine ([PSCustomObject]@{ Name='Widgets'; Phase='Applying' }) ([TimeSpan]::Zero)
+    if ($sparseLine -notmatch 'Widgets: Applying') { throw "A working line with no detail read badly: $sparseLine" }
+    if ($sparseLine -match ' - ') { throw "An absent detail must not be printed: $sparseLine" }
+    if ($sparseLine -match 'so far') { throw "A step that just started must not print a time: $sparseLine" }
+    # A step that writes a paragraph must not wrap the console three times.
+    $longDetail = 'Windows is downloading and installing the en-GB language pack. ' * 6
+    $trimmed = Format-WorkerStillWorkingLine ([PSCustomObject]@{ Name='Display language'; Phase='Downloading'; Detail=$longDetail }) ([TimeSpan]::Zero)
+    if ($trimmed.Length -gt 180) { throw "A long detail was not shortened: $($trimmed.Length) characters." }
+    if ($trimmed -notmatch '\.\.\.$') { throw "A shortened detail must say it was shortened: $trimmed" }
+    # Both counts must be named, so nobody has to guess what 26 and 43 mean.
+    if ($sourceText -notmatch 'Step 1 of 2: \$administratorCount of the \$planCount change') { throw 'The administrator count must say what it counts.' }
+    if ($sourceText -notmatch 'Step 2 of 2: applying and checking all \$planCount change') { throw 'The whole-plan count must say what it counts.' }
+    # A caveat has to reach the screen before the work starts, or a ten minute
+    # download is just an unexplained wait. A dry run has always printed them;
+    # so must a real run, and before the administrator step is started.
+    $noteOffset = $sourceText.LastIndexOf('Write-CliStatus "  Note [$($item.Id)]: $advisory"')
+    $adminStartOffset = $sourceText.LastIndexOf('$operation = Start-AdministratorChanges $selected')
+    if ($noteOffset -lt 0) { throw 'A quick apply must print the caveats it knows about.' }
+    if ($adminStartOffset -lt 0 -or $noteOffset -gt $adminStartOffset) { throw 'Caveats must be printed before the administrator step starts.' }
+    if ($noteOffset -lt $quickApplyOffset) { throw 'The caveats must belong to the quick-apply block.' }
+    # The display language caveat is the one that costs real time, so prove it
+    # says how long, rather than only that something is slow.
+    foreach ($mustSay in @('about ten minutes', 'Windows Update', 'every other selected change still runs')) {
+        if ($sourceText -notmatch [regex]::Escape($mustSay)) { throw "The display language caveat no longer says '$mustSay'." }
+    }
+    # A run that changes the PATH or needs a sign-out has to say so at the end.
+    # The window puts it in a box; a command-line run has only this line.
+    # Searched from the end: every phrase below also appears in the line that
+    # searches for it, and the code being checked comes after the self-test.
+    $followUpOffset = $sourceText.LastIndexOf('Write-CliStatus "Next: $line"')
+    if ($followUpOffset -lt 0) { throw 'A command-line run must say what is still needed when it finishes.' }
+    if ($followUpOffset -lt $sourceText.LastIndexOf('Dingo finished: $succeeded succeeded')) { throw 'The follow-up must come after the results, not before them.' }
+    # The PATH line, driven rather than read out of the source. The folder is on
+    # the stand-in PATH in one case and absent in the other, and nothing here
+    # touches the real environment.
+    $pathPlan = @([PSCustomObject]@{ Id='tools-on-path'; DesiredState='On the PATH'; Name='Run tools from anywhere'; RestartRequired=$false })
+    $pathDone = @([PSCustomObject]@{ Id='tools-on-path'; Outcome='Succeeded' })
+    $pathLines = @(Get-RunFollowUpLines $pathDone $pathPlan 'C:\Windows;C:\Windows\System32')
+    if ($pathLines.Count -ne 1) { throw "A PATH change must produce one instruction; got $($pathLines.Count)." }
+    if ($pathLines[0] -notmatch 'Close this terminal and open a new one') { throw "The PATH instruction reads wrong: $($pathLines[0])" }
+    if ($pathLines[0] -notmatch [regex]::Escape($script:ShimDirectory)) { throw 'The PATH instruction must name the launcher folder.' }
+    $alreadyOnPath = @(Get-RunFollowUpLines $pathDone $pathPlan "C:\Windows;$($script:ShimDirectory)")
+    if ($alreadyOnPath.Count) { throw "A terminal that already has the folder needs no instruction: $($alreadyOnPath[0])" }
+    $pathFailed = @(Get-RunFollowUpLines @([PSCustomObject]@{ Id='tools-on-path'; Outcome='Failed' }) $pathPlan 'C:\Windows')
+    if ($pathFailed.Count) { throw 'A PATH change that failed must not claim a new terminal will help.' }
+    $pathRemoved = @(Get-RunFollowUpLines $pathDone @([PSCustomObject]@{ Id='tools-on-path'; DesiredState='Not on the PATH'; Name='Run tools from anywhere'; RestartRequired=$false }) 'C:\Windows')
+    if ($pathRemoved.Count) { throw 'Taking the folder off the PATH must not ask for a new terminal.' }
+    # The sign-out line, and both together.
+    $signOutPlan = @([PSCustomObject]@{ Id='display-language'; DesiredState='Australian English (en-AU)'; Name='Display language'; RestartRequired=$true })
+    $signOutLines = @(Get-RunFollowUpLines @([PSCustomObject]@{ Id='display-language'; Outcome='PartiallyApplied' }) $signOutPlan 'C:\Windows')
+    if ($signOutLines.Count -ne 1 -or $signOutLines[0] -notmatch 'sign out and back in') { throw "A change needing a sign-out must say so: $($signOutLines -join ' | ')" }
+    if ($signOutLines[0] -match 'click') { throw 'A command line has no button to click.' }
+    $bothLines = @(Get-RunFollowUpLines ($pathDone + @([PSCustomObject]@{ Id='display-language'; Outcome='Succeeded' })) ($pathPlan + $signOutPlan) 'C:\Windows')
+    if ($bothLines.Count -ne 2) { throw "Two outstanding jobs must produce two lines; got $($bothLines.Count)." }
+    # A quiet run says nothing at all.
+    $quietLines = @(Get-RunFollowUpLines @([PSCustomObject]@{ Id='hidden-files'; Outcome='Succeeded' }) @([PSCustomObject]@{ Id='hidden-files'; DesiredState='Shown'; Name='Hidden files'; RestartRequired=$false }) 'C:\Windows')
+    if ($quietLines.Count) { throw "A run with nothing outstanding must stay quiet: $($quietLines[0])" }
+    # The closing sentence has to suit where it is read.
+    $windowRestart = Get-RestartInstruction @('Display language')
+    if ($windowRestart -notmatch 'Then click Read settings again\.$') { throw "The window wording changed: $windowRestart" }
+    $consoleRestart = Get-RestartInstruction @('Display language') 'Then run Dingo again to check.'
+    if ($consoleRestart -notmatch 'Then run Dingo again to check\.$') { throw "The command-line wording is wrong: $consoleRestart" }
+    if ($consoleRestart -match 'click') { throw "A command line has no button to click: $consoleRestart" }
+    if ($consoleRestart -notmatch 'Display language') { throw 'The restart line must name the setting that needs it.' }
+    $manyRestart = Get-RestartInstruction @('Display language','Region and formats') 'Then run Dingo again to check.'
+    if ($manyRestart -notmatch 'Display language, Region and formats') { throw "Two settings did not both get named: $manyRestart" }
+    # A plan holds tools, shortcuts, file types and the PATH as well as Windows
+    # settings, so no count may call the whole lot "settings".
+    foreach ($countedLine in @($sourceText -split "`n" | Where-Object { $_ -match 'Write-CliStatus' -and $_ -match '\$planCount|\$\(\$selected\.Count\)' })) {
+        if ($countedLine -match 'setting\(s\)') { throw "A count calls mixed changes settings: $($countedLine.Trim())" }
+    }
+    # A step with nothing running must return at once rather than wait for ever.
+    Wait-AdministratorChangesOnConsole $null
+    Wait-AdministratorChangesOnConsole ([PSCustomObject]@{ Process=$null; ProgressPath='' })
+    # Closing File Explorer repaints every console on the desktop, so a command
+    # line run must have finished printing before it happens. Otherwise stale
+    # lines are redrawn over the results and a good run looks like a bad one.
+    $finishedOffset = $sourceText.LastIndexOf('Dingo finished: $succeeded succeeded')
+    $restartOffset = $sourceText.LastIndexOf('if ($restartExplorer -and -not $NoRestartExplorer)')
+    if ($finishedOffset -lt 0 -or $restartOffset -lt 0) { throw 'The quick-apply ending could not be found in the source.' }
+    if ($restartOffset -lt $finishedOffset) { throw 'A command-line run must print its results before File Explorer is restarted.' }
     $pathSetting = $script:Settings | Where-Object Id -eq 'tools-on-path' | Select-Object -First 1
     if (-not $pathSetting) { throw 'The command-line access setting is missing.' }
     if ($pathSetting.Tab -ne 'Tool shortcuts' -or -not $pathSetting.RequiresAdmin -or -not $pathSetting.CanChoose) {
@@ -4175,7 +4678,7 @@ if ($MachineWorker) {
 
         if ($TargetUserSid -notmatch '^S-\d(?:-\d+)+$') { throw 'The desktop user SID supplied to the administrator step is invalid.' }
         $plan = @(ConvertFrom-JsonList (Get-Content -LiteralPath $PlanPath -Raw))
-        Write-Log 'INFO' "Administrator worker received $($plan.Count) setting(s)."
+        Write-Log 'INFO' "Administrator worker received $($plan.Count) change(s)."
         Set-WorkerProgressStep 0 @($plan).Count '' '' 'Starting' 'Administrator approval accepted'
         $results = Invoke-AdministratorPlan $plan $script:Settings $ResultPath
         Write-WorkerResults $results $ResultPath
@@ -4237,6 +4740,9 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             }
         }
         $skippedNotice = if ($skipped) { "$($skipped.Count) tool card(s) were left alone. $($skipped.Reason) $($skipped.Hint)" } else { '' }
+        # Settled before any state is read, because reading a state produces the
+        # caveats, and a caveat has to know what else this run will do.
+        $script:PlannedSettingIds = @($selected | ForEach-Object { [string]$_.Id })
         foreach ($item in $selected) {
             $item.DesiredState = $item.PreferredState
             $item.CurrentState = Get-SettingState $item
@@ -4261,37 +4767,58 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
                     Version=$script:DingoVersion; Mode='WhatIf'; Success=(-not [bool]$blocked); ExitCode=$exitCode; Changed=$false; Elevated=$elevatedDryRun; Skipped=$skipped; Plan=$plan
                 }) -Depth 7))
             } else {
-                Write-CliStatus "Dingo dry run: $($selected.Count) preferred setting(s) would be applied. No changes were made."
+                Write-CliStatus "Dingo dry run: $($selected.Count) change(s) would be made. Nothing was changed."
                 if ($skippedNotice) { Write-CliStatus $skippedNotice }
                 [Console]::Out.WriteLine(($plan | Format-Table Id,Name,Kind,Scope,RequiresAdmin,Available,CurrentStatus,CurrentState,Target -AutoSize | Out-String -Width 240).TrimEnd())
                 foreach ($advised in @($plan | Where-Object Advisory)) { [Console]::Out.WriteLine("[$($advised.Id)] Caveat: $($advised.Advisory)") }
                 foreach ($failure in $blocked) { [Console]::Error.WriteLine("[$($failure.Id)] Preflight failed: $($failure.Message)") }
             }
-            Write-Log 'INFO' "Quick-apply dry run completed for $($selected.Count) setting(s)."
+            Write-Log 'INFO' "Quick-apply dry run completed for $($selected.Count) change(s)."
         } else {
             if ($blocked) { throw "Preflight failed: $(@($blocked | ForEach-Object { "[$($_.Id)] $($_.Message)" }) -join '; ')" }
-            Write-CliStatus "Dingo quick apply: applying $($selected.Count) preferred setting(s)."
+            $planCount = $selected.Count
+            Write-CliStatus "Dingo quick apply: applying $planCount change(s)."
             if ($skippedNotice) { Write-CliStatus $skippedNotice }
-            Write-Log 'INFO' "Quick apply started for $($selected.Count) setting(s)."
+            Write-Log 'INFO' "Quick apply started for $planCount change(s)."
             if ($skippedNotice) { Write-Log 'INFO' $skippedNotice }
+            # A caveat is worth far more before the work starts than in the
+            # results afterwards. A dry run has always printed these. A real run
+            # did not, so the display language pack, which alone can turn a two
+            # minute run into ten, arrived as an unexplained wait.
+            foreach ($item in $selected) {
+                $advisory = Get-SettingAdvisory $item
+                if (-not $advisory) { continue }
+                Write-CliStatus "  Note [$($item.Id)]: $advisory"
+                Write-Log 'INFO' "Caveat [$($item.Id)]: $advisory"
+            }
             $administratorResults = @{}
-            if ($selected | Where-Object RequiresAdmin) {
-                Write-CliStatus 'Administrator approval is required for part of this plan.'
+            $administratorCount = @($selected | Where-Object RequiresAdmin).Count
+            if ($administratorCount) {
+                # Two counts appear in this output, so say what each one is for.
+                # These are the settings Windows must approve; they are applied
+                # first, by a second process, and counted out of their own total.
+                Write-CliStatus "Step 1 of 2: $administratorCount of the $planCount change(s) need administrator approval."
                 $operation = Start-AdministratorChanges $selected
+                Wait-AdministratorChangesOnConsole $operation
                 $administratorResults = Complete-AdministratorChanges $operation
             }
+            # Every selected setting passes through here, approved ones included:
+            # this is where each one is finished off and its final state read
+            # back. So this count is the whole plan, not the administrator part.
+            Write-CliStatus "Step 2 of 2: applying and checking all $planCount change(s)."
             $results = New-Object System.Collections.ArrayList
+            $stepNumber = 0
             foreach ($item in $selected) {
-                Write-CliStatus "[$($item.Id)] Applying $($item.PreferredState)..."
+                $stepNumber++
+                Write-CliStatus "  $stepNumber/$planCount [$($item.Id)] Applying $($item.PreferredState)..."
                 $result = Invoke-SettingChange $item $administratorResults
                 [void]$results.Add($result)
-                Write-CliStatus "[$($item.Id)] $($result.Outcome): $($item.CurrentState.DisplayText)"
+                Write-CliStatus "  $stepNumber/$planCount [$($item.Id)] $($result.Outcome): $($item.CurrentState.DisplayText)"
             }
             $restartExplorer = @($results | Where-Object Outcome -ne 'Failed' | ForEach-Object {
                 $resultId = $_.Id
                 $selected | Where-Object { $_.Id -eq $resultId -and $_.RestartExplorer }
             }).Count -gt 0
-            if ($restartExplorer -and -not $NoRestartExplorer) { [void](Restart-DesktopExplorer) }
             $resultRows = @($results | ForEach-Object {
                 $item = $selected | Where-Object Id -eq $_.Id | Select-Object -First 1
                 [PSCustomObject]@{ Id=$_.Id; Outcome=$_.Outcome; CurrentStatus=$item.CurrentState.Status; CurrentState=$item.CurrentState.DisplayText; State=$item.CurrentState; VerificationBasis=(Get-VerificationDescription $item); Message=$_.Message; Components=$_.Components }
@@ -4309,6 +4836,17 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             } else {
                 [Console]::Out.WriteLine(($resultRows | Format-Table Id,Outcome,CurrentState,Message -AutoSize | Out-String -Width 220).TrimEnd())
                 Write-CliStatus "Dingo finished: $succeeded succeeded; $partial partially applied; $failed failed. Log: $script:LogFile"
+            }
+            foreach ($line in @(Get-RunFollowUpLines $results $selected)) {
+                Write-CliStatus "Next: $line"
+                Write-Log 'INFO' "Follow-up: $line"
+            }
+            # Last of all, because closing File Explorer repaints every console
+            # on the desktop. Doing it earlier redraws stale lines over the
+            # results table, and the run then looks like it went wrong.
+            if ($restartExplorer -and -not $NoRestartExplorer) {
+                Write-CliStatus 'Restarting File Explorer to finish. The desktop blinks once.'
+                [void](Restart-DesktopExplorer)
             }
             Write-Log 'INFO' "Quick apply finished: $succeeded succeeded; $partial partially applied; $failed failed."
         }
@@ -4617,35 +5155,6 @@ function New-CardText {
 function Add-CardColumn($Grid, $Control, [int]$Column) {
     [Windows.Controls.Grid]::SetColumn($Control, $Column)
     [void]$Grid.Children.Add($Control)
-}
-
-function Format-Duration([TimeSpan]$Span) {
-    if ($Span.TotalSeconds -lt 0) { return '0:00' }
-    '{0}:{1:00}' -f [math]::Floor($Span.TotalMinutes),$Span.Seconds
-}
-
-function Read-WorkerProgressFile([string]$Path) {
-    # Read failures are normal: the worker replaces this file about twice a
-    # second. The caller keeps showing the last good reading instead.
-    if (-not $Path) { return $null }
-    try {
-        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
-        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
-        return ConvertFrom-Json $raw
-    } catch { return $null }
-}
-
-function Read-WorkerFinishedIds([string]$Path) {
-    # The worker rewrites its result file after every setting, so the window can
-    # tell which cards are already done long before the process exits.
-    if (-not $Path) { return @() }
-    try {
-        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
-        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
-        if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
-        return @(@(ConvertFrom-JsonList $raw) | ForEach-Object { [string]$_.Id } | Where-Object { $_ })
-    } catch { return @() }
 }
 
 function Request-AdministratorStop($Pending) {
@@ -5192,7 +5701,7 @@ $ApplyButton.Add_Click({
             return
         }
         Set-ActionButtonsEnabled $false
-        Write-Log 'INFO' "Applying $($selected.Count) setting(s) as desktop user $([Security.Principal.WindowsIdentity]::GetCurrent().Name)."
+        Write-Log 'INFO' "Applying $($selected.Count) change(s) as desktop user $([Security.Principal.WindowsIdentity]::GetCurrent().Name)."
         $adminItems = @($selected | Where-Object RequiresAdmin)
         if (-not $adminItems) {
             Complete-ApplyChanges $selected @{}

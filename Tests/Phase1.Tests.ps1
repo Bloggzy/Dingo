@@ -293,7 +293,7 @@ try {
                 (New-OperationComponent 'Final verification' Failed 'pending sign-in')
             ) 'pending sign-in' $false $true
         }
-        $card = $script:Settings | Where-Object Id -eq 'language-au'
+        $card = $script:Settings | Where-Object Id -eq 'display-language'
         $plan = @(New-ApplyPlan @($card))
         [void](Complete-ApplyChanges $plan @{})
         Assert ($SummaryText.Text -match '1 partially applied; 0 failed') 'GUI summary lost the partial-result counts.'
@@ -358,12 +358,17 @@ try {
                 Assert ([bool]$card.AdvisoryControl) "Card '$($card.Id)' has no note box to fill in."
                 Assert ($card.AdvisoryControl.Parent.Visibility -eq 'Collapsed') "Card '$($card.Id)' shows an empty note box."
             }
-            $language = $script:Settings | Where-Object Id -eq 'language-au'
+            $language = $script:Settings | Where-Object Id -eq 'display-language'
             $picker = @($language.ChoiceControls)[0]
             Assert ($picker -is [Windows.Controls.ComboBox]) 'The language card does not offer a drop-down.'
             $picker.SelectedItem = 'Spanish (es-ES)'
             Assert ($language.DesiredState -eq 'Spanish (es-ES)') 'The drop-down did not change the chosen language.'
-            $picker.SelectedItem = 'British English (en-GB)'
+            # Put it back to whatever this card prefers, not to a name typed in
+            # here. A later test checks that every list card still starts on its
+            # preferred choice, and a hard-coded name breaks it the day the
+            # preferred language changes.
+            $picker.SelectedItem = $language.PreferredState
+            Assert ($language.DesiredState -eq $language.PreferredState) 'The language card was left on the wrong choice.'
             $tool = $script:Settings | Where-Object Id -eq 'tool-eztools'
             $update = $tool.ChoiceControls | Where-Object { $_.Tag.Value -eq 'Update installed tool' }
             Assert ($update -and $update.IsEnabled) 'Explicit update radio is absent or disabled.'
@@ -415,12 +420,17 @@ try {
             Assert ($unique.Count -eq $card.StateOptions.Count) "'$($card.Id)' repeats a choice in its list."
             Assert ($card.DesiredState -eq $card.PreferredState) "'$($card.Id)' does not start on its preferred choice."
         }
-        foreach ($id in @('timezone-utc','region-australia','language-au','iso-time')) {
+        foreach ($id in @('timezone-utc','region-australia','display-language','iso-time')) {
             $card = $script:Settings | Where-Object Id -eq $id
             Assert ($card.Section -eq 'Tweaks') "'$id' left the Tweaks section."
             Assert ($card.StateOptions.Count -gt (Get-MaxRadioChoices)) "'$id' no longer offers a list of choices."
         }
-        Assert (($script:Settings | Where-Object Id -eq 'language-au').PreferredState -eq 'British English (en-GB)') 'The preferred display language is not British English.'
+        Assert (($script:Settings | Where-Object Id -eq 'display-language').PreferredState -eq 'Australian English (en-AU)') 'The preferred display language is not Australian English.'
+        # Australian English has no interface of its own. Windows supplies it
+        # through the British pack, so that fallback must stay in the chain.
+        $auPacks = @((Get-LanguageChoiceTable)['Australian English (en-AU)'].Packs)
+        Assert ($auPacks[0] -eq 'en-AU' -and $auPacks -contains 'en-GB') "Australian English must fall back to the British pack; the chain is $($auPacks -join ',')."
+        Assert ((Get-LanguageChoiceTable)['Australian English (en-AU)'].Tag -eq 'en-AU') 'Australian English must ask Windows for en-AU.'
         Assert (($script:Settings | Where-Object Id -eq 'region-australia').PreferredState -eq 'Australia (en-AU)') 'The preferred region is not Australia.'
         Assert (($script:Settings | Where-Object Id -eq 'timezone-utc').PreferredState -eq 'UTC') 'The preferred time zone is not UTC.'
     }
@@ -591,7 +601,7 @@ try {
         Assert (-not (Test-SystemLocaleAccepted 'zz-ZZ')) 'An unknown language tag was accepted as a system locale.'
     }
     Test-Case 'Only a language that must be downloaded counts as a slow step, and the answer is cached' {
-        $card = ($script:Settings | Where-Object Id -eq 'language-au').PSObject.Copy()
+        $card = ($script:Settings | Where-Object Id -eq 'display-language').PSObject.Copy()
         $other = ($script:Settings | Where-Object Id -eq 'hidden-files').PSObject.Copy()
         try {
             function Get-DisplayLanguagePackSource { param([string]$Language) '' }
@@ -628,7 +638,7 @@ try {
         }
     }
     Test-Case 'A display language with no pack on this computer warns before anyone waits' {
-        $card = ($script:Settings | Where-Object Id -eq 'language-au').PSObject.Copy()
+        $card = ($script:Settings | Where-Object Id -eq 'display-language').PSObject.Copy()
         function Get-DisplayLanguagePackSource { param([string]$Language) '' }
         # The answer is cached per language, so a changed stub needs a fresh start.
         Clear-DisplayPackCache
@@ -704,7 +714,7 @@ try {
     Test-Case 'Switching display language replaces the account language list rather than adding to it' {
         # Windows shows Store apps in the FIRST supported language of this list, so
         # leaving an old entry above the chosen one quietly defeats the change.
-        $card = $script:Settings | Where-Object Id -eq 'language-au'
+        $card = $script:Settings | Where-Object Id -eq 'display-language'
         $script:Applied = $null
         $script:Forced = $false
         function Get-DisplayLanguagePackSource { param([string]$Language) 'en-GB' }
@@ -805,7 +815,7 @@ try {
             $entry = @([pscustomobject]@{ Scope='Machine' })
             $all = @(
                 [pscustomobject]@{ Id='timezone-utc'; Name='Time zone'; DesiredState='UTC'; Kind='Registry'; Entries=$entry }
-                [pscustomobject]@{ Id='language-au'; Name='Display language'; DesiredState='British English (en-GB)'; Kind='Language'; Entries=$entry }
+                [pscustomobject]@{ Id='display-language'; Name='Display language'; DesiredState='British English (en-GB)'; Kind='Language'; Entries=$entry }
                 [pscustomobject]@{ Id='onedrive'; Name='OneDrive'; DesiredState='Disabled'; Kind='Registry'; Entries=$entry }
                 [pscustomobject]@{ Id='edge-copilot'; Name='Copilot in Edge'; DesiredState='Disabled'; Kind='Registry'; Entries=$entry }
             )
@@ -816,7 +826,7 @@ try {
             Clear-DisplayPackCache
             $split = Split-SlowPlanRequests $plan $all
             Assert ((@($split.Quick) | ForEach-Object { $_.Id }) -join ',' -eq 'timezone-utc,onedrive,edge-copilot') 'The quick settings were reordered or lost.'
-            Assert ((@($split.Slow) | ForEach-Object { $_.Id }) -join ',' -eq 'language-au') 'The slow language step was not separated out.'
+            Assert ((@($split.Slow) | ForEach-Object { $_.Id }) -join ',' -eq 'display-language') 'The slow language step was not separated out.'
             # A pack that is already here is not slow, so nothing is moved.
             function Get-DisplayLanguagePackSource { param([string]$Language) 'en-GB' }
             Clear-DisplayPackCache
@@ -838,7 +848,7 @@ try {
             $results = Invoke-AdministratorPlan $plan $all
             $elapsed = $watch.Elapsed.TotalSeconds
             $ids = @(foreach ($result in $results) { [string]$result.Id })
-            Assert (($ids -join ',') -eq 'timezone-utc,onedrive,edge-copilot,language-au') "The plan ran in the order $($ids -join ',')."
+            Assert (($ids -join ',') -eq 'timezone-utc,onedrive,edge-copilot,display-language') "The plan ran in the order $($ids -join ',')."
             # Three quick settings of 0.7s plus a 6s download is 8.1s one after the
             # other. Overlapped it is about 6s, so anything under 7.5s proves it.
             Assert ($elapsed -lt 7.5) "The download did not overlap the quick settings: the plan took $([math]::Round($elapsed,1))s."
@@ -871,7 +881,7 @@ try {
         # The caveat depends on the chosen language, so it has to be recomputed
         # rather than frozen at the moment the card was first drawn.
         $box = [pscustomobject]@{ Visibility='Collapsed' }
-        $card = ($script:Settings | Where-Object Id -eq 'language-au').PSObject.Copy()
+        $card = ($script:Settings | Where-Object Id -eq 'display-language').PSObject.Copy()
         $card | Add-Member -NotePropertyName AdvisoryControl -NotePropertyValue ([pscustomobject]@{ Text=''; Parent=$box }) -Force
         try {
             # A pack that is here: nothing to warn about.
@@ -922,7 +932,7 @@ try {
                 (New-OperationComponent 'Final verification' Failed 'pending sign-in')
             ) 'pending sign-in' $false $true
         }
-        $plan = @(New-ApplyPlan @(($script:Settings | Where-Object Id -eq 'language-au')))
+        $plan = @(New-ApplyPlan @(($script:Settings | Where-Object Id -eq 'display-language')))
         [void](Complete-ApplyChanges $plan @{})
         Assert (@($script:Notices).Count -eq 1) 'A setting left unfinished raised no notice.'
         Assert ($script:Notices[0] -match 'sign out and back in') 'The notice does not say what to do.'
