@@ -434,8 +434,10 @@ try {
             $shared = @(@(& $slug $card.PreferredState) | Where-Object { $idWords -contains $_ })
             Assert (-not $shared.Count) "'$($card.Id)' is named after part of its preferred choice '$($card.PreferredState)' ($($shared -join ', ')). An ID names the setting, not a value it can hold."
         }
-        # The five that were renamed for exactly this reason must stay gone.
-        foreach ($stale in @('timezone-utc','region-australia','iso-time','never-combine','explorer-this-pc','language-au')) {
+        # Every ID that was renamed to name its setting must stay gone. The
+        # last one was not named after a value, only after what the change is
+        # for, which is the same habit one step further along.
+        foreach ($stale in @('timezone-utc','region-australia','iso-time','never-combine','explorer-this-pc','language-au','windows-update-continuity')) {
             Assert (-not @($script:Settings | Where-Object Id -eq $stale).Count) "The old ID '$stale' is back."
         }
     }

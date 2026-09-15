@@ -271,7 +271,7 @@ function Get-SettingAdvisory($Setting) {
     if (Test-SettingNeedsLanguageDownload $Setting) {
         return "This computer has no display pack for $($Setting.DesiredState), so Windows must download one from Windows Update. That one step usually takes about ten minutes, and can hold up the whole run. Dingo waits fifteen minutes at most, stops sooner if nothing is moving, and every other selected change still runs."
     }
-    if ($Setting.Id -eq 'windows-update-continuity') {
+    if ($Setting.Id -eq 'windows-update') {
         return 'Registry configuration only: automatic-restart prevention is not verified. This does not cancel pending or user-scheduled restarts, establish effective management policy, or guarantee an uninterrupted processing window. Update notifications, including restart warnings, are suppressed by this selection.'
     }
     # A caveat that Dingo cannot fix by writing the setting. Dingo still applies
@@ -2280,7 +2280,7 @@ function Get-Settings {
         (New-Entry User 'SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsCopilot' 'AllowCopilotRuntime' 0 1)
     ) $true $true))
 
-    [void]$settings.Add((New-Setting 'windows-update-continuity' 'Windows Update' 'Forensic continuity: manual update configuration' 'CAUTION: configures registry policies for manual update maintenance and suppresses update notifications, including restart warnings. Dingo verifies the stored values, not effective restart prevention. Pending restarts, Windows policy prerequisites, and organisation management can affect behavior. Schedule maintenance and independently check restart conditions before processing evidence.' 'Configured; manual maintenance' 'Windows-managed/default' 'Registry' @(
+    [void]$settings.Add((New-Setting 'windows-update' 'Windows Update' 'Forensic continuity: manual update configuration' 'CAUTION: configures registry policies for manual update maintenance and suppresses update notifications, including restart warnings. Dingo verifies the stored values, not effective restart prevention. Pending restarts, Windows policy prerequisites, and organisation management can affect behavior. Schedule maintenance and independently check restart conditions before processing evidence.' 'Configured; manual maintenance' 'Windows-managed/default' 'Registry' @(
         (New-Entry Machine $windowsUpdateAU 'NoAutoUpdate' 1 $script:RemoveValue),
         (New-Entry Machine $windowsUpdateAU 'NoAutoRebootWithLoggedOnUsers' 1 $script:RemoveValue),
         (New-Entry Machine $windowsUpdate 'SetComplianceDeadlineForQU' 0 $script:RemoveValue),
@@ -4014,7 +4014,7 @@ if ($SelfTest) {
     }
     $launcherPath = Join-Path $PSScriptRoot 'Start-Dingo.cmd'
     if (-not (Test-Path -LiteralPath $launcherPath) -or (Get-Content -LiteralPath $launcherPath -Raw) -notmatch '%\*') { throw 'Start-Dingo.cmd does not forward command-line arguments.' }
-    $updateSetting = $script:Settings | Where-Object Id -eq 'windows-update-continuity'
+    $updateSetting = $script:Settings | Where-Object Id -eq 'windows-update'
     $requiredUpdatePolicies = @{
         NoAutoUpdate=1; NoAutoRebootWithLoggedOnUsers=1
         SetComplianceDeadlineForQU=0; SetComplianceDeadlineForFU=0
@@ -4152,7 +4152,7 @@ if ($SelfTest) {
         # A tool caveat depends on what this machine has installed, so those are
         # checked separately below rather than asserted to be absent.
         foreach ($shipped in @($script:Settings | Where-Object { -not $_.Requirements.ContainsKey('RequiredTools') -or -not @($_.Requirements['RequiredTools']).Count })) {
-            if ($shipped.Id -eq 'windows-update-continuity') {
+            if ($shipped.Id -eq 'windows-update') {
                 if ((Get-SettingAdvisory $shipped) -notmatch 'not verified') { throw 'Update configuration must disclose its verification limit.' }
             } elseif (Get-SettingAdvisory $shipped) { throw "Setting '$($shipped.Id)' carries an unexpected caveat." }
         }

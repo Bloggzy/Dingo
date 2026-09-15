@@ -177,7 +177,7 @@ Each card offers a list to choose from.
 | --- | --- | --- | --- |
 | `onedrive` | OneDrive file sync | yes | Disabled by policy |
 | `windows-copilot` | Windows Copilot | yes | Disabled |
-| `windows-update-continuity` | Manual update configuration | yes | Configured |
+| `windows-update` | Manual update configuration | yes | Configured |
 
 ### Microsoft Edge
 
