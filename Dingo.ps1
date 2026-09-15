@@ -250,6 +250,20 @@ function Test-SettingNeedsLanguageDownload($Setting) {
     return $true
 }
 
+function Get-PlannedSettingIds {
+    # What this run is going to apply. A caveat about a missing prerequisite is
+    # wrong when that prerequisite is in the same run, so the advisory asks here
+    # first. A command-line run sets the list from its plan. In the window there
+    # is no plan until Apply is pressed, so the ticked cards are the answer.
+    # Read with Get-Variable: the test suites load Dingo one function at a time
+    # and never run a bare assignment at the top of the file.
+    $planned = Get-Variable -Name PlannedSettingIds -Scope Script -ErrorAction SilentlyContinue
+    if ($planned -and @($planned.Value).Count) { return @($planned.Value) }
+    $all = Get-Variable -Name Settings -Scope Script -ErrorAction SilentlyContinue
+    if (-not $all -or -not $all.Value) { return @() }
+    return @($all.Value | Where-Object { $_.Selected } | ForEach-Object { [string]$_.Id })
+}
+
 function Get-SettingAdvisory($Setting) {
     # A language with no display pack on this computer has to be fetched from
     # Windows Update. That is minutes, not seconds, so say so before the person
@@ -272,7 +286,13 @@ function Get-SettingAdvisory($Setting) {
     # depends on is absent. Say so rather than reporting an unqualified success.
     if ($Setting.Requirements.ContainsKey('RequiredTools')) {
         $missing = New-Object System.Collections.ArrayList
+        $planned = @(Get-PlannedSettingIds)
         foreach ($requiredId in @($Setting.Requirements['RequiredTools'])) {
+            # Already in this run. Dingo lists a runtime before the tools that
+            # need it and applies the plan in that order, so it will be there by
+            # the time this one installs. Telling someone to select a card they
+            # have already selected reads like they got something wrong.
+            if ($planned -contains $requiredId) { continue }
             $required = @(Get-ToolCatalog | Where-Object Id -eq $requiredId)[0]
             if (-not $required) { [void]$missing.Add($requiredId); continue }
             if (-not (Find-InstalledTool $required)) { [void]$missing.Add($required.Name) }
@@ -4113,6 +4133,15 @@ if ($SelfTest) {
         $dependentMock = ($script:Settings | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1).PSObject.Copy()
         $dependentMock.Requirements = @{ RequiredTools = @('tool-definitely-not-in-the-catalog') }
         if ((Get-SettingAdvisory $dependentMock) -notmatch 'will not start') { throw 'A tool with a missing dependency must produce a caveat.' }
+        # The same tool, with that dependency in the same run. Dingo installs the
+        # runtime first, so telling the person to select it would be wrong.
+        $savedPlanned = @(Get-Variable -Name PlannedSettingIds -Scope Script -ErrorAction SilentlyContinue | ForEach-Object { $_.Value })
+        try {
+            $script:PlannedSettingIds = @('tool-definitely-not-in-the-catalog')
+            if (Get-SettingAdvisory $dependentMock) { throw 'A dependency that is in the same run must produce no caveat.' }
+            $script:PlannedSettingIds = @('something-else-entirely')
+            if ((Get-SettingAdvisory $dependentMock) -notmatch 'will not start') { throw 'A dependency left out of the run must still produce a caveat.' }
+        } finally { $script:PlannedSettingIds = $savedPlanned }
         if (-not (Test-SettingPreflight $dependentMock).Available) { throw 'A dependency caveat must never fail preflight.' }
         $dependentMock.Requirements = @{ RequiredTools = @() }
         if (Get-SettingAdvisory $dependentMock) { throw 'A tool with no dependencies must produce no caveat.' }
@@ -4642,6 +4671,9 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             }
         }
         $skippedNotice = if ($skipped) { "$($skipped.Count) tool card(s) were left alone. $($skipped.Reason) $($skipped.Hint)" } else { '' }
+        # Settled before any state is read, because reading a state produces the
+        # caveats, and a caveat has to know what else this run will do.
+        $script:PlannedSettingIds = @($selected | ForEach-Object { [string]$_.Id })
         foreach ($item in $selected) {
             $item.DesiredState = $item.PreferredState
             $item.CurrentState = Get-SettingState $item
