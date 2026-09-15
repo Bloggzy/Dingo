@@ -360,6 +360,18 @@ A tool entry Dingo cannot read is skipped, and the reason is logged. A broken `T
 
 `Tools.json` names commands Dingo will run. Treat it as carefully as `Dingo.ps1`.
 
+## Build a release
+
+```powershell
+.\Build-Release.ps1 -Verify
+```
+
+This writes `Dingo-<version>.zip` beside the script and prints its SHA256. The version is read from `Dingo.ps1`, so the file name cannot disagree with what the script reports.
+
+The package holds `Dingo.ps1`, `Start-Dingo.cmd`, `README.md`, `LICENSE`, and `Tools.example.json`. That list lives in the build script. A file that is missing stops the build rather than producing a package with a hole in it.
+
+`-Verify` unpacks the finished zip into a temporary folder and runs the self-tests from there, which is what proves the package works on its own rather than only where it was built.
+
 ## Tests
 
 ```powershell
