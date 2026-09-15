@@ -363,7 +363,12 @@ try {
             Assert ($picker -is [Windows.Controls.ComboBox]) 'The language card does not offer a drop-down.'
             $picker.SelectedItem = 'Spanish (es-ES)'
             Assert ($language.DesiredState -eq 'Spanish (es-ES)') 'The drop-down did not change the chosen language.'
-            $picker.SelectedItem = 'British English (en-GB)'
+            # Put it back to whatever this card prefers, not to a name typed in
+            # here. A later test checks that every list card still starts on its
+            # preferred choice, and a hard-coded name breaks it the day the
+            # preferred language changes.
+            $picker.SelectedItem = $language.PreferredState
+            Assert ($language.DesiredState -eq $language.PreferredState) 'The language card was left on the wrong choice.'
             $tool = $script:Settings | Where-Object Id -eq 'tool-eztools'
             $update = $tool.ChoiceControls | Where-Object { $_.Tag.Value -eq 'Update installed tool' }
             Assert ($update -and $update.IsEnabled) 'Explicit update radio is absent or disabled.'
@@ -420,7 +425,12 @@ try {
             Assert ($card.Section -eq 'Tweaks') "'$id' left the Tweaks section."
             Assert ($card.StateOptions.Count -gt (Get-MaxRadioChoices)) "'$id' no longer offers a list of choices."
         }
-        Assert (($script:Settings | Where-Object Id -eq 'display-language').PreferredState -eq 'British English (en-GB)') 'The preferred display language is not British English.'
+        Assert (($script:Settings | Where-Object Id -eq 'display-language').PreferredState -eq 'Australian English (en-AU)') 'The preferred display language is not Australian English.'
+        # Australian English has no interface of its own. Windows supplies it
+        # through the British pack, so that fallback must stay in the chain.
+        $auPacks = @((Get-LanguageChoiceTable)['Australian English (en-AU)'].Packs)
+        Assert ($auPacks[0] -eq 'en-AU' -and $auPacks -contains 'en-GB') "Australian English must fall back to the British pack; the chain is $($auPacks -join ',')."
+        Assert ((Get-LanguageChoiceTable)['Australian English (en-AU)'].Tag -eq 'en-AU') 'Australian English must ask Windows for en-AU.'
         Assert (($script:Settings | Where-Object Id -eq 'region-australia').PreferredState -eq 'Australia (en-AU)') 'The preferred region is not Australia.'
         Assert (($script:Settings | Where-Object Id -eq 'timezone-utc').PreferredState -eq 'UTC') 'The preferred time zone is not UTC.'
     }

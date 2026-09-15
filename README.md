@@ -134,7 +134,7 @@ Each card offers a list to choose from.
 | --- | --- | --- | --- |
 | `timezone-utc` | Time zone | yes | UTC |
 | `region-australia` | Region and formats | no | Australia (en-AU) |
-| `display-language` | Display language | yes | British English (en-GB) |
+| `display-language` | Display language | yes | Australian English (en-AU) |
 | `iso-time` | Date and time format | no | yyyy-MM-dd HH:mm |
 
 ### Taskbar
@@ -275,7 +275,7 @@ Turning a card off puts back whatever the type pointed at before.
 - Widgets removal is the one change with no way back.
 - Logs go to the `Logs` folder beside the script. Dingo keeps the 20 newest.
 - Windows Terminal must have been opened once, so its settings file exists.
-- A display language with no pack on the machine is a download of about ten minutes.
+- A display language with no pack on the machine is a download of about ten minutes. Windows ships no Australian interface, so Australian English is supplied through the British pack with the language set to en-AU on top. Pick a language whose pack is already on the machine to skip the wait.
 - Only one Dingo run per Windows account at a time.
 
 Inspect a run that was interrupted:
