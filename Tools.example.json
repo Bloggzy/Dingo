@@ -34,6 +34,31 @@
       "detect": [
         { "kind": "uninstall-key", "match": "Everything*" }
       ]
+    },
+    {
+      // A tool with no installer, shipped as a zip on its own GitHub releases page.
+      // Name the repository, never an address. Dingo builds the address itself,
+      // reads the latest release, and unpacks the one matching zip into "dest".
+      // The pattern may hold * and ?, and must match exactly one file.
+      "id": "tool-chainsaw",
+      "name": "Chainsaw",
+      "category": "Event logs",
+      "description": "Searches Windows event logs and other artefacts with Sigma rules.",
+      "install": {
+        "kind": "github-release",
+        "repo": "WithSecureLabs/chainsaw",
+        "assetPattern": "chainsaw_x86_64-pc-windows-msvc.zip",
+        "dest": "%DINGO_TOOL_ROOT%/Chainsaw",
+        "scope": "machine"
+      },
+      // The PATH card writes one launcher for each program found here. This zip
+      // holds a chainsaw folder, so the search has to go down a level.
+      // Add "name" when the program file carries its version, so one launcher
+      // under a steady name points at the newest copy.
+      "shims": { "from": "%DINGO_TOOL_ROOT%/Chainsaw", "pattern": "chainsaw.exe", "recurse": true },
+      "detect": [
+        { "kind": "file", "path": "%DINGO_TOOL_ROOT%/Chainsaw/chainsaw/chainsaw.exe" }
+      ]
     }
   ]
 }

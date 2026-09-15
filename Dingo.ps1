@@ -57,7 +57,7 @@ $script:PendingApply = $null
 $script:ApplyInProgress = $false
 $script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.7.5'
+$script:DingoVersion = '0.7.6'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -791,14 +791,26 @@ function ConvertTo-ToolDefinition($Raw) {
 
     $install = Get-JsonField $Raw 'install' $null
     $installKind = [string](Get-JsonField $install 'kind' 'winget')
-    if ($installKind -notin @('winget','script')) { throw "Tool '$id' uses install kind '$installKind', which this version of Dingo cannot run." }
+    if ($installKind -notin @('winget','script','github-release')) { throw "Tool '$id' uses install kind '$installKind', which this version of Dingo cannot run." }
     $package = [string](Get-JsonField $install 'package' '')
     $url = [string](Get-JsonField $install 'url' '')
     $dest = [string](Get-JsonField $install 'dest' '')
+    $repo = [string](Get-JsonField $install 'repo' '')
+    $assetPattern = [string](Get-JsonField $install 'assetPattern' '')
     $expectedHash = [string](Get-JsonField $install 'sha256' '')
     if ($expectedHash -and $expectedHash -notmatch '^[0-9a-fA-F]{64}$') { throw "Tool '$id' needs a 64-character SHA256 hash." }
     if ($installKind -eq 'winget') {
         if ([string]::IsNullOrWhiteSpace($package)) { throw "Tool '$id' has no winget package id." }
+    } elseif ($installKind -eq 'github-release') {
+        # Dingo builds the address itself from the repository name, so a release
+        # download can never be pointed at another host by the catalog.
+        if ($repo -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,98}/[A-Za-z0-9][A-Za-z0-9._-]{0,98}$') { throw "Tool '$id' needs a GitHub repository written as 'owner/name'." }
+        if ([string]::IsNullOrWhiteSpace($assetPattern)) { throw "Tool '$id' needs an assetPattern naming the release file to download." }
+        # A pattern may hold * and ?, because a release file carries its version.
+        # Anything that could turn it into a path is refused.
+        if ($assetPattern -match '[\\/:"<>|]' -or $assetPattern -match '[\x00-\x1f]') { throw "Tool '$id' has an assetPattern that is not a usable file name." }
+        if ($assetPattern -notlike '*.zip') { throw "Tool '$id' must name a .zip release file, because Dingo unpacks nothing else." }
+        if ([string]::IsNullOrWhiteSpace($dest)) { throw "Tool '$id' needs a dest folder for its release download." }
     } else {
         # A downloaded installer script runs with administrator rights, so refuse
         # anything that is not fetched over TLS from a named host.
@@ -807,7 +819,8 @@ function ConvertTo-ToolDefinition($Raw) {
     }
     $scope = [string](Get-JsonField $install 'scope' 'machine')
     if ($scope -notin @('machine','user')) { throw "Tool '$id' has scope '$scope'; use 'machine' or 'user'." }
-    $timeoutMinutes = [int](Get-JsonField $install 'timeoutMinutes' $(if ($installKind -eq 'script') { 45 } else { 15 }))
+    $defaultTimeout = switch ($installKind) { 'script' { 45 }; 'github-release' { 30 }; default { 15 } }
+    $timeoutMinutes = [int](Get-JsonField $install 'timeoutMinutes' $defaultTimeout)
     if ($timeoutMinutes -lt 1 -or $timeoutMinutes -gt 240) { throw "Tool '$id' has a timeout of $timeoutMinutes minutes; use 1 to 240." }
 
     $rules = New-Object System.Collections.ArrayList
@@ -836,10 +849,17 @@ function ConvertTo-ToolDefinition($Raw) {
     if ($rawShims) {
         $from = [string](Get-JsonField $rawShims 'from' '')
         if ([string]::IsNullOrWhiteSpace($from)) { throw "Tool '$id' has a shims block with no 'from' folder." }
+        # A tool whose program carries its version in the file name, such as
+        # hayabusa-4.1.0-win-x64.exe, needs one steady launcher name instead.
+        $shimName = [string](Get-JsonField $rawShims 'name' '')
+        if ($shimName -and $shimName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+            throw "Tool '$id' has a shim named '$shimName', which is not a usable file name."
+        }
         $shims = [PSCustomObject]@{
             From = $from
             Pattern = [string](Get-JsonField $rawShims 'pattern' '*.exe')
             Recurse = [bool](Get-JsonField $rawShims 'recurse' $true)
+            Name = $shimName
         }
     }
 
@@ -894,6 +914,8 @@ function ConvertTo-ToolDefinition($Raw) {
         Url = $url
         Sha256 = $expectedHash
         Dest = $dest
+        Repo = $repo
+        AssetPattern = $assetPattern
         Arguments = @(Get-JsonField $install 'arguments' @())
         Shims = $shims
         Shortcuts = @($shortcuts)
@@ -1008,6 +1030,62 @@ function Get-BuiltInToolCatalog {
             detect=@(
                 [PSCustomObject]@{ kind='uninstall-key'; match='DB Browser for SQLite*' },
                 [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\DB Browser for SQLite\DB Browser for SQLite.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-memprocfs'; name='MemProcFS'; category='Memory'
+            description='Reads a memory image as a file system you can browse, and runs a forensic analysis over it. Command-line tool. Downloaded from the author''s own GitHub releases and unpacked into the tools folder.'
+            install=[PSCustomObject]@{
+                kind='github-release'; scope='machine'
+                repo='ufrisk/MemProcFS'
+                assetPattern='MemProcFS_files_and_binaries_v*-win_x64-*.zip'
+                dest='%DINGO_TOOL_ROOT%\MemProcFS'
+            }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/MemProcFS'; pattern='MemProcFS.exe'; recurse=$false }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/MemProcFS/MemProcFS.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-volatility3'; name='Volatility 3'; category='Memory'
+            description='Memory image analysis framework. Dingo takes the standalone Windows programs, so no Python install is needed. Command-line tools vol and volshell.'
+            install=[PSCustomObject]@{
+                kind='github-release'; scope='machine'
+                repo='volatilityfoundation/volatility3'
+                assetPattern='volatility3-win-exes-*.zip'
+                dest='%DINGO_TOOL_ROOT%\Volatility3'
+            }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/Volatility3'; pattern='*.exe'; recurse=$false }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/Volatility3/vol.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-hayabusa'; name='Hayabusa'; category='Event logs'
+            description='Scans Windows event logs with Sigma rules and writes a timeline. Command-line tool. The program file carries its version, so Dingo makes one launcher called hayabusa that points at the newest copy.'
+            install=[PSCustomObject]@{
+                kind='github-release'; scope='machine'
+                repo='Yamato-Security/hayabusa'
+                assetPattern='hayabusa-*-win-x64.zip'
+                dest='%DINGO_TOOL_ROOT%\Hayabusa'
+            }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/Hayabusa'; pattern='hayabusa-*-win-x64.exe'; recurse=$false; name='hayabusa' }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/Hayabusa/hayabusa-*-win-x64.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-duckdb'; name='DuckDB'; category='Text and data'
+            description='Runs SQL over csv, json, and parquet files straight from disk, with no database to load first. Command-line tool.'
+            install=[PSCustomObject]@{
+                kind='github-release'; scope='machine'
+                repo='duckdb/duckdb'
+                assetPattern='duckdb_cli-windows-amd64.zip'
+                dest='%DINGO_TOOL_ROOT%\DuckDB'
+            }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/DuckDB'; pattern='duckdb.exe'; recurse=$false }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/DuckDB/duckdb.exe' }
             )
         }
     )
@@ -1391,6 +1469,104 @@ function Install-ScriptPackage($Tool) {
     }
 }
 
+function Expand-DingoZipArchive([string]$ArchivePath, [string]$Destination) {
+    # Windows PowerShell 5.1 ships Expand-Archive, but it neither overwrites an
+    # existing file nor refuses an entry whose name climbs out of the folder.
+    # So every entry is checked first, and only then is anything written.
+    Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $root = ([IO.Path]::GetFullPath($Destination)).TrimEnd('\')
+    $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $planned = New-Object System.Collections.ArrayList
+        foreach ($entry in $archive.Entries) {
+            $relative = ([string]$entry.FullName).Replace('/', '\')
+            if ([string]::IsNullOrWhiteSpace($relative)) { continue }
+            if ([IO.Path]::IsPathRooted($relative) -or $relative.Contains(':')) {
+                throw "The archive entry '$($entry.FullName)' carries a full path, so nothing was unpacked."
+            }
+            $target = [IO.Path]::GetFullPath((Join-Path $root $relative))
+            if (-not $target.StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase)) {
+                throw "The archive entry '$($entry.FullName)' points outside $root, so nothing was unpacked."
+            }
+            [void]$planned.Add([PSCustomObject]@{ Entry = $entry; Target = $target; IsFolder = [string]::IsNullOrEmpty($entry.Name) })
+        }
+        $written = 0
+        foreach ($item in $planned) {
+            if ($item.IsFolder) {
+                if (-not (Test-Path -LiteralPath $item.Target -PathType Container)) {
+                    New-Item -ItemType Directory -Path $item.Target -Force -ErrorAction Stop | Out-Null
+                }
+                continue
+            }
+            $parent = [IO.Path]::GetDirectoryName($item.Target)
+            if ($parent -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+                New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+            }
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($item.Entry, $item.Target, $true)
+            $written++
+        }
+        return $written
+    } finally { $archive.Dispose() }
+}
+
+function Get-GitHubLatestRelease([string]$Repo, [int]$TimeoutSeconds = 60) {
+    # Windows PowerShell 5.1 can still default to an older protocol.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $uri = "https://api.github.com/repos/$Repo/releases/latest"
+    $headers = @{ 'Accept' = 'application/vnd.github+json'; 'User-Agent' = "Dingo/$script:DingoVersion" }
+    return Invoke-RestMethod -Uri $uri -Headers $headers -UseBasicParsing -TimeoutSec $TimeoutSeconds -ErrorAction Stop
+}
+
+function Install-GitHubReleasePackage($Tool) {
+    # The catalog names a repository and a file pattern, never an address. Dingo
+    # builds the address itself, so a catalog entry cannot send the download
+    # somewhere else.
+    Write-Log 'INFO' "Reading the latest $($Tool.Name) release from github.com/$($Tool.Repo)."
+    $release = Get-GitHubLatestRelease $Tool.Repo
+    $tag = [string](Get-JsonField $release 'tag_name' '')
+    $assets = @(@(Get-JsonField $release 'assets' @()) | Where-Object { ([string](Get-JsonField $_ 'name' '')) -like $Tool.AssetPattern })
+    if (-not $assets.Count) { throw "The latest $($Tool.Name) release ($tag) holds no file matching '$($Tool.AssetPattern)'." }
+    if ($assets.Count -gt 1) {
+        $names = (@($assets | ForEach-Object { [string](Get-JsonField $_ 'name' '') }) -join ', ')
+        throw "'$($Tool.AssetPattern)' matches more than one file in the latest $($Tool.Name) release ($tag): $names."
+    }
+    $assetName = [string](Get-JsonField $assets[0] 'name' '')
+    $downloadUrl = [string](Get-JsonField $assets[0] 'browser_download_url' '')
+    $expectedPrefix = "https://github.com/$($Tool.Repo)/releases/download/"
+    if (-not $downloadUrl.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The download address for $assetName is '$downloadUrl', which is not a release file of $($Tool.Repo)."
+    }
+
+    $archivePath = Join-Path $env:TEMP ("Dingo-release-{0}.zip" -f [Guid]::NewGuid().ToString('N'))
+    $progress = $ProgressPreference
+    try {
+        # The progress bar makes Invoke-WebRequest many times slower on a large file.
+        $ProgressPreference = 'SilentlyContinue'
+        Write-Log 'INFO' "Downloading $assetName from $downloadUrl."
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -UseBasicParsing -TimeoutSec ([Math]::Min($Tool.TimeoutSeconds, 3600)) -ErrorAction Stop
+        # A release file is built fresh for every version, so no hash can be kept
+        # in the catalog. Record what was fetched, so a run can be audited later.
+        $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256 -ErrorAction Stop).Hash
+        Write-Log 'INFO' "Release file SHA256 $hash for $($Tool.Name) $tag."
+        Write-OperationJournal 'InstallerProvenance' ([Guid]::NewGuid().ToString('N')) $Tool.Id $Tool.Scope @{
+            Url=$downloadUrl; Sha256=$hash; ExpectedSha256=''; Repository=$Tool.Repo; Tag=$tag; Asset=$assetName
+        }
+
+        $destination = Expand-ToolRootPath $Tool.Dest
+        if (-not (Test-PathIsOnLocalDrive $destination)) { throw "The install folder '$destination' for $($Tool.Name) is not a full path on a drive of this computer." }
+        if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
+            New-Item -ItemType Directory -Path $destination -Force -ErrorAction Stop | Out-Null
+            Write-Log 'INFO' "Created $destination."
+        }
+        $written = Expand-DingoZipArchive $archivePath $destination
+        Write-Log 'INFO' "Unpacked $written file(s) of $($Tool.Name) $tag into $destination."
+    } finally {
+        $ProgressPreference = $progress
+        Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Send-EnvironmentChange {
     if (-not ('Dingo.NativeMethods' -as [type])) { Send-InternationalSettingChange | Out-Null }
     $result = [IntPtr]::Zero
@@ -1464,8 +1640,14 @@ function Get-ExpectedShims {
         if (-not $tool.Shims) { continue }
         $from = Expand-ToolRootPath $tool.Shims.From
         if (-not (Test-Path -LiteralPath $from -PathType Container)) { continue }
-        foreach ($file in @(Get-ChildItem -LiteralPath $from -Filter $tool.Shims.Pattern -File -Recurse:$tool.Shims.Recurse -ErrorAction SilentlyContinue)) {
-            $name = [IO.Path]::GetFileNameWithoutExtension($file.Name)
+        $files = @(Get-ChildItem -LiteralPath $from -Filter $tool.Shims.Pattern -File -Recurse:$tool.Shims.Recurse -ErrorAction SilentlyContinue)
+        # A tool that keeps its version in the program name, such as
+        # hayabusa-4.1.0-win-x64.exe, leaves the older copies behind when it is
+        # updated. One launcher under a steady name points at the newest one.
+        if ([string](Get-JsonField $tool.Shims 'Name' '')) { $files = @($files | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1) }
+        foreach ($file in $files) {
+            $name = [string](Get-JsonField $tool.Shims 'Name' '')
+            if (-not $name) { $name = [IO.Path]::GetFileNameWithoutExtension($file.Name) }
             if ($shims.Contains($name)) {
                 Write-Log 'WARN' "Two tools both provide '$name'; keeping $($shims[$name])."
                 continue
@@ -2003,6 +2185,7 @@ function Set-PackageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     if ($update -and -not $installed) { throw "$($tool.Name) is not installed. Choose Installed to install it first." }
     if ($tool.InstallKind -eq 'winget') { Install-WingetPackage $tool $update }
     elseif ($tool.InstallKind -eq 'script') { Install-ScriptPackage $tool }
+    elseif ($tool.InstallKind -eq 'github-release') { Install-GitHubReleasePackage $tool }
     else { throw "Install kind '$($tool.InstallKind)' is not supported in this version of Dingo." }
 }
 
@@ -3842,8 +4025,61 @@ if ($SelfTest) {
     }
     # Tool cards offer an explicit update action, but never uninstall.
     $builtInTools = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
-    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9')) {
+    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9','tool-memprocfs','tool-volatility3','tool-hayabusa','tool-duckdb')) {
         if (@($builtInTools | Where-Object Id -eq $expectedId).Count -ne 1) { throw "The built-in tool catalog is missing '$expectedId'." }
+    }
+    # The tools that come straight from a GitHub release. Each one must name a
+    # repository rather than an address, must ask for a zip, must unpack inside
+    # the tools folder, and must offer its program to the PATH card.
+    foreach ($releaseId in @('tool-memprocfs','tool-volatility3','tool-hayabusa','tool-duckdb')) {
+        $releaseTool = $builtInTools | Where-Object Id -eq $releaseId | Select-Object -First 1
+        if ($releaseTool.InstallKind -ne 'github-release') { throw "'$releaseId' must use the github-release install kind." }
+        if ($releaseTool.Url) { throw "'$releaseId' must not name a download address; Dingo builds it from the repository." }
+        if ($releaseTool.Repo -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$') { throw "'$releaseId' must name a GitHub repository as owner/name." }
+        if ($releaseTool.AssetPattern -notlike '*.zip') { throw "'$releaseId' must ask for a zip file." }
+        if ($releaseTool.Dest -notlike "$($script:ToolRootToken)\*") { throw "'$releaseId' must unpack inside the tools folder." }
+        if ($releaseTool.Scope -ne 'machine') { throw "Writing to the tools folder needs administrator approval, so '$releaseId' must be machine scope." }
+        if (-not $releaseTool.Shims -or $releaseTool.Shims.From -notlike "$($script:ToolRootToken)/*") { throw "'$releaseId' must offer its command-line program from the tools folder." }
+        $releaseSetting = $script:Settings | Where-Object Id -eq $releaseId | Select-Object -First 1
+        if (-not $releaseSetting) { throw "'$releaseId' produced no card." }
+        if (-not $releaseSetting.RequiresAdmin) { throw "'$releaseId' must request administrator approval." }
+        if ([bool]$releaseSetting.Requirements['WingetRequired']) { throw "A release download must not be blocked by a missing winget." }
+    }
+    # Hayabusa stamps its version into the program name, so its launcher is named
+    # by hand. Every other tool takes the name from the file.
+    $hayabusaTool = $builtInTools | Where-Object Id -eq 'tool-hayabusa' | Select-Object -First 1
+    if ($hayabusaTool.Shims.Name -ne 'hayabusa') { throw 'The Hayabusa launcher must be called hayabusa.' }
+    if ((($builtInTools | Where-Object Id -eq 'tool-duckdb' | Select-Object -First 1).Shims.Name)) { throw 'DuckDB names its own launcher, so no override is needed.' }
+    # An archive must never write outside the folder it was told to fill.
+    $zipTestRoot = Join-Path $env:TEMP ("Dingo-zip-test-{0}" -f [Guid]::NewGuid().ToString('N'))
+    try {
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        New-Item -ItemType Directory -Path $zipTestRoot -Force -ErrorAction Stop | Out-Null
+        $goodZip = Join-Path $zipTestRoot 'good.zip'
+        $escapeZip = Join-Path $zipTestRoot 'escape.zip'
+        foreach ($case in @(
+            [PSCustomObject]@{ Path=$goodZip; Entry='inner/tool.txt' },
+            [PSCustomObject]@{ Path=$escapeZip; Entry='../escaped.txt' }
+        )) {
+            $archive = [IO.Compression.ZipFile]::Open($case.Path, [IO.Compression.ZipArchiveMode]::Create)
+            try {
+                $writer = New-Object IO.StreamWriter (($archive.CreateEntry($case.Entry)).Open())
+                try { $writer.Write('dingo') } finally { $writer.Dispose() }
+            } finally { $archive.Dispose() }
+        }
+        $unpackRoot = Join-Path $zipTestRoot 'unpack'
+        New-Item -ItemType Directory -Path $unpackRoot -Force -ErrorAction Stop | Out-Null
+        if ((Expand-DingoZipArchive $goodZip $unpackRoot) -ne 1) { throw 'A plain archive did not unpack one file.' }
+        if (-not (Test-Path -LiteralPath (Join-Path $unpackRoot 'inner\tool.txt') -PathType Leaf)) { throw 'A plain archive did not land where it was told.' }
+        # Unpacking the same archive again must overwrite rather than fail.
+        if ((Expand-DingoZipArchive $goodZip $unpackRoot) -ne 1) { throw 'Unpacking the same archive twice must overwrite.' }
+        $escapeRefused = $false
+        try { [void](Expand-DingoZipArchive $escapeZip $unpackRoot) } catch { $escapeRefused = $true }
+        if (-not $escapeRefused) { throw 'An archive entry pointing outside the folder was accepted.' }
+        if (Test-Path -LiteralPath (Join-Path $zipTestRoot 'escaped.txt')) { throw 'An archive entry escaped the folder it was given.' }
+    } finally {
+        Remove-Item -LiteralPath $zipTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
     $toolSettings = @($script:Settings | Where-Object Kind -eq 'Package')
     if ($toolSettings.Count -ne @(Get-ToolCatalog).Count) { throw "Every catalog tool must become a setting; found $($toolSettings.Count)." }
@@ -3882,7 +4118,16 @@ if ($SelfTest) {
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; url='http://example.com/a.ps1'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; url='file:///c:/a.ps1'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
-        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; url='https://example.com/a.ps1' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) }
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='script'; url='https://example.com/a.ps1' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        # A release download builds its own address, so the repository name must
+        # be a plain owner/name, the file must be a zip, and the folder is needed.
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; assetPattern='a.zip'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='https://evil.example.com/o/r'; assetPattern='a.zip'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name/extra'; assetPattern='a.zip'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name'; assetPattern='..\\a.zip'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name'; assetPattern='a.exe'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name'; assetPattern='a.zip' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) }
     )) {
         $rejected = $false
         try { [void](ConvertTo-ToolDefinition $badTool) } catch { $rejected = $true }

@@ -12,7 +12,7 @@ Nothing is applied until you select it. Every change is shown on a card first, a
 
 ![Dingo main window: the Tweaks section open on the Whole computer tab, showing setting cards and the Tweaks, Tools, and Options sections](Assets/Dingo-main-screen-redacted.png)
 
-Current version: **0.7.5**.
+Current version: **0.7.6**.
 
 ## Use the window
 
@@ -79,7 +79,7 @@ Do not apply changes from an elevated console. Dingo must stay in your signed-in
 
 ## What it changes
 
-Thirty-nine cards. The ID is what `-Include` and `-Exclude` accept. **Admin** means Windows asks for approval.
+Forty-three cards. The ID is what `-Include` and `-Exclude` accept. **Admin** means Windows asks for approval.
 
 ### Region and language
 
@@ -154,10 +154,29 @@ Each tool card has two choices: **Installed** (install it if missing, leave it a
 | `tool-sqlitebrowser` | DB Browser for SQLite | yes |
 | `tool-dotnet-desktop-9` | .NET 9 Desktop Runtime | yes |
 | `tool-eztools` | Eric Zimmerman's tools | yes |
+| `tool-memprocfs` | MemProcFS | yes |
+| `tool-volatility3` | Volatility 3 | yes |
+| `tool-hayabusa` | Hayabusa | yes |
+| `tool-duckdb` | DuckDB | yes |
 
 Select .NET 9 as well as Eric Zimmerman's tools. Those tools need it, and a fresh Windows 11 does not have it. Dingo lists it first, so one run installs both in the right order.
 
 Most tools come from winget, so you need a network connection. Eric Zimmerman's tools are not in winget. Dingo runs the author's own `Get-ZimmermanTools.ps1` over HTTPS and checks its SHA256 before running it. They install to `EZTools` inside the tools folder, `C:\DFIR\Tools` by default, and the download is several hundred megabytes.
+
+MemProcFS, Volatility 3, Hayabusa, and DuckDB are not in winget either. Each one ships a zip on its own GitHub releases page, so Dingo reads the latest release, downloads the Windows file, and unpacks it into its own folder inside the tools folder:
+
+| Tool | Folder | Command |
+| --- | --- | --- |
+| MemProcFS | `MemProcFS` | `MemProcFS` |
+| Volatility 3 | `Volatility3` | `vol`, `volshell` |
+| Hayabusa | `Hayabusa` | `hayabusa` |
+| DuckDB | `DuckDB` | `duckdb` |
+
+All four are command-line tools, so they get no Start menu or Desktop shortcut. Select **Run tools from anywhere** to type the commands above from any folder. Volatility 3 is the standalone Windows build, so no Python install is needed.
+
+Hayabusa puts its version in the program name, such as `hayabusa-4.1.0-win-x64.exe`. Dingo always names the launcher `hayabusa` and points it at the newest copy in the folder, so the command never changes when you update.
+
+Dingo builds the download address itself from the repository name, so a catalog entry can never send the download to another site. A release file is rebuilt for every version, so no SHA256 can be pinned in advance; Dingo records the hash of what it actually fetched in the log and the journal. Choose **Update installed tool** to fetch the newest release again.
 
 ### Where tools are installed
 
@@ -249,13 +268,15 @@ Any path may hold `%DINGO_TOOL_ROOT%`, which Dingo replaces with the tools folde
 | `name` | yes | Shown on the card |
 | `category` | no | Defaults to `Tools` |
 | `description` | no | Defaults to "Install \<name\>" |
-| `install.kind` | no | `winget` (default) or `script` |
+| `install.kind` | no | `winget` (default), `script`, or `github-release` |
 | `install.package` | winget only | The exact winget package id |
 | `install.url` | script only | `https://` address. Plain `http` is refused |
 | `install.sha256` | no | Expected SHA256 for a script. A mismatch blocks it |
-| `install.dest` | script only | Folder to install into |
+| `install.repo` | github-release only | The repository as `owner/name`. Dingo builds the address from it |
+| `install.assetPattern` | github-release only | Wildcard for the release file, such as `duckdb_cli-windows-amd64.zip`. It must be a `.zip`, and must match exactly one file |
+| `install.dest` | script and github-release | Folder to install into |
 | `install.arguments` | no | Extra arguments. `-Dest` is always passed for you |
-| `install.timeoutMinutes` | no | 1 to 240. Default 15 (winget) or 45 (script) |
+| `install.timeoutMinutes` | no | 1 to 240. Default 15 (winget), 30 (github-release), or 45 (script) |
 | `install.scope` | no | `machine` (default) or `user` |
 | `install.source` | no | winget only. Defaults to `winget` |
 | `detect` | yes | One or more detect rules |
@@ -264,6 +285,7 @@ Any path may hold `%DINGO_TOOL_ROOT%`, which Dingo replaces with the tools folde
 | `shims.from` | no | Folder to scan for command-line programs, for the PATH card |
 | `shims.pattern` | no | Defaults to `*.exe` |
 | `shims.recurse` | no | Defaults to `true` |
+| `shims.name` | no | One steady launcher name. Use it when the program name holds its version. Dingo then writes one launcher, pointing at the newest matching file |
 | `shortcuts[].name` | yes, in the list | Becomes a file name, so slashes and colons are refused |
 | `shortcuts[].target` | yes, in the list | The program. Use forward slashes |
 | `shortcuts[].arguments` | no | Extra arguments |
