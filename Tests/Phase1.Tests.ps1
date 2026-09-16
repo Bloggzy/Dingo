@@ -194,6 +194,7 @@ try {
         Assert (($calls -join ',') -eq 'winget:False,script,winget:True,script') 'Wrong install/update dispatch.'
     }
     Test-Case 'Winget install suppresses implicit upgrades; explicit update permits them' {
+        function Resolve-UsableWinget($WingetPath) { $WingetPath }
         $seen = New-Object Collections.ArrayList
         function Get-WingetPath { 'mock-winget.exe' }
         function Invoke-ChildProcess($FilePath,$Arguments,$TimeoutSeconds,$Label) {
@@ -204,7 +205,110 @@ try {
         Install-WingetPackage $tool $true
         Assert ($seen[0] -contains '--no-upgrade' -and $seen[1] -notcontains '--no-upgrade') 'Implicit upgrades not controlled.'
     }
+    Test-Case 'Winget version is read from the client and compared with the floor' {
+        $reported = 'v1.11.400'
+        function Get-WingetPath { 'mock-winget.exe' }
+        function Invoke-ChildProcess { [pscustomobject]@{ExitCode=0;Output=$reported} }
+        Assert ((Get-WingetVersion) -eq [version]'1.11.400') 'Release version was misread.'
+        $reported = 'v1.2.10691'
+        Assert ((Get-WingetVersion) -eq [version]'1.2.10691') 'Old version was misread.'
+        $reported = 'v1.7'
+        Assert ((Get-WingetVersion) -eq [version]'1.7.0') 'Two-part version was misread.'
+        $reported = 'v1.9.25180-preview'
+        Assert ((Get-WingetVersion) -eq [version]'1.9.25180') 'Preview suffix broke the version.'
+        $reported = 'Unknown'
+        Assert ($null -eq (Get-WingetVersion)) 'An unreadable version was invented.'
+        # An unreadable client must never block an install that would have worked.
+        Assert ((Test-WingetVersionSupported).Supported) 'Unreadable version was treated as too old.'
+        $reported = 'v1.5.2201'
+        Assert (-not (Test-WingetVersionSupported).Supported) 'A version below the floor passed.'
+        $reported = 'v1.6.0'
+        Assert ((Test-WingetVersionSupported).Supported) 'The floor version itself was rejected.'
+    }
+    Test-Case 'The repair refuses to run without rights, and insists on a module that has the command' {
+        function Test-IsAdministrator { $false }
+        Assert-Throws { Repair-WingetClient } 'administrator rights'
+        $source = (Get-Command Repair-WingetClient).Definition
+        # The module can be present but too old to carry the command, so being
+        # installed is never taken as proof that the command exists.
+        Assert ($source -match 'MinimumVersion') 'The repair accepts any module version.'
+        Assert ($source -match "Get-Command Repair-WinGetPackageManager") 'The repair never checks the command exists.'
+    }
+    Test-Case 'The gallery is only required when the module is missing or too old' {
+        function Get-Module { $null }
+        Assert ((Get-WingetRepairEndpoints).Count -eq 2) 'A missing module did not require the gallery.'
+        function Get-Module { [pscustomobject]@{Version=[version]'1.2.0'} }
+        Assert ((Get-WingetRepairEndpoints).Count -eq 2) 'An old module did not require the gallery.'
+        function Get-Module { [pscustomobject]@{Version=[version]'1.9.0'} }
+        $endpoints = Get-WingetRepairEndpoints
+        Assert ($endpoints.Count -eq 1) 'A new enough module still required the gallery.'
+        Assert ($endpoints['the App Installer download'] -match 'aka.ms/getwinget') 'The App Installer address is never checked.'
+    }
+    Test-Case 'A repair stops before it starts when the network it needs is out of reach' {
+        function Test-IsAdministrator { $true }
+        function Get-Module { $null }
+        function Test-EndpointReachable { $false }
+        function Invoke-ChildProcess { throw 'The repair started without a network.' }
+        Assert-Throws { Repair-WingetClient } 'cannot reach'
+        Assert-Throws { Repair-WingetClient } 'powershellgallery'
+    }
+    Test-Case 'A server that answers with an error status still counts as reachable' {
+        function Invoke-WebRequest { throw (New-Object Net.WebException 'Not found', $null, 'ProtocolError', (New-Object Net.HttpWebResponse)) }
+        Assert (Test-EndpointReachable 'https://example.invalid/') 'An answering server was called unreachable.'
+        function Invoke-WebRequest { throw 'The remote name could not be resolved' }
+        Assert (-not (Test-EndpointReachable 'https://example.invalid/')) 'A dead name was called reachable.'
+    }
+    Test-Case 'A supported winget is checked once and never repaired' {
+        Set-RunScopedFlag 'WingetVersionVerified' $false
+        Set-RunScopedFlag 'WingetRepairAttempted' $false
+        $checks = New-Object Collections.ArrayList
+        function Get-WingetVersion { [void]$checks.Add(1); [version]'1.11.400' }
+        function Repair-WingetClient { throw 'Unexpected repair' }
+        Assert ((Resolve-UsableWinget 'mock-winget.exe') -eq 'mock-winget.exe') 'A good winget path was changed.'
+        Assert ((Resolve-UsableWinget 'mock-winget.exe') -eq 'mock-winget.exe') 'A verified winget was rechecked.'
+        Assert ($checks.Count -eq 1) "Version was read $($checks.Count) times instead of once."
+    }
+    Test-Case 'An old winget is repaired once, and the repaired client is used' {
+        Set-RunScopedFlag 'WingetVersionVerified' $false
+        Set-RunScopedFlag 'WingetRepairAttempted' $false
+        $repairs = New-Object Collections.ArrayList
+        $state = @{ Version = [version]'1.2.10691' }
+        function Test-IsAdministrator { $true }
+        function Get-WingetVersion { $state.Version }
+        function Get-WingetPath { 'repaired-winget.exe' }
+        function Repair-WingetClient { [void]$repairs.Add(1); $state.Version = [version]'1.11.400' }
+        Assert ((Resolve-UsableWinget 'old-winget.exe') -eq 'repaired-winget.exe') 'The repaired client was not picked up.'
+        Assert ($repairs.Count -eq 1) "Repair ran $($repairs.Count) times instead of once."
+    }
+    Test-Case 'A repair that does not raise the version fails with advice, and never runs twice' {
+        Set-RunScopedFlag 'WingetVersionVerified' $false
+        Set-RunScopedFlag 'WingetRepairAttempted' $false
+        $repairs = New-Object Collections.ArrayList
+        function Test-IsAdministrator { $true }
+        function Get-WingetVersion { [version]'1.2.10691' }
+        function Get-WingetPath { 'still-old-winget.exe' }
+        function Repair-WingetClient { [void]$repairs.Add(1) }
+        Assert-Throws { Resolve-UsableWinget 'old-winget.exe' } 'aka.ms/getwinget'
+        Assert-Throws { Resolve-UsableWinget 'old-winget.exe' } 'did not fix it'
+        Assert ($repairs.Count -eq 1) "Repair ran $($repairs.Count) times instead of once."
+    }
+    Test-Case 'An old winget without administrator rights explains what to do instead' {
+        Set-RunScopedFlag 'WingetVersionVerified' $false
+        Set-RunScopedFlag 'WingetRepairAttempted' $false
+        function Test-IsAdministrator { $false }
+        function Get-WingetVersion { [version]'1.2.10691' }
+        function Repair-WingetClient { throw 'Unexpected repair' }
+        Assert-Throws { Resolve-UsableWinget 'old-winget.exe' } 'administrator'
+    }
+    Test-Case 'A missing package source is reported with the command that fixes it' {
+        function Get-WingetPath { 'mock-winget.exe' }
+        function Resolve-UsableWinget($WingetPath) { $WingetPath }
+        function Invoke-ChildProcess { [pscustomobject]@{ExitCode=-1978335217;Output='Failed when opening source(s)'} }
+        $tool = ($script:Settings | Where-Object Id -eq 'tool-7zip').Entries[0]
+        Assert-Throws { Install-WingetPackage $tool } 'winget source reset --force'
+    }
     Test-Case 'Winget no-upgrade refusal is accepted only for ensure-installed' {
+        function Resolve-UsableWinget($WingetPath) { $WingetPath }
         function Get-WingetPath { 'mock-winget.exe' }
         function Invoke-ChildProcess { [pscustomobject]@{ExitCode=-1978335135;Output='already installed'} }
         $tool = ($script:Settings | Where-Object Id -eq 'tool-7zip').Entries[0]

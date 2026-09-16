@@ -61,7 +61,7 @@ $script:PendingApply = $null
 $script:ApplyInProgress = $false
 $script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.7.8'
+$script:DingoVersion = '0.7.9'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -1168,6 +1168,158 @@ function Get-WingetPath {
     return ''
 }
 
+function Get-MinimumWingetVersion {
+    # Microsoft changed the layout of the pre-indexed package source. A client
+    # older than this cannot read the source the server now publishes, so every
+    # install fails with 0x8a15000f, "Data required by the source is missing".
+    # The message names the source, so the real fault -- a stale client -- is
+    # easy to miss. Repairing the client is the only cure.
+    return [version]'1.6.0'
+}
+
+function Get-WingetVersion([string]$WingetPath = '') {
+    $winget = if ($WingetPath) { $WingetPath } else { Get-WingetPath }
+    if (-not $winget) { return $null }
+    try { $run = Invoke-ChildProcess $winget @('--version') 30 'The winget version check' }
+    catch { Write-Log 'WARN' "Could not read the winget version: $($_.Exception.Message)"; return $null }
+    if ($run.ExitCode -ne 0) {
+        Write-Log 'WARN' "winget --version exited with code $($run.ExitCode). $(Get-OutputTail $run.Output)"
+        return $null
+    }
+    # The output reads "v1.11.400", and a preview build adds a suffix.
+    $match = [regex]::Match([string]$run.Output, 'v?(\d+)\.(\d+)(?:\.(\d+))?')
+    if (-not $match.Success) {
+        Write-Log 'WARN' "winget reported a version Dingo could not read: $(Get-OutputTail $run.Output)"
+        return $null
+    }
+    $build = if ($match.Groups[3].Success) { [int]$match.Groups[3].Value } else { 0 }
+    return New-Object Version ([int]$match.Groups[1].Value), ([int]$match.Groups[2].Value), $build
+}
+
+function Test-WingetVersionSupported([string]$WingetPath = '') {
+    # A version Dingo cannot read counts as supported. A changed version string
+    # must never stop an install that would otherwise have worked.
+    $version = Get-WingetVersion $WingetPath
+    $minimum = Get-MinimumWingetVersion
+    [PSCustomObject]@{ Supported = (-not $version -or $version -ge $minimum); Version = $version; Minimum = $minimum }
+}
+
+function Test-EndpointReachable([string]$Url, [int]$TimeoutSeconds = 20) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    try {
+        Invoke-WebRequest -Uri $Url -UseBasicParsing -Method Head -TimeoutSec $TimeoutSeconds -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        # A server that answers at all has been reached, even when it answers
+        # with an error status or refuses HEAD. Only a transport failure means
+        # this computer cannot get there, and that is what is worth reporting.
+        $response = $null
+        try { $response = $_.Exception.Response } catch { $response = $null }
+        if ($response) { return $true }
+        Write-Log 'WARN' "$Url could not be reached: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Get-WingetRepairEndpoints {
+    # Repair-WinGetPackageManager downloads App Installer itself, so that
+    # address is always needed. The gallery is needed only when this computer
+    # does not already carry a module new enough to hold the command.
+    $endpoints = New-Object Collections.Specialized.OrderedDictionary
+    $endpoints.Add('the App Installer download', 'https://aka.ms/getwinget')
+    $installed = @(Get-Module -ListAvailable -Name Microsoft.WinGet.Client | Sort-Object Version -Descending)
+    if (-not $installed.Count -or $installed[0].Version -lt [version]'1.8.0') {
+        $endpoints.Add('the PowerShell Gallery', 'https://www.powershellgallery.com/api/v2/')
+    }
+    return $endpoints
+}
+
+function Repair-WingetClient([int]$TimeoutSeconds = 900) {
+    # Microsoft ships a module whose only job is to put a working winget on the
+    # machine, dependencies and all. It runs in its own Windows PowerShell so a
+    # stuck download cannot hang Dingo, and so the module never has to be
+    # loaded into this session.
+    if (-not (Test-IsAdministrator)) { throw 'Repairing winget needs administrator rights.' }
+    $powershell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $powershell)) { throw "Windows PowerShell was not found at $powershell." }
+    # A repair on a computer with no route out stalls on a download and then
+    # fails with a timeout, which reads like a broken repair. Ask the network
+    # the question first, so the answer names the network instead.
+    $endpoints = Get-WingetRepairEndpoints
+    $unreachable = New-Object Collections.ArrayList
+    foreach ($name in @($endpoints.Keys)) {
+        if (-not (Test-EndpointReachable $endpoints[$name])) { [void]$unreachable.Add("$name ($($endpoints[$name]))") }
+    }
+    if ($unreachable.Count) {
+        throw "This computer cannot reach $($unreachable -join ' or '), so winget cannot be repaired here. Check the network, the proxy, and any firewall rule, then try again."
+    }
+    # Repair-WinGetPackageManager arrived in module version 1.8, so the module
+    # being present is not enough. A computer carrying an older copy has to be
+    # brought up to that version before the command exists at all.
+    $repairScript = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$minimum = [version]'1.8.0'
+$module = Get-Module -ListAvailable -Name Microsoft.WinGet.Client |
+    Sort-Object Version -Descending | Select-Object -First 1
+if (-not $module -or $module.Version -lt $minimum) {
+    Get-PackageProvider -Name NuGet -ForceBootstrap | Out-Null
+    Install-Module -Name Microsoft.WinGet.Client -Repository PSGallery -MinimumVersion $minimum -Scope AllUsers -Force -AllowClobber
+}
+Import-Module Microsoft.WinGet.Client -MinimumVersion $minimum
+if (-not (Get-Command Repair-WinGetPackageManager -ErrorAction SilentlyContinue)) {
+    throw "The Microsoft.WinGet.Client module on this computer has no Repair-WinGetPackageManager command. Install App Installer by hand from https://aka.ms/getwinget."
+}
+Repair-WinGetPackageManager -AllUsers -Latest
+'@
+    $arguments = @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-Command',$repairScript)
+    Write-Log 'INFO' 'Repairing winget with Repair-WinGetPackageManager.'
+    $run = Invoke-ChildProcess $powershell $arguments $TimeoutSeconds 'The winget repair'
+    Write-Log 'DEBUG' "winget repair exit code $($run.ExitCode). $(Get-OutputTail $run.Output)"
+    if ($run.ExitCode -ne 0) { throw "The repair command failed with code $($run.ExitCode). $(Get-OutputTail $run.Output)" }
+}
+
+function Get-RunScopedFlag([string]$Name) {
+    [bool](Get-Variable -Name $Name -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
+}
+
+function Set-RunScopedFlag([string]$Name, [bool]$Value) {
+    Set-Variable -Name $Name -Scope Script -Value $Value
+}
+
+function Resolve-UsableWinget([string]$WingetPath) {
+    # Returns a winget that can read the package source, repairing the client
+    # once per run if it is too old. Checking costs one fast process call, and
+    # only until the first pass, because only a repair can change the answer.
+    if (Get-RunScopedFlag 'WingetVersionVerified') { return $WingetPath }
+    $check = Test-WingetVersionSupported $WingetPath
+    if ($check.Supported) {
+        if ($check.Version) { Write-Log 'INFO' "winget reports version $($check.Version)." }
+        Set-RunScopedFlag 'WingetVersionVerified' $true
+        return $WingetPath
+    }
+    Write-Log 'WARN' "winget $($check.Version) is older than $($check.Minimum), so it cannot read the current package source."
+    if (Get-RunScopedFlag 'WingetRepairAttempted') {
+        throw "winget $($check.Version) is too old to install anything, and the repair earlier in this run did not fix it. Install the latest App Installer from https://aka.ms/getwinget, then try again."
+    }
+    Set-RunScopedFlag 'WingetRepairAttempted' $true
+    if (-not (Test-IsAdministrator)) {
+        throw "winget $($check.Version) is too old to install anything. Run Dingo as an administrator so it can repair winget, or install the latest App Installer from https://aka.ms/getwinget yourself."
+    }
+    Repair-WingetClient
+    # The repaired client sits in a new package folder, so find it again.
+    $repaired = Get-WingetPath
+    if (-not $repaired) { throw 'The winget repair reported success, but winget is still not on this computer.' }
+    $after = Test-WingetVersionSupported $repaired
+    if (-not $after.Supported) {
+        throw "The winget repair finished, but winget still reports version $($after.Version), below $($after.Minimum). Install the latest App Installer from https://aka.ms/getwinget, then try again."
+    }
+    Write-Log 'INFO' "winget was repaired and now reports version $($after.Version)."
+    Set-RunScopedFlag 'WingetVersionVerified' $true
+    return $repaired
+}
+
 function Get-UninstallEntry([string]$Match) {
     $roots = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
@@ -1307,6 +1459,7 @@ function Install-WingetPackage($Tool, [bool]$AllowUpgrade = $false) {
     $TimeoutSeconds = $Tool.TimeoutSeconds
     $winget = Get-WingetPath
     if (-not $winget) { throw 'winget is not available on this computer, so Dingo cannot install anything.' }
+    $winget = Resolve-UsableWinget $winget
     $arguments = @(
         'install','--id',$Tool.Package,'--exact','--source',$Tool.Source,'--scope',$Tool.Scope,
         '--accept-package-agreements','--accept-source-agreements','--disable-interactivity','--silent'
@@ -1323,7 +1476,13 @@ function Install-WingetPackage($Tool, [bool]$AllowUpgrade = $false) {
         return
     }
     if ($run.ExitCode -ne 0) {
-        throw "winget exited with code $($run.ExitCode) for $($Tool.Package). $(Get-OutputTail $run.Output)"
+        # SOURCE_DATA_MISSING (0x8A15000F). A supported client still reports it
+        # when the local source cache is damaged or the machine cannot reach
+        # the source, so say what to try rather than only quoting winget.
+        $hint = if ($run.ExitCode -eq -1978335217) {
+            " The winget package source could not be opened. Run 'winget source reset --force' as an administrator, and check this computer can reach https://cdn.winget.microsoft.com."
+        } else { '' }
+        throw "winget exited with code $($run.ExitCode) for $($Tool.Package). $(Get-OutputTail $run.Output)$hint"
     }
 }
 

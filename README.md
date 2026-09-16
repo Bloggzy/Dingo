@@ -12,7 +12,7 @@ Nothing is applied until you select it. Every change is shown on a card first, a
 
 ![Dingo main window: the Tweaks section open on the Whole computer tab, showing setting cards and the Tweaks, Tools, and Options sections](Assets/Dingo-main-screen-redacted.png)
 
-Current version: **0.7.8**.
+Current version: **0.7.9**.
 
 ## Use the window
 
@@ -233,7 +233,7 @@ Each tool card has two choices: **Installed** (install it if missing, leave it a
 
 Select .NET 9 as well as Eric Zimmerman's tools. Those tools need it, and a fresh Windows 11 does not have it. Dingo lists it first, so one run installs both in the right order.
 
-Most tools come from winget, so you need a network connection. Eric Zimmerman's tools are not in winget. Dingo runs the author's own `Get-ZimmermanTools.ps1` over HTTPS and checks its SHA256 before running it. They install to `EZTools` inside the tools folder, `C:\DFIR\Tools` by default, and the download is several hundred megabytes.
+Most tools come from winget, so you need a network connection. Dingo also checks the winget version before it installs anything. A client older than 1.6 cannot read the package list Microsoft publishes today, and every install fails with `0x8a15000f`, "Data required by the source is missing". When Dingo is running as an administrator it repairs winget itself with `Repair-WinGetPackageManager`, then carries on. Otherwise it stops and tells you to install the latest App Installer from <https://aka.ms/getwinget>. Before it repairs anything, Dingo checks it can reach the App Installer download, and the PowerShell Gallery when the repair module is missing or too old. A computer with no route out is told so by name, rather than waiting for a download to time out. Eric Zimmerman's tools are not in winget. Dingo runs the author's own `Get-ZimmermanTools.ps1` over HTTPS and checks its SHA256 before running it. They install to `EZTools` inside the tools folder, `C:\DFIR\Tools` by default, and the download is several hundred megabytes.
 
 MemProcFS, Volatility 3, Hayabusa, and DuckDB are not in winget either. Each one ships a zip on its own GitHub releases page, so Dingo reads the latest release, downloads the Windows file, and unpacks it into its own folder inside the tools folder:
 
