@@ -29,6 +29,14 @@ You need nothing else. Windows PowerShell 5.1 is already part of Windows 11.
 
 ## Use the command line
 
+**In short:** to apply everything, the settings and the tools, run this:
+
+```bat
+Start-Dingo.cmd -Apply -Include tweaks,tools
+```
+
+The rest of this section is the detail.
+
 Preview a plan. Nothing is changed:
 
 ```bat
