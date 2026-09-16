@@ -62,6 +62,15 @@ $missing = @($script:PackageFiles | Where-Object { -not (Test-Path -LiteralPath 
 if ($missing.Count) { throw "The package is missing $($missing -join ', '). Nothing was built." }
 
 $version = Get-DingoReleaseVersion $scriptPath
+
+# The readme states the version in its own words, and 0.7.8 shipped with that
+# line still reading 0.7.7. The readme is in the box, so a stale line there is
+# a wrong package, not a typo. Stop the build instead.
+$readmePath = Join-Path $source 'README.md'
+$stated = @(Select-String -LiteralPath $readmePath -Pattern '^Current version: \*\*([^*]+)\*\*' -ErrorAction Stop)
+if ($stated.Count -ne 1) { throw "Could not read one 'Current version' line from '$readmePath'; found $($stated.Count)." }
+$statedVersion = $stated[0].Matches[0].Groups[1].Value
+if ($statedVersion -ne $version) { throw "README.md says version $statedVersion but Dingo.ps1 says $version. Nothing was built." }
 $zipPath = Join-Path $OutputDirectory "Dingo-$version.zip"
 if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) {
     New-Item -ItemType Directory -Path $OutputDirectory -Force -ErrorAction Stop | Out-Null
