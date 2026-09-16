@@ -11,7 +11,11 @@ param(
     [switch]$SelfTest,
     [switch]$StateSelfTest,
     [switch]$UiSelfTest,
-    [switch]$ApplyPreferred,
+    # Renamed from -ApplyPreferred after 0.7.7. The switch is the verb, 'do it',
+    # and -Include/-Exclude say what to do it to. The old name still binds so
+    # existing scripts and shortcuts keep working.
+    [Alias('ApplyPreferred')]
+    [switch]$Apply,
     [switch]$WhatIf,
     [switch]$ListSettings,
     [switch]$RecoveryReport,
@@ -154,7 +158,7 @@ function Exit-DingoSingleInstance {
 # Keep the launcher separate from the WPF host so a failed GUI process cannot
 # strand the command shell, and hold the per-user mutex for the host's lifetime.
 # Avoid persistent user-wide shell workarounds; the host process only owns the UI.
-if (-not ($SelfTest -or $StateSelfTest -or $UiSelfTest -or $ApplyPreferred -or $WhatIf -or $ListSettings -or $RecoveryReport -or $Help -or $Version -or $Include -or $Exclude -or $script:UnexpectedArguments.Count -or $MachineWorker -or $ElevationBroker -or $FinalizeInternationalSettings -or $WpfHost)) {
+if (-not ($SelfTest -or $StateSelfTest -or $UiSelfTest -or $Apply -or $WhatIf -or $ListSettings -or $RecoveryReport -or $Help -or $Version -or $Include -or $Exclude -or $script:UnexpectedArguments.Count -or $MachineWorker -or $ElevationBroker -or $FinalizeInternationalSettings -or $WpfHost)) {
     if (-not (Enter-DingoSingleInstance)) {
         Add-Type -AssemblyName PresentationFramework
         [System.Windows.MessageBox]::Show('Dingo is already running for this Windows account.', 'Dingo is already running', 'OK', 'Information') | Out-Null
@@ -750,10 +754,16 @@ function Set-DingoToolRoot([string]$Value) {
 }
 
 function Expand-ToolRootPath([string]$Path) {
-    # The token is expanded by Windows like any other environment variable. This
-    # wrapper exists so a path that still holds the token after expansion is
-    # caught here rather than becoming a folder with a '%' in its name.
-    $expanded = [Environment]::ExpandEnvironmentVariables([string]$Path)
+    # The token is expanded by Windows like any other environment variable, and
+    # an unset variable fails in two different ways. Windows PowerShell leaves
+    # the token in the string. .NET on PowerShell 7 drops it instead, so
+    # '%DINGO_TOOL_ROOT%\EZTools' comes back as '\EZTools', which Windows reads
+    # as the root of the current drive. That second one is silent, so the
+    # variable is checked before the expansion, not only after it.
+    $text = [string]$Path
+    $missing = $text -like "*$($script:ToolRootToken)*" -and -not [Environment]::GetEnvironmentVariable($script:ToolRootVariableName)
+    if ($missing) { throw "The tools folder is not set, so '$Path' could not be resolved." }
+    $expanded = [Environment]::ExpandEnvironmentVariables($text)
     if ($expanded -like "*$($script:ToolRootToken)*") { throw "The tools folder is not set, so '$Path' could not be resolved." }
     return $expanded
 }
@@ -2544,7 +2554,17 @@ function ConvertTo-StrictJson([string]$Text) {
         if ($character -eq ',') {
             $nextIndex = $index + 1
             while ($nextIndex -lt $clean.Length -and [char]::IsWhiteSpace($clean[$nextIndex])) { $nextIndex++ }
-            if ($nextIndex -lt $clean.Length -and $clean[$nextIndex] -in @('}',']')) { continue }
+            if ($nextIndex -lt $clean.Length -and $clean[$nextIndex] -in @('}',']')) {
+                # Only a comma that closes a real value is a trailing comma.
+                # After another comma, an opening brace, or a colon, the file is
+                # broken, and dropping the comma would repair '{"a":1,,}' into
+                # '{"a":1,}', which PowerShell 7 accepts and 5.1 rejects. Leave
+                # it in place so a broken file is refused on every runtime.
+                $previous = $builder.Length - 1
+                while ($previous -ge 0 -and [char]::IsWhiteSpace($builder[$previous])) { $previous-- }
+                $previousCharacter = if ($previous -ge 0) { $builder[$previous] } else { [char]0 }
+                if ($previousCharacter -notin @([char]',',[char]'{',[char]'[',[char]':',[char]0)) { continue }
+            }
         }
         [void]$builder.Append($character)
     }
@@ -3697,17 +3717,21 @@ GUI:
 
 Quick apply:
   Start-Dingo.cmd -WhatIf [-Include what] [-Exclude what] [-OutputFormat Text|Json]
-  Start-Dingo.cmd -ApplyPreferred [-Include what] [-Exclude what] [-NoRestartExplorer] [-OutputFormat Text|Json]
+  Start-Dingo.cmd -Apply [-Include what] [-Exclude what] [-NoRestartExplorer] [-OutputFormat Text|Json]
 
-  Without -Include, only the Tweaks section is applied. Tool cards are left alone,
-  and the run reports how many were skipped.
+  -Apply makes the changes. -WhatIf only previews them. Neither one chooses what
+  to change: -Include and -Exclude do that.
+
+  Without -Include, a bare -Apply applies the Tweaks section only. It installs no
+  tools. The tool cards are left alone, and the run says so before it starts and
+  names how many it skipped.
 
 What to include or exclude:
   A section word, a setting ID, or a comma-separated list of either.
   Sections are 'tweaks' (account and computer settings) and 'tools'
   (installs, shortcuts, and file associations).
 
-  -Include tweaks              the default: settings only, no installs
+  -Include tweaks              the default: settings only, no tools installed
   -Include tools               installs, shortcuts, and file associations
   -Include tweaks,tools        everything
   -Include tools -Exclude tool-7zip    a section, less one card
@@ -3952,9 +3976,13 @@ if ($SelfTest) {
         throw 'Command-line parsing must reject stray positional and unknown arguments through the Dingo help path.'
     }
     $helpText = Get-DingoHelpText
-    foreach ($helpTopic in @('-ApplyPreferred','-ListSettings','-Include tweaks','-Include tools','-Include tweaks,tools')) {
+    foreach ($helpTopic in @('-Apply','-ListSettings','-Include tweaks','-Include tools','-Include tweaks,tools')) {
         if ($helpText -notmatch [regex]::Escape($helpTopic)) { throw "The command-line help text does not cover '$helpTopic'." }
     }
+    if ($helpText -notmatch 'installs no\s+tools') { throw 'The command-line help text does not say that a bare -Apply installs no tools.' }
+    # -ApplyPreferred was the name up to 0.7.7. Dropping the alias would break
+    # every existing script and shortcut, so the self test holds on to it.
+    if ($selfTestAst.Extent.Text -notmatch "Alias\('ApplyPreferred'\)") { throw 'The -ApplyPreferred compatibility alias is missing from the -Apply parameter.' }
     # The default is a trap if it is undocumented, so the help must state it.
     if ($helpText -notmatch 'Without -Include') { throw 'The command-line help text does not state what a bare apply does.' }
     $launcherAst = $selfTestAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Start-AdministratorChanges' },$true)
@@ -4695,16 +4723,16 @@ if ($ToolRoot -and $script:ToolRootRejected -and -not ($MachineWorker -or $Eleva
     exit 2
 }
 
-if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
+if ($Apply -or $WhatIf -or $Include -or $Exclude) {
     $exitCode = 0
-    if (-not ($ApplyPreferred -or $WhatIf)) {
-        Write-CliErrorResponse 'Use -ApplyPreferred to make changes, or -WhatIf to preview them.' 2
+    if (-not ($Apply -or $WhatIf)) {
+        Write-CliErrorResponse 'Use -Apply to make changes, or -WhatIf to preview them.' 2
         exit 2
     }
     # A dry run changes nothing, so it stays available where every process is
     # elevated, such as Windows Sandbox. Only real changes are refused.
     if ((Test-IsAdministrator) -and -not $WhatIf) {
-        Write-CliErrorResponse 'Start Dingo from the signed-in desktop account, not from an elevated PowerShell window. Dingo will request administrator approval only for settings that need it.' 2 'ApplyPreferred'
+        Write-CliErrorResponse 'Start Dingo from the signed-in desktop account, not from an elevated PowerShell window. Dingo will request administrator approval only for settings that need it.' 2 'Apply'
         exit 2
     }
     $elevatedDryRun = [bool]((Test-IsAdministrator) -and $WhatIf)
@@ -4712,7 +4740,7 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
         Write-CliStatus 'Note: this dry run is elevated, so account settings are read from the elevated account. That is the same account under UAC, but not if you elevated as somebody else.'
     }
     if (-not (Enter-DingoSingleInstance)) {
-        Write-CliErrorResponse 'Dingo is already running for this Windows account.' 3 $(if ($WhatIf) { 'WhatIf' } else { 'ApplyPreferred' })
+        Write-CliErrorResponse 'Dingo is already running for this Windows account.' 3 $(if ($WhatIf) { 'WhatIf' } else { 'Apply' })
         exit 3
     }
     try {
@@ -4734,12 +4762,12 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
                     Section = 'Tools'
                     Count = $skippedIds.Count
                     Ids = $skippedIds
-                    Reason = 'No -Include was given, so only the Tweaks section ran.'
+                    Reason = 'No -Include was given, so this run applies the Tweaks section only and installs no tools.'
                     Hint = 'Use -Include tools for the tool cards, or -Include tweaks,tools for both.'
                 }
             }
         }
-        $skippedNotice = if ($skipped) { "$($skipped.Count) tool card(s) were left alone. $($skipped.Reason) $($skipped.Hint)" } else { '' }
+        $skippedNotice = if ($skipped) { "$($skipped.Reason) $($skipped.Count) tool card(s) are left alone. $($skipped.Hint)" } else { '' }
         # Settled before any state is read, because reading a state produces the
         # caveats, and a caveat has to know what else this run will do.
         $script:PlannedSettingIds = @($selected | ForEach-Object { [string]$_.Id })
@@ -4829,7 +4857,7 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             if ($partial -or $failed) { $exitCode = 1 }
             if ($OutputFormat -eq 'Json') {
                 [Console]::Out.WriteLine((ConvertTo-Json -InputObject ([PSCustomObject]@{
-                    Version=$script:DingoVersion; Mode='ApplyPreferred'; Success=($exitCode -eq 0); ExitCode=$exitCode; Skipped=$skipped
+                    Version=$script:DingoVersion; Mode='Apply'; Success=($exitCode -eq 0); ExitCode=$exitCode; Skipped=$skipped
                     Summary=[PSCustomObject]@{Succeeded=$succeeded;PartiallyApplied=$partial;Failed=$failed}
                     RestartRequired=[bool](@($results | Where-Object RestartRequired).Count); LogPath=$script:LogFile; Results=$resultRows
                 }) -Depth 9))
@@ -4851,7 +4879,7 @@ if ($ApplyPreferred -or $WhatIf -or $Include -or $Exclude) {
             Write-Log 'INFO' "Quick apply finished: $succeeded succeeded; $partial partially applied; $failed failed."
         }
     } catch {
-        Write-CliErrorResponse $_.Exception.Message 2 $(if ($WhatIf) { 'WhatIf' } else { 'ApplyPreferred' })
+        Write-CliErrorResponse $_.Exception.Message 2 $(if ($WhatIf) { 'WhatIf' } else { 'Apply' })
         Write-Log 'ERROR' "Quick apply failed: $($_.Exception.ToString())"
         $exitCode = 2
     } finally {

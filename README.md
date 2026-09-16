@@ -38,21 +38,28 @@ Start-Dingo.cmd -WhatIf
 Apply the preferred Windows settings:
 
 ```bat
-Start-Dingo.cmd -ApplyPreferred
+Start-Dingo.cmd -Apply
 ```
 
-A bare `-ApplyPreferred` applies the **Tweaks** section only. It does not install tools. To include tools:
+Up to version 0.7.7 this switch was called `-ApplyPreferred`. That name still works as an alias, so
+existing scripts and shortcuts do not need changing.
+
+`-Apply` makes the changes and `-WhatIf` previews them. Neither one picks what to change; `-Include` and
+`-Exclude` do that.
+
+A bare `-Apply` applies the **Tweaks** section only. It installs no tools. The run prints that before it
+starts, together with the number of tool cards it left alone. To include tools:
 
 ```bat
-Start-Dingo.cmd -ApplyPreferred -Include tools
-Start-Dingo.cmd -ApplyPreferred -Include tweaks,tools
+Start-Dingo.cmd -Apply -Include tools
+Start-Dingo.cmd -Apply -Include tweaks,tools
 ```
 
 `-Include` and `-Exclude` also take setting IDs, separated by commas:
 
 ```bat
-Start-Dingo.cmd -ApplyPreferred -Include widgets,taskbar-search
-Start-Dingo.cmd -ApplyPreferred -Include tools -Exclude tool-7zip
+Start-Dingo.cmd -Apply -Include widgets,taskbar-search
+Start-Dingo.cmd -Apply -Include tools -Exclude tool-7zip
 ```
 
 Other commands:
@@ -63,7 +70,7 @@ Start-Dingo.cmd -Help
 Start-Dingo.cmd -Version
 ```
 
-Add `-OutputFormat Json` to `-WhatIf`, `-ApplyPreferred`, or `-ListSettings` for machine-readable output. Add `-NoRestartExplorer` to skip the File Explorer restart.
+Add `-OutputFormat Json` to `-WhatIf`, `-Apply`, or `-ListSettings` for machine-readable output. In JSON, the apply mode is reported as `"Mode": "Apply"`. Add `-NoRestartExplorer` to skip the File Explorer restart.
 
 ### What a run prints
 
@@ -106,7 +113,7 @@ The PATH line is left out when this terminal already has the folder, so it only 
 `Start-Dingo.cmd` is a convenience. It picks the right PowerShell switches for you and holds the window open if a run fails. For a command-line run you can call the script instead:
 
 ```powershell
-.\Dingo.ps1 -ApplyPreferred -Include tweaks,tools
+.\Dingo.ps1 -Apply -Include tweaks,tools
 ```
 
 Everything above works the same way. Two differences:
@@ -123,7 +130,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 Add `-ToolRoot` to use a different tools folder for one run, without saving it:
 
 ```bat
-Start-Dingo.cmd -ApplyPreferred -Include tools -ToolRoot "D:\DFIR\Tools"
+Start-Dingo.cmd -Apply -Include tools -ToolRoot "D:\DFIR\Tools"
 ```
 
 A folder Dingo cannot use ends the run with exit code `2` and says why. See [Where tools are installed](#where-tools-are-installed) for the saved option and the rules.
