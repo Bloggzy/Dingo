@@ -24,11 +24,34 @@ function Assert-Throws([scriptblock]$Body,$Pattern) {
     $message=''; try { & $Body } catch { $message=$_.Exception.Message }
     Assert ($message -match $Pattern) "Expected $Pattern; got $message"
 }
+function New-ProbeExecutable([string]$Path, [string]$Source) {
+    $compiler = Join-Path $env:WinDir 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+        $compiler = Join-Path $env:WinDir 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+    }
+    if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+        throw "The .NET Framework C# compiler is not on this computer, so the probe cannot be built: $compiler"
+    }
+    $sourcePath = [IO.Path]::ChangeExtension($Path, '.cs')
+    [IO.File]::WriteAllText($sourcePath, $Source, (New-Object Text.UTF8Encoding $true))
+    $build = Invoke-ChildProcess $compiler @('/nologo','/target:exe','/platform:anycpu',"/out:$Path",$sourcePath) 120 'Probe compiler'
+    if ($build.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "The probe did not compile (exit $($build.ExitCode)): $($build.Output)"
+    }
+}
+
 $scratch=Join-Path $PSScriptRoot ('.phase3-'+[Guid]::NewGuid().ToString('N'))
 [void](New-Item -ItemType Directory -Path $scratch)
 $probe=Join-Path $scratch 'argument probe.exe'
 try {
-    Add-Type -OutputAssembly $probe -OutputType ConsoleApplication -TypeDefinition @'
+    # Add-Type -OutputAssembly built the probe on Windows PowerShell 5.1, but
+    # .NET Core dropped assembly output, so on PowerShell 7 this whole suite
+    # stopped at the first line. The .NET Framework compiler ships with Windows
+    # and is the same on both runtimes, so the probe is built by calling it.
+    # Invoke-ChildProcess carries the arguments, which is the function this
+    # suite tests: a compiler command that arrives wrong fails the build loudly
+    # rather than quietly passing a test.
+    New-ProbeExecutable $probe @'
 using System;
 using System.IO;
 using System.Text;

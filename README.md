@@ -389,6 +389,9 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Tests\Phase2.Test
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Tests\Phase3.Tests.ps1
 ```
 
+All three suites run on Windows PowerShell 5.1 and on PowerShell 7. Phase 3 builds a small native probe with the
+.NET Framework C# compiler that ships with Windows, so it needs no SDK.
+
 These are isolated checks with mocked installers. They write no registry values. For real Windows validation, use the [Phase 4 VM test pack](Tests/Phase4/README.md) on a disposable VM, starting from a snapshot.
 
 ## Credits
