@@ -568,7 +568,11 @@ try {
             # Nothing published yet: the approval prompt is still unanswered.
             Update-AdministratorProgress $pending
             Assert ($SummaryText.Text -match 'Waiting for administrator approval') 'An unanswered approval prompt is not named.'
-            Assert ($SummaryText.Text -match '7:30') 'The waiting message carries no elapsed time.'
+            # These two clocks read the real wall clock, so a slow machine can push
+            # the count on to the next second between the offset above and the
+            # check here. Accept that one second. The point of the check is the
+            # m:ss shape and the right starting point, not the exact tick.
+            Assert ($SummaryText.Text -match '7:3[01]') 'The waiting message carries no elapsed time.'
             Assert ($ProgressBar.IsIndeterminate) 'The progress bar claims progress before the worker started.'
             # First step running, nothing finished.
             Set-Content -LiteralPath $resultPath -Value '[]'
@@ -587,7 +591,7 @@ try {
             Write-WorkerProgress 'Downloading' 'Downloading the en-GB language pack. Windows allows 12m 0s more.'
             Update-AdministratorProgress $pending
             Assert ($SummaryText.Text -match 'Windows Update, so this step is the slow one') 'A download does not explain why it is slow.'
-            Assert ($SummaryText.Text -match '2:14 on this step') 'The per-step clock is missing.'
+            Assert ($SummaryText.Text -match '2:1[45] on this step') 'The per-step clock is missing.'
             Assert ($SummaryText.Text -match '1 of 2 finished') 'The finished count did not advance.'
             Assert ($ProgressBar.Value -eq 50) "The progress bar reads $($ProgressBar.Value) instead of 50."
             Assert (($script:Settings | Where-Object Id -eq 'a').DetailsControl.Text -match 'finished') 'A finished card still says it is waiting.'
