@@ -233,10 +233,11 @@ The cards are shown in name order, and the **Install tools** tab has a search bo
 | `tool-volatility3` | Volatility 3 | yes |
 | `tool-hayabusa` | Hayabusa | yes |
 | `tool-duckdb` | DuckDB | yes |
+| `tool-arsenalimagemounter` | Arsenal Image Mounter | yes |
 
 Select .NET 9 as well as Eric Zimmerman's tools. Those tools need it, and a fresh Windows 11 does not have it. Dingo installs it first, so one run installs both in the right order.
 
-.NET 10 is a separate card. Newer analyst tools are built on .NET 10, and a .NET 9 install does not satisfy them. The two runtimes sit side by side; installing one does not touch or replace the other.
+.NET 10 is a separate card. Newer analyst tools are built on .NET 10, and a .NET 9 install does not satisfy them. Arsenal Image Mounter is one of them. The two runtimes sit side by side; installing one does not touch or replace the other.
 
 The table above is the order Dingo installs in, not the order the window shows. The window sorts the cards by name so a growing list stays easy to read. The plan still runs in the order above, so a runtime is always installed before the tools that need it.
 
@@ -252,6 +253,30 @@ MemProcFS, Volatility 3, Hayabusa, and DuckDB are not in winget either. Each one
 | DuckDB | `DuckDB` | `duckdb` |
 
 All four are command-line tools, so they get no Start menu or Desktop shortcut. Select **Run tools from anywhere** to type the commands above from any folder. Volatility 3 is the standalone Windows build, so no Python install is needed.
+
+### Arsenal Image Mounter
+
+Arsenal Image Mounter mounts a forensic disk image as a real disk, so ordinary Windows tools can read it. It needs the **.NET 10 Desktop Runtime**, so select that card as well.
+
+It is the one tool that is in neither winget nor a GitHub release. Arsenal Recon publish it only through their own download page, behind a MEGA link that changes with every release. So the catalog holds a page address and a product name, never a download address:
+
+1. Dingo reads <https://arsenalrecon.com/downloads> over HTTPS.
+2. It finds the link whose product name sits next to it. If no link matches, or more than one does, Dingo stops and tells you to download it by hand. It never guesses which file to run.
+3. It asks MEGA for the file, and refuses any address that is not MEGA's own storage.
+4. It checks the file name MEGA reports against `Arsenal-Image-Mounter-v*.zip`.
+5. It downloads and decrypts the file, then checks it against the checksum carried inside the link itself.
+
+Step 5 is the important one. A MEGA link holds the decryption key after the `#`, and that key also carries a checksum of the original file. So Dingo can prove the bytes are exactly what Arsenal Recon uploaded, without any published SHA256. If the checksum does not match, the file is thrown away and nothing is unpacked.
+
+This proves the file matches its link. It does not prove the link is theirs; that rests on the HTTPS certificate of `arsenalrecon.com`, the same trust Dingo already places in a GitHub download. Every run records the page, the link, the file name, its size, its SHA256, and both checksums in the log folder, so a run can be audited afterwards.
+
+The archive wraps everything in a folder that carries the version, such as `Arsenal-Image-Mounter-v3.13.368`. Dingo takes that wrapper off, so the tool always sits at `ArsenalImageMounter` inside the tools folder and the Start menu shortcut keeps working after an update.
+
+| Tool | Folder | Command | Shortcut |
+| --- | --- | --- | --- |
+| Arsenal Image Mounter | `ArsenalImageMounter` | `aim_cli` | Arsenal Image Mounter |
+
+Use of the tool is governed by the Arsenal Recon licence, which is in that folder. Mounting an image for the first time makes Windows install Arsenal's disk driver, so expect a Windows prompt then. Dingo does not install that driver; only the tool does, when you use it.
 
 Hayabusa puts its version in the program name, such as `hayabusa-4.1.0-win-x64.exe`. Dingo always names the launcher `hayabusa` and points it at the newest copy in the folder, so the command never changes when you update.
 
@@ -347,15 +372,17 @@ Any path may hold `%DINGO_TOOL_ROOT%`, which Dingo replaces with the tools folde
 | `name` | yes | Shown on the card |
 | `category` | no | Defaults to `Tools` |
 | `description` | no | Defaults to "Install \<name\>" |
-| `install.kind` | no | `winget` (default), `script`, or `github-release` |
+| `install.kind` | no | `winget` (default), `script`, `github-release`, or `mega-page` |
 | `install.package` | winget only | The exact winget package id |
-| `install.url` | script only | `https://` address. Plain `http` is refused |
+| `install.url` | script and mega-page | `https://` address. Plain `http` is refused. For mega-page it is the page the link is published on, not the file |
 | `install.sha256` | no | Expected SHA256 for a script. A mismatch blocks it |
 | `install.repo` | github-release only | The repository as `owner/name`. Dingo builds the address from it |
-| `install.assetPattern` | github-release only | Wildcard for the release file, such as `duckdb_cli-windows-amd64.zip`. It must be a `.zip`, and must match exactly one file |
-| `install.dest` | script and github-release | Folder to install into |
+| `install.assetPattern` | github-release and mega-page | Wildcard for the file, such as `duckdb_cli-windows-amd64.zip`. It must be a `.zip`. For github-release it must match exactly one release file; for mega-page the name the server reports must match it, or nothing is unpacked |
+| `install.dest` | script, github-release, and mega-page | Folder to install into |
+| `install.linkName` | mega-page only | The product name to look for on the page. Exactly one link must sit next to it, or Dingo stops |
+| `install.stripRoot` | no | mega-page only. `true` takes off a single wrapping folder, for an archive whose top folder carries the version |
 | `install.arguments` | no | Extra arguments. `-Dest` is always passed for you |
-| `install.timeoutMinutes` | no | 1 to 240. Default 15 (winget), 30 (github-release), or 45 (script) |
+| `install.timeoutMinutes` | no | 1 to 240. Default 15 (winget), 30 (github-release and mega-page), or 45 (script) |
 | `install.scope` | no | `machine` (default) or `user` |
 | `install.source` | no | winget only. Defaults to `winget` |
 | `detect` | yes | One or more detect rules |
@@ -379,6 +406,8 @@ Detect rules:
 | `uninstall-key` | `match` | Wildcard on the uninstall display name, such as `7-Zip*` |
 | `file` | `path` | A file that must exist. Wildcards allowed. Use forward slashes |
 | `command` | `command` | A program on the PATH, such as `rg.exe` |
+
+A `mega-page` entry is for a vendor who publishes only through a MEGA link that changes with each release. Dingo reads the page, takes the one link that sits next to `linkName`, checks the file name against `assetPattern`, and checks the decrypted file against the checksum carried in the link. See the Arsenal Image Mounter section above for what each step guards against.
 
 A tool entry Dingo cannot read is skipped, and the reason is logged. A broken `Tools.json` is ignored, and the built-in list is used. Dingo always starts.
 
