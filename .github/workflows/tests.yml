@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Report the shell
         shell: powershell
@@ -82,7 +82,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "The release build failed with exit code $LASTEXITCODE." }
 
       - name: Keep the package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: dingo-package
           path: artifacts/Dingo-*.zip
