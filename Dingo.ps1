@@ -1,11 +1,60 @@
-#requires -version 5.1
 <#
 .SYNOPSIS
-    State-aware Windows 11 preference configurator.
+    Sets up a fresh Windows 11 machine for DFIR work: settings, debloat, and tools.
 .DESCRIPTION
-    The GUI runs as the signed-in user so HKCU changes affect the visible desktop.
-    Machine-only changes are sent to a constrained elevated worker when required.
+    Dingo does three jobs. It changes Windows settings to suit an analyst, such as
+    UTC time, ISO dates, shown file extensions and shown hidden files. It removes
+    Windows clutter, such as Widgets, Copilot, Bing in Start, OneDrive and the Edge
+    promotions. It installs the core tool set and wires it in, with Start menu and
+    Desktop shortcuts, file associations, and a PATH entry for the command-line
+    tools.
+
+    Every setting is read before it is written, so a card always shows what the
+    machine is doing now, not what Dingo hopes. Nothing is applied until it is
+    selected, every change is verified afterwards, and all but one are reversible.
+
+    Dingo starts without elevation and stays that way. The window and every
+    account setting run as the signed-in user, so HKCU writes land in the profile
+    that is on screen. Only the computer-wide parts are handed to a short-lived
+    elevated worker, which is given a written plan, runs it, and writes back what
+    it did. Tools come from winget, from an author's own GitHub release, or from
+    an author's own install script pinned to a revision and a hash.
+
+    The whole program is this one file. It needs nothing but the Windows
+    PowerShell 5.1 that Windows 11 already ships.
+
+    Run it with no options to open the window. Every switch below is for the
+    command line; the last few are internal and are never typed by hand.
+.EXAMPLE
+    Start-Dingo.cmd
+
+    Opens the window. This is the usual way to run Dingo.
+.EXAMPLE
+    Start-Dingo.cmd -WhatIf
+
+    Prints the plan and changes nothing.
+.EXAMPLE
+    Start-Dingo.cmd -Apply -Include tweaks,tools
+
+    Applies everything: the Windows settings and the tools.
+.EXAMPLE
+    Start-Dingo.cmd -Apply -Include tools -Exclude tool-eztools
+
+    Installs every tool but one.
+.NOTES
+    Do not use "Run as administrator". Dingo asks for approval itself, and only
+    for the changes that need it. Every run is written to the Logs folder, and
+    -RecoveryReport reports any change that started without recording that it
+    finished.
+.LINK
+    https://github.com/Bloggzy/Dingo
 #>
+
+# The help above has to be the first thing in the file, and a blank line has to
+# follow it. A #requires line placed first makes Get-Help ignore the whole block
+# and print only the syntax, and no blank line after it swallows this line.
+#requires -version 5.1
+
 [CmdletBinding(PositionalBinding=$false)]
 param(
     [switch]$SelfTest,
