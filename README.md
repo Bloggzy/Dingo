@@ -12,7 +12,7 @@ Nothing is applied until you select it. Every change is shown on a card first, a
 
 ![Dingo main window: the Tweaks section open on the Whole computer tab, showing setting cards and the Tweaks, Tools, and Options sections](Assets/Dingo-main-screen-redacted.png)
 
-Current version: **0.7.9**.
+Current version: **0.8.0**.
 
 ## Use the window
 
