@@ -1254,7 +1254,7 @@ function Test-WingetVersionSupported([string]$WingetPath = '') {
 }
 
 function Test-EndpointReachable([string]$Url, [int]$TimeoutSeconds = 20) {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    Initialize-DingoWebSession
     try {
         Invoke-WebRequest -Uri $Url -UseBasicParsing -Method Head -TimeoutSec $TimeoutSeconds -ErrorAction Stop | Out-Null
         return $true
@@ -1302,6 +1302,82 @@ function New-DownloadFailure([string]$What, [string]$Url, $ErrorRecord) {
     return "$What could not be downloaded from $Url. $detail"
 }
 
+function Initialize-DingoWebSession {
+    # Two settings every download in this session needs. Windows PowerShell 5.1
+    # can still offer an older protocol than the server will accept. And a
+    # company proxy that asks who you are gets no answer unless the credentials
+    # of the signed-in account are offered, which shows up as a 407 refusal.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    try {
+        $proxy = [Net.WebRequest]::DefaultWebProxy
+        if ($proxy -and -not $proxy.Credentials) {
+            $proxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials
+        }
+    } catch { Write-Log 'WARN' "The proxy credentials could not be set: $($_.Exception.Message)" }
+}
+
+function Test-TransientWebFault($ErrorRecord) {
+    # Worth trying again: the call never reached a server at all, or the server
+    # said it is busy or broken just now. A refusal that will read the same in
+    # ten seconds -- not found, forbidden, or a rate limit counted by the hour
+    # -- is never retried, because repeating it only wastes the person's time.
+    $status = Get-WebErrorStatus $ErrorRecord
+    return ($status -eq 0 -or $status -eq 408 -or ($status -ge 500 -and $status -le 599))
+}
+
+function Invoke-WithDownloadRetry([scriptblock]$Download, [string]$What, [int]$Attempts = 3) {
+    # One dropped packet used to fail a whole install. The wait grows between
+    # tries so a server that is briefly busy is given room to recover.
+    for ($attempt = 1; $true; $attempt++) {
+        try { return (& $Download) }
+        catch {
+            if ($attempt -ge $Attempts -or -not (Test-TransientWebFault $_)) { throw }
+            $wait = 2 * $attempt
+            Write-Log 'WARN' "$What failed on try $attempt of $Attempts : $($_.Exception.Message) Waiting $wait seconds, then trying again."
+            Start-Sleep -Seconds $wait
+        }
+    }
+}
+
+function Format-ByteSize([int64]$Bytes) {
+    if ($Bytes -lt 0) { return 'an unknown amount' }
+    if ($Bytes -ge 1GB) { return ('{0:N1} GB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N0} MB' -f ($Bytes / 1MB)) }
+    return ('{0:N0} KB' -f ($Bytes / 1KB))
+}
+
+function Get-FreeSpaceBytes([string]$Path) {
+    # -1 means the drive could not be asked, which must never block an install.
+    try {
+        $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Path))
+        if (-not $root) { return [int64](-1) }
+        $drive = New-Object IO.DriveInfo $root
+        if (-not $drive.IsReady) { return [int64](-1) }
+        return [int64]$drive.AvailableFreeSpace
+    } catch { return [int64](-1) }
+}
+
+function Assert-EnoughFreeSpace([string]$Path, [int64]$RequiredBytes, [string]$What) {
+    # A download or an unpack that runs the disk dry leaves a half-written tool
+    # and an error about a file handle. Ask the drive while there is still room
+    # to say something the reader can act on.
+    $free = Get-FreeSpaceBytes $Path
+    if ($free -lt 0) { Write-Log 'WARN' "The free space on the drive holding $Path could not be read, so the size was not checked."; return }
+    if ($free -ge $RequiredBytes) { return }
+    throw "$What needs about $(Format-ByteSize $RequiredBytes) on the drive holding $Path, and only $(Format-ByteSize $free) is free. Make room, then try again."
+}
+
+function Test-FileIsLocked([string]$Path) {
+    # A tool that is open right now cannot be replaced. Windows reports that as
+    # a plain access refusal part-way through, so it is asked about first.
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        $stream = [IO.File]::Open($Path, 'Open', 'ReadWrite', 'None')
+        $stream.Dispose()
+        return $false
+    } catch { return $true }
+}
+
 function Get-WingetRepairEndpoints {
     # Repair-WinGetPackageManager downloads App Installer itself, so that
     # address is always needed. The gallery is needed only when this computer
@@ -1341,6 +1417,11 @@ function Repair-WingetClient([int]$TimeoutSeconds = 900) {
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# This runs in its own PowerShell, so it needs the proxy answer of its own.
+try {
+    $proxy = [Net.WebRequest]::DefaultWebProxy
+    if ($proxy -and -not $proxy.Credentials) { $proxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials }
+} catch { }
 $minimum = [version]'1.8.0'
 $module = Get-Module -ListAvailable -Name Microsoft.WinGet.Client |
     Sort-Object Version -Descending | Select-Object -First 1
@@ -1727,10 +1808,13 @@ function Install-ScriptPackage($Tool) {
     if ($Tool.Url -notmatch '^https://') { throw "The install script for $($Tool.Name) must be fetched over https." }
     $scriptPath = Join-Path $env:TEMP ("Dingo-installer-{0}.ps1" -f [Guid]::NewGuid().ToString('N'))
     try {
-        # Windows PowerShell 5.1 can still default to an older protocol.
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Initialize-DingoWebSession
         Write-Log 'INFO' "Downloading the $($Tool.Name) install script from $($Tool.Url)."
-        try { Invoke-WebRequest -Uri $Tool.Url -OutFile $scriptPath -UseBasicParsing -TimeoutSec 120 -MaximumRedirection 0 -ErrorAction Stop }
+        try {
+            Invoke-WithDownloadRetry {
+                Invoke-WebRequest -Uri $Tool.Url -OutFile $scriptPath -UseBasicParsing -TimeoutSec 120 -MaximumRedirection 0 -ErrorAction Stop
+            } "The $($Tool.Name) install script download"
+        }
         catch { throw (New-DownloadFailure "The $($Tool.Name) install script" $Tool.Url $_) }
         # Record what was actually executed, so a run can be audited afterwards.
         $hash = (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
@@ -1752,6 +1836,13 @@ function Install-ScriptPackage($Tool) {
             New-Item -ItemType Directory -Path $destination -Force -ErrorAction Stop | Out-Null
             Write-Log 'INFO' "Created $destination."
         }
+        # An author's script downloads its own files, so how much room it needs
+        # is not knowable here. A drive this close to full is worth saying out
+        # loud, but it is a warning: only the script itself can prove it is short.
+        $free = Get-FreeSpaceBytes $destination
+        if ($free -ge 0 -and $free -lt 1GB) {
+            Write-Log 'WARN' "The drive holding $destination has only $(Format-ByteSize $free) free. The $($Tool.Name) install may not fit."
+        }
         $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-NonInteractive','-File',$scriptPath,'-Dest',$destination) + @($Tool.Arguments)
         Write-Log 'INFO' "Running the $($Tool.Name) install script into $destination."
         $run = Invoke-ChildProcess (Get-PowerShellHostPath) $arguments $Tool.TimeoutSeconds "The $($Tool.Name) install script"
@@ -1768,9 +1859,17 @@ function Expand-DingoZipArchive([string]$ArchivePath, [string]$Destination) {
     # Windows PowerShell 5.1 ships Expand-Archive, but it neither overwrites an
     # existing file nor refuses an entry whose name climbs out of the folder.
     # So every entry is checked first, and only then is anything written.
+    #
+    # Nothing goes into the destination until the whole archive has been unpacked
+    # beside it, the drive has been shown to have room, and every file about to
+    # be replaced has been shown to be free. A broken archive, a full drive, or a
+    # tool that is open at the time then leaves the working install as it was.
     Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
     $root = ([IO.Path]::GetFullPath($Destination)).TrimEnd('\')
+    # A sibling of the destination, so the drive is the same one and moving a
+    # file into place is a rename rather than a copy.
+    $staging = "$root.dingo-unpack-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
     $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
     try {
         $planned = New-Object System.Collections.ArrayList
@@ -1784,8 +1883,38 @@ function Expand-DingoZipArchive([string]$ArchivePath, [string]$Destination) {
             if (-not $target.StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase)) {
                 throw "The archive entry '$($entry.FullName)' points outside $root, so nothing was unpacked."
             }
-            [void]$planned.Add([PSCustomObject]@{ Entry = $entry; Target = $target; IsFolder = [string]::IsNullOrEmpty($entry.Name) })
+            [void]$planned.Add([PSCustomObject]@{
+                Entry = $entry; Target = $target; Relative = $relative
+                Staged = [IO.Path]::GetFullPath((Join-Path $staging $relative))
+                IsFolder = [string]::IsNullOrEmpty($entry.Name); Length = [int64]$entry.Length
+            })
         }
+        $files = @($planned | Where-Object { -not $_.IsFolder })
+        # The staged copy and the copy already in place both sit on this drive
+        # at the same moment, so the archive has to fit on it twice.
+        $needed = [int64]0
+        foreach ($item in $files) { $needed += $item.Length }
+        Assert-EnoughFreeSpace $root ($needed * 2) 'Unpacking this download'
+
+        # Unpack beside the destination, never into it. A broken archive or a
+        # drive that fills up then leaves the working install exactly as it was.
+        New-Item -ItemType Directory -Path $staging -Force -ErrorAction Stop | Out-Null
+        foreach ($item in $files) {
+            $stagedParent = [IO.Path]::GetDirectoryName($item.Staged)
+            if ($stagedParent -and -not (Test-Path -LiteralPath $stagedParent -PathType Container)) {
+                New-Item -ItemType Directory -Path $stagedParent -Force -ErrorAction Stop | Out-Null
+            }
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($item.Entry, $item.Staged, $true)
+        }
+
+        # Every file that is about to be replaced is asked whether it is free.
+        # Replacing a tool that is running fails half way through otherwise, and
+        # leaves a folder that is neither the old version nor the new one.
+        $locked = @($files | Where-Object { Test-FileIsLocked $_.Target } | ForEach-Object { [IO.Path]::GetFileName($_.Target) })
+        if ($locked.Count) {
+            throw "$(Join-WordList $locked) $(if ($locked.Count -eq 1) { 'is' } else { 'are' }) open right now, so nothing was changed. Close the program, then try again."
+        }
+
         $written = 0
         foreach ($item in $planned) {
             if ($item.IsFolder) {
@@ -1798,19 +1927,27 @@ function Expand-DingoZipArchive([string]$ArchivePath, [string]$Destination) {
             if ($parent -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
                 New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
             }
-            [IO.Compression.ZipFileExtensions]::ExtractToFile($item.Entry, $item.Target, $true)
+            # A move within one drive is a rename, so this stage is quick and
+            # the window in which the folder is half old and half new is short.
+            Move-Item -LiteralPath $item.Staged -Destination $item.Target -Force -ErrorAction Stop
             $written++
         }
         return $written
-    } finally { $archive.Dispose() }
+    } finally {
+        $archive.Dispose()
+        Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Get-GitHubLatestRelease([string]$Repo, [int]$TimeoutSeconds = 60) {
-    # Windows PowerShell 5.1 can still default to an older protocol.
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    Initialize-DingoWebSession
     $uri = "https://api.github.com/repos/$Repo/releases/latest"
     $headers = @{ 'Accept' = 'application/vnd.github+json'; 'User-Agent' = "Dingo/$script:DingoVersion" }
-    try { return Invoke-RestMethod -Uri $uri -Headers $headers -UseBasicParsing -TimeoutSec $TimeoutSeconds -ErrorAction Stop }
+    try {
+        return (Invoke-WithDownloadRetry {
+            Invoke-RestMethod -Uri $uri -Headers $headers -UseBasicParsing -TimeoutSec $TimeoutSeconds -ErrorAction Stop
+        } "Reading the latest $Repo release")
+    }
     catch {
         # GitHub answers a computer that is not signed in only 60 times an hour,
         # and it counts by address. A whole office behind one address runs out
@@ -1841,6 +1978,7 @@ function Install-GitHubReleasePackage($Tool) {
     }
     $assetName = [string](Get-JsonField $assets[0] 'name' '')
     $downloadUrl = [string](Get-JsonField $assets[0] 'browser_download_url' '')
+    $assetBytes = [int64](Get-JsonField $assets[0] 'size' 0)
     $expectedPrefix = "https://github.com/$($Tool.Repo)/releases/download/"
     if (-not $downloadUrl.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw "The download address for $assetName is '$downloadUrl', which is not a release file of $($Tool.Repo)."
@@ -1851,8 +1989,16 @@ function Install-GitHubReleasePackage($Tool) {
     try {
         # The progress bar makes Invoke-WebRequest many times slower on a large file.
         $ProgressPreference = 'SilentlyContinue'
-        Write-Log 'INFO' "Downloading $assetName from $downloadUrl."
-        try { Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -UseBasicParsing -TimeoutSec ([Math]::Min($Tool.TimeoutSeconds, 3600)) -ErrorAction Stop }
+        # GitHub states the size, so the drive holding the temporary folder can
+        # be asked before the download starts rather than when it runs out.
+        if ($assetBytes -gt 0) { Assert-EnoughFreeSpace $archivePath $assetBytes "Downloading $assetName" }
+        Initialize-DingoWebSession
+        Write-Log 'INFO' "Downloading $assetName ($(Format-ByteSize $assetBytes)) from $downloadUrl."
+        try {
+            Invoke-WithDownloadRetry {
+                Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -UseBasicParsing -TimeoutSec ([Math]::Min($Tool.TimeoutSeconds, 3600)) -ErrorAction Stop
+            } "The $assetName download"
+        }
         catch { throw (New-DownloadFailure $assetName $downloadUrl $_) }
         # A release file is built fresh for every version, so no hash can be kept
         # in the catalog. Record what was fetched, so a run can be audited later.

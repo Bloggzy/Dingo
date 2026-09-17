@@ -160,6 +160,74 @@ class Probe {
         Assert ($record.Event -eq 'InstallerProvenance' -and $record.Data.Sha256 -eq $tool.Sha256) 'Provenance absent.'
         $script:LogFile=$null
     }
+    Test-Case 'A dropped download is tried again; a refusal is not' {
+        function Start-Sleep { }
+        $state=@{Count=0}
+        # No response object at all is a transport fault, so it is worth retrying.
+        $value = Invoke-WithDownloadRetry { $state.Count++; if ($state.Count -lt 3) { throw 'The remote name could not be resolved' }; 'ok' } 'test download'
+        Assert ($value -eq 'ok') 'The value from a successful retry was lost.'
+        Assert ($state.Count -eq 3) "Took $($state.Count) tries instead of 3."
+        $state.Count=0
+        Assert-Throws { Invoke-WithDownloadRetry { $state.Count++; throw 'The remote name could not be resolved' } 'test download' } 'could not be resolved'
+        Assert ($state.Count -eq 3) "Gave up after $($state.Count) tries instead of 3."
+        # A refusal that will read the same in ten seconds is never repeated.
+        function Get-WebErrorStatus { 404 }
+        $state.Count=0
+        Assert-Throws { Invoke-WithDownloadRetry { $state.Count++; throw 'not found' } 'test download' } 'not found'
+        Assert ($state.Count -eq 1) "A permanent refusal was tried $($state.Count) times."
+        function Get-WebErrorStatus { 503 }
+        $state.Count=0
+        Assert-Throws { Invoke-WithDownloadRetry { $state.Count++; throw 'busy' } 'test download' } 'busy'
+        Assert ($state.Count -eq 3) "A busy server was tried $($state.Count) times instead of 3."
+    }
+    Test-Case 'The web session asks for TLS 1.2 and offers the account to a proxy' {
+        Initialize-DingoWebSession
+        Assert ((([Net.ServicePointManager]::SecurityProtocol) -band [Net.SecurityProtocolType]::Tls12) -ne 0) 'TLS 1.2 was not requested.'
+        $proxy=[Net.WebRequest]::DefaultWebProxy
+        Assert ((-not $proxy) -or $proxy.Credentials) 'A proxy was left with nothing to answer with.'
+    }
+    Test-Case 'A zip is unpacked into place and leaves no staging folder behind' {
+        $src=Join-Path $scratch 'pack-src'
+        New-Item -ItemType Directory -Path (Join-Path $src 'sub') -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $src 'tool.exe'),'new')
+        [IO.File]::WriteAllText((Join-Path $src 'sub\data.txt'),'new data')
+        $zip=Join-Path $scratch 'pack.zip'
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [IO.Compression.ZipFile]::CreateFromDirectory($src,$zip)
+        $dest=Join-Path $scratch 'pack-dest'
+        New-Item -ItemType Directory -Path $dest -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $dest 'tool.exe'),'old')
+        $written=Expand-DingoZipArchive $zip $dest
+        Assert ($written -eq 2) "Wrote $written file(s) instead of 2."
+        Assert ((Get-Content -Raw -LiteralPath (Join-Path $dest 'tool.exe')) -eq 'new') 'The old file was not replaced.'
+        Assert ((Get-Content -Raw -LiteralPath (Join-Path $dest 'sub\data.txt')) -eq 'new data') 'The nested file is wrong.'
+        Assert (-not @(Get-ChildItem -Path $scratch -Filter 'pack-dest.dingo-unpack-*' -Force -ErrorAction SilentlyContinue).Count) 'A staging folder was left behind.'
+    }
+    Test-Case 'A tool that is open stops the unpack, and the copy in place survives' {
+        $zip=Join-Path $scratch 'pack.zip'
+        $dest=Join-Path $scratch 'locked-dest'
+        New-Item -ItemType Directory -Path $dest -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $dest 'tool.exe'),'old')
+        $held=[IO.File]::Open((Join-Path $dest 'tool.exe'),'Open','ReadWrite','None')
+        try { Assert-Throws { Expand-DingoZipArchive $zip $dest } 'open right now' }
+        finally { $held.Dispose() }
+        Assert ((Get-Content -Raw -LiteralPath (Join-Path $dest 'tool.exe')) -eq 'old') 'The running tool was overwritten.'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $dest 'sub\data.txt'))) 'Other files landed although the unpack stopped.'
+        Assert (-not @(Get-ChildItem -Path $scratch -Filter 'locked-dest.dingo-unpack-*' -Force -ErrorAction SilentlyContinue).Count) 'A staging folder was left behind.'
+    }
+    Test-Case 'An unpack that will not fit stops before the folder is touched' {
+        function Get-FreeSpaceBytes { [int64]1 }
+        $zip=Join-Path $scratch 'pack.zip'
+        $dest=Join-Path $scratch 'full-dest'
+        New-Item -ItemType Directory -Path $dest -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $dest 'tool.exe'),'old')
+        Assert-Throws { Expand-DingoZipArchive $zip $dest } 'Make room'
+        Assert ((Get-Content -Raw -LiteralPath (Join-Path $dest 'tool.exe')) -eq 'old') 'The folder was changed although the drive was full.'
+        Assert (-not @(Get-ChildItem -Path $scratch -Filter 'full-dest.dingo-unpack-*' -Force -ErrorAction SilentlyContinue).Count) 'A staging folder was left behind.'
+        # A drive that cannot be asked must never stop an install that would work.
+        function Get-FreeSpaceBytes { [int64](-1) }
+        Assert-EnoughFreeSpace $dest ([int64]1TB) 'A test'
+    }
     "Passed $script:Passed phase 3 tests on PowerShell $($PSVersionTable.PSVersion)."
 } finally {
     $script:LogFile=$null
