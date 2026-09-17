@@ -1,0 +1,89 @@
+name: Tests
+
+# Dingo is one Windows PowerShell 5.1 script with a WPF window, so the tests
+# only mean anything on a real Windows runner. Nothing here reaches the network:
+# the suites stub Invoke-WebRequest and use addresses that cannot resolve.
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run pointless, so stop it.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the shell
+        shell: powershell
+        run: |
+          "PowerShell $($PSVersionTable.PSVersion)"
+          "Apartment  $([Threading.Thread]::CurrentThread.GetApartmentState())"
+
+      # -STA and the real 5.1 host, the same way Start-Dingo.cmd runs it. The
+      # UI self-test builds the whole window and closes it again; it never
+      # shows it, so it needs no desktop.
+      - name: Self-test
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Dingo.ps1 -SelfTest
+          if ($LASTEXITCODE -ne 0) { throw "Self-test failed with exit code $LASTEXITCODE." }
+
+      - name: UI self-test
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Dingo.ps1 -UiSelfTest
+          if ($LASTEXITCODE -ne 0) { throw "UI self-test failed with exit code $LASTEXITCODE." }
+
+      - name: State self-test
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Dingo.ps1 -StateSelfTest | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "State self-test failed with exit code $LASTEXITCODE." }
+
+      - name: Phase 1 tests
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Tests\Phase1.Tests.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Phase 1 failed with exit code $LASTEXITCODE." }
+
+      - name: Phase 2 tests
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Tests\Phase2.Tests.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Phase 2 failed with exit code $LASTEXITCODE." }
+
+      # Phase 3 builds a small probe program with the .NET Framework compiler
+      # that ships with Windows, so it needs no toolchain of its own.
+      - name: Phase 3 tests
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Tests\Phase3.Tests.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Phase 3 failed with exit code $LASTEXITCODE." }
+
+      # A build that passes only in the repository proves nothing. -Verify
+      # unpacks the finished zip somewhere else and runs the self-tests from
+      # there, which is what catches a file left out of the package.
+      - name: Build and verify the release package
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Build-Release.ps1 -Verify -OutputDirectory .\artifacts
+          if ($LASTEXITCODE -ne 0) { throw "The release build failed with exit code $LASTEXITCODE." }
+
+      - name: Keep the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dingo-package
+          path: artifacts/Dingo-*.zip
+          if-no-files-found: error
