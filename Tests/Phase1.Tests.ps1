@@ -15,6 +15,7 @@ foreach ($statement in $ast.EndBlock.Statements) {
     }
 }
 $script:LogFile = $null
+$script:DingoVersion = '0.0.0-test'
 $script:RemoveValue = '__REMOVE_VALUE__'
 $script:SettingHandlers = @{}
 $script:ToolCatalogWarning = ''
@@ -315,14 +316,94 @@ try {
         Install-WingetPackage $tool
         Assert-Throws { Install-WingetPackage $tool $true } 'winget exited'
     }
-    Test-Case 'Explicit update preflight requires winget even when tool already exists' {
+    Test-Case 'A missing winget stops an account-scope update that cannot install one' {
         function Get-WingetPath { '' }
+        function Test-IsAdministrator { $false }
         function Find-InstalledTool { [pscustomobject]@{Version='1'} }
-        $setting = @(New-ApplyPlan @(($script:Settings | Where-Object Id -eq 'tool-7zip')))[0]
+        # ripgrep installs into the signed-in account, so its card never runs
+        # elevated. Without rights Dingo cannot supply winget, so it must stop.
+        $setting = @(New-ApplyPlan @(($script:Settings | Where-Object Id -eq 'tool-ripgrep')))[0]
+        Assert (-not $setting.RequiresAdmin) 'The account-scope tool asks for elevation.'
         $setting.CurrentState = New-StateResult Preferred Installed
         Assert ((Test-SettingPreflight $setting).Available) 'Already installed tool unnecessarily requires winget.'
         $setting.DesiredState = 'Update installed tool'
-        Assert (-not (Test-SettingPreflight $setting).Available) 'Update can pass preflight without winget.'
+        $check = Test-SettingPreflight $setting
+        Assert (-not $check.Available) 'Update can pass preflight without winget.'
+        Assert ($check.Message -match 'administrator rights to install it') 'The block never says what would fix it.'
+    }
+    Test-Case 'A missing winget lets an elevated card through, because Dingo can install one' {
+        function Get-WingetPath { '' }
+        function Test-IsAdministrator { $false }
+        function Find-InstalledTool { [pscustomobject]@{Version='1'} }
+        # 7-Zip installs for the whole computer, so its card runs elevated and
+        # the worker will hold the rights the winget install needs.
+        $setting = @(New-ApplyPlan @(($script:Settings | Where-Object Id -eq 'tool-7zip')))[0]
+        Assert ($setting.RequiresAdmin) 'The computer-wide tool does not ask for elevation.'
+        $setting.CurrentState = New-StateResult Preferred Installed
+        $setting.DesiredState = 'Update installed tool'
+        Assert ((Test-SettingPreflight $setting).Available) 'An elevated card was blocked by a winget Dingo can install.'
+    }
+    Test-Case 'An absent winget is installed once, and the new client is used' {
+        Set-RunScopedFlag 'WingetVersionVerified' $false
+        Set-RunScopedFlag 'WingetRepairAttempted' $false
+        $repairs = New-Object Collections.ArrayList
+        $state = @{ Path = '' }
+        function Test-IsAdministrator { $true }
+        function Get-WingetPath { $state.Path }
+        function Get-WingetVersion { [version]'1.11.400' }
+        function Repair-WingetClient { [void]$repairs.Add(1); $state.Path = 'new-winget.exe' }
+        Assert ((Resolve-UsableWinget '') -eq 'new-winget.exe') 'The installed client was not picked up.'
+        Assert ($repairs.Count -eq 1) "Repair ran $($repairs.Count) times instead of once."
+    }
+    Test-Case 'An absent winget that cannot be installed explains what to do instead' {
+        Set-RunScopedFlag 'WingetVersionVerified' $false
+        Set-RunScopedFlag 'WingetRepairAttempted' $false
+        function Test-IsAdministrator { $false }
+        function Repair-WingetClient { throw 'Unexpected repair' }
+        Assert-Throws { Resolve-UsableWinget '' } 'administrator'
+        Assert-Throws { Resolve-UsableWinget '' } 'aka.ms/getwinget'
+    }
+    Test-Case 'An install that leaves no winget behind is reported, and never retried' {
+        Set-RunScopedFlag 'WingetVersionVerified' $false
+        Set-RunScopedFlag 'WingetRepairAttempted' $false
+        $repairs = New-Object Collections.ArrayList
+        function Test-IsAdministrator { $true }
+        function Get-WingetPath { '' }
+        function Repair-WingetClient { [void]$repairs.Add(1) }
+        Assert-Throws { Resolve-UsableWinget '' } 'still not on this computer'
+        Assert-Throws { Resolve-UsableWinget '' } 'did not supply it'
+        Assert ($repairs.Count -eq 1) "Repair ran $($repairs.Count) times instead of once."
+    }
+    Test-Case 'A download that cannot leave the computer names the network, not the library' {
+        function Test-EndpointReachable { $false }
+        $record = $null
+        try { throw 'The remote name could not be resolved' } catch { $record = $_ }
+        $message = New-DownloadFailure 'The test file' 'https://example.invalid/file.zip' $record
+        Assert ($message -match 'cannot reach https://example.invalid/file.zip') 'The unreachable address is not named.'
+        Assert ($message -match 'proxy') 'The proxy is never mentioned as a cause.'
+        # A server that answers has been reached, so the network is not blamed.
+        function Test-EndpointReachable { $true }
+        $plain = New-DownloadFailure 'The test file' 'https://example.invalid/file.zip' $record
+        Assert ($plain -notmatch 'cannot reach') 'A reachable server was blamed on the network.'
+        Assert ($plain -match 'could not be resolved') 'The original fault was lost.'
+    }
+    Test-Case 'A proxy sign-in and a too-busy server are each named' {
+        function Test-EndpointReachable { throw 'The status should answer before the network is asked.' }
+        function Get-WebErrorStatus { 407 }
+        Assert ((Get-DownloadFailureAdvice 'https://example.invalid/' $null) -match 'proxy asked for a sign-in') 'A 407 was not explained.'
+        function Get-WebErrorStatus { 429 }
+        Assert ((Get-DownloadFailureAdvice 'https://example.invalid/' $null) -match 'Wait a while') 'A 429 was not explained.'
+    }
+    Test-Case 'A GitHub refusal is explained as a rate limit, with a way round it' {
+        function Invoke-RestMethod { throw 'Response status code does not indicate success: 403 (rate limit exceeded).' }
+        function Get-WebErrorStatus { 403 }
+        Assert-Throws { Get-GitHubLatestRelease 'ufrisk/MemProcFS' } 'asked too many times this hour'
+        Assert-Throws { Get-GitHubLatestRelease 'ufrisk/MemProcFS' } 'github.com/ufrisk/MemProcFS/releases/latest'
+        function Get-WebErrorStatus { 404 }
+        Assert-Throws { Get-GitHubLatestRelease 'ufrisk/MemProcFS' } 'no published release'
+        function Get-WebErrorStatus { 0 }
+        function Test-EndpointReachable { $false }
+        Assert-Throws { Get-GitHubLatestRelease 'ufrisk/MemProcFS' } 'cannot reach'
     }
     Test-Case 'Missing tool update is stopped at preflight' {
         function Get-WingetPath { 'mock-winget.exe' }
