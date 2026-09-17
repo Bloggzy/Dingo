@@ -4987,6 +4987,16 @@ if ($SelfTest) {
         foreach ($shipped in @($script:Settings | Where-Object { -not $_.Requirements.ContainsKey('RequiredTools') -or -not @($_.Requirements['RequiredTools']).Count })) {
             if ($shipped.Id -eq 'windows-update') {
                 if ((Get-SettingAdvisory $shipped) -notmatch 'not verified') { throw 'Update configuration must disclose its verification limit.' }
+            } elseif (Test-SettingNeedsLanguageDownload $shipped) {
+                # Whether a display pack is already on this computer is a fact
+                # about the machine, not about Dingo. A workstation usually has
+                # the pack and gets no caveat; a fresh build agent has none and
+                # must get one. So the words are checked rather than the absence,
+                # which is the same treatment a tool caveat already gets below.
+                if ((Get-SettingAdvisory $shipped) -notmatch 'Windows Update') {
+                    throw "Setting '$($shipped.Id)' needs a language download but does not say so."
+                }
+                if (-not (Test-SettingPreflight $shipped).Available) { throw 'A language download caveat must never fail preflight.' }
             } elseif (Get-SettingAdvisory $shipped) { throw "Setting '$($shipped.Id)' carries an unexpected caveat." }
         }
         # A tool that needs another tool must say so when that one is absent, and

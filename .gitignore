@@ -3,6 +3,9 @@ Logs/
 Tests/Phase4/Evidence/
 Dingo-*.zip
 
+# Where the CI build drops the package before uploading it.
+artifacts/
+
 # Windows Terminal backups written by Dingo
 *.backup-*
 *.replace-backup-*
