@@ -218,6 +218,8 @@ Restart Edge after these.
 
 Each tool card has two choices: **Installed** (install it if missing, leave it alone if present) and **Update installed tool**. Neither choice removes a tool.
 
+The cards are shown in name order, and the **Install tools** tab has a search box above the list. Type part of a name, such as `haya`, and only the matching cards stay on screen. Type more than one word and a card must match every word. The search only hides cards; a tool you already selected stays in the plan while it is out of sight. Press **Clear** to show the whole list again.
+
 | ID | Tool | Admin |
 | --- | --- | --- |
 | `tool-7zip` | 7-Zip | yes |
@@ -225,13 +227,18 @@ Each tool card has two choices: **Installed** (install it if missing, leave it a
 | `tool-ripgrep` | ripgrep | no |
 | `tool-sqlitebrowser` | DB Browser for SQLite | yes |
 | `tool-dotnet-desktop-9` | .NET 9 Desktop Runtime | yes |
+| `tool-dotnet-desktop-10` | .NET 10 Desktop Runtime | yes |
 | `tool-eztools` | Eric Zimmerman's tools | yes |
 | `tool-memprocfs` | MemProcFS | yes |
 | `tool-volatility3` | Volatility 3 | yes |
 | `tool-hayabusa` | Hayabusa | yes |
 | `tool-duckdb` | DuckDB | yes |
 
-Select .NET 9 as well as Eric Zimmerman's tools. Those tools need it, and a fresh Windows 11 does not have it. Dingo lists it first, so one run installs both in the right order.
+Select .NET 9 as well as Eric Zimmerman's tools. Those tools need it, and a fresh Windows 11 does not have it. Dingo installs it first, so one run installs both in the right order.
+
+.NET 10 is a separate card. Newer analyst tools are built on .NET 10, and a .NET 9 install does not satisfy them. The two runtimes sit side by side; installing one does not touch or replace the other.
+
+The table above is the order Dingo installs in, not the order the window shows. The window sorts the cards by name so a growing list stays easy to read. The plan still runs in the order above, so a runtime is always installed before the tools that need it.
 
 Most tools come from winget, so you need a network connection. Dingo also checks the winget version before it installs anything. A client older than 1.6 cannot read the package list Microsoft publishes today, and every install fails with `0x8a15000f`, "Data required by the source is missing". When Dingo is running as an administrator it repairs winget itself with `Repair-WinGetPackageManager`, then carries on. Otherwise it stops and tells you to install the latest App Installer from <https://aka.ms/getwinget>. Before it repairs anything, Dingo checks it can reach the App Installer download, and the PowerShell Gallery when the repair module is missing or too old. A computer with no route out is told so by name, rather than waiting for a download to time out. Eric Zimmerman's tools are not in winget. Dingo runs the author's own `Get-ZimmermanTools.ps1` over HTTPS and checks its SHA256 before running it. They install to `EZTools` inside the tools folder, `C:\DFIR\Tools` by default, and the download is several hundred megabytes.
 

@@ -1056,8 +1056,18 @@ function Get-BuiltInToolCatalog {
             )
         },
         [PSCustomObject]@{
+            # Listed before the tools that need it, because the elevated worker
+            # applies the plan in catalog order.
+            id='tool-dotnet-desktop-10'; name='.NET 10 Desktop Runtime'; category='Forensics'
+            description="Newer analyst tools are built on .NET 10, which a fresh Windows 11 install does not include. Without this they fail to start with 'You must install .NET to run this application'. This sits beside the .NET 9 runtime; it does not replace it."
+            install=[PSCustomObject]@{ kind='winget'; package='Microsoft.DotNet.DesktopRuntime.10'; scope='machine' }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='C:/Program Files/dotnet/shared/Microsoft.WindowsDesktop.App/10.*' }
+            )
+        },
+        [PSCustomObject]@{
             id='tool-eztools'; name="Eric Zimmerman's tools"; category='Forensics'
-            description='The full DFIR tool set, including Timeline Explorer, Registry Explorer, EvtxECmd, and RECmd. Installed with the author''s own Get-ZimmermanTools script. Needs the .NET 9 Desktop Runtime, which is the card above.'
+            description='The full DFIR tool set, including Timeline Explorer, Registry Explorer, EvtxECmd, and RECmd. Installed with the author''s own Get-ZimmermanTools script. Needs the .NET 9 Desktop Runtime, which is a card of its own on this tab.'
             install=[PSCustomObject]@{
                 kind='script'; scope='machine'
                 url='https://raw.githubusercontent.com/EricZimmerman/Get-ZimmermanTools/d808d1dfe6446faf884576a8a1c11b6875197a19/Get-ZimmermanTools.ps1'
@@ -4638,7 +4648,7 @@ if ($SelfTest) {
     }
     # Tool cards offer an explicit update action, but never uninstall.
     $builtInTools = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
-    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9','tool-memprocfs','tool-volatility3','tool-hayabusa','tool-duckdb')) {
+    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9','tool-dotnet-desktop-10','tool-memprocfs','tool-volatility3','tool-hayabusa','tool-duckdb')) {
         if (@($builtInTools | Where-Object Id -eq $expectedId).Count -ne 1) { throw "The built-in tool catalog is missing '$expectedId'." }
     }
     # The tools that come straight from a GitHub release. Each one must name a
@@ -4817,6 +4827,17 @@ if ($SelfTest) {
     $ezIndex = [array]::IndexOf(@($builtInTools | ForEach-Object { $_.Id }), 'tool-eztools')
     if ($runtimeIndex -lt 0 -or $ezIndex -lt 0 -or $runtimeIndex -gt $ezIndex) {
         throw 'The .NET runtime must be listed before the tools that need it.'
+    }
+    # The .NET runtimes live side by side. Each must look for its own major
+    # version only, or installing one would mark the other as already present.
+    foreach ($pair in @(@('tool-dotnet-desktop-9','9'), @('tool-dotnet-desktop-10','10'))) {
+        $runtimeTool = $builtInTools | Where-Object Id -eq $pair[0] | Select-Object -First 1
+        if (-not $runtimeTool) { throw "The catalog is missing '$($pair[0])'." }
+        if ($runtimeTool.Package -ne "Microsoft.DotNet.DesktopRuntime.$($pair[1])") { throw "'$($pair[0])' must install the .NET $($pair[1]) desktop runtime." }
+        $paths = @($runtimeTool.Detect | ForEach-Object { $_.Path })
+        if (@($paths | Where-Object { $_ -like "*/Microsoft.WindowsDesktop.App/$($pair[1]).*" }).Count -ne 1) {
+            throw "'$($pair[0])' must detect only its own major version."
+        }
     }
     $missingTool = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-absent'; name='Absent'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='file'; path='%ProgramFiles%\Dingo-Definitely-Absent\x.exe' }) })
     if (Find-InstalledTool $missingTool) { throw 'Tool detection reported a missing tool as installed.' }
@@ -5438,11 +5459,17 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
         <TabControl Name="ToolTabs" BorderThickness="0" Margin="0,6,0,0" FontSize="14">
           <TabItem Header="Install tools">
             <Grid>
-              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
               <Border Background="#E8F6EE" Padding="12" Margin="8">
                 <TextBlock Name="ToolsScopeText" Text="Analyst tools. Dingo checks whether each one is already installed, and installs the missing ones with winget. Dingo never removes a tool." TextWrapping="Wrap"/>
               </Border>
-              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+              <Grid Grid.Row="1" Margin="8,0,8,6">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <TextBox Name="ToolFilterTextBox" Grid.Column="0" Padding="6,5" VerticalAlignment="Center" AutomationProperties.Name="Search the tool list"/>
+                <Button Name="ToolFilterClearButton" Grid.Column="1" Content="Clear" Margin="8,0,0,0"/>
+                <TextBlock Name="ToolFilterCountText" Grid.Column="2" Text="" VerticalAlignment="Center" Foreground="#52606D" Margin="12,0,4,0"/>
+              </Grid>
+              <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                 <StackPanel Name="ToolSettingsPanel" Margin="8,0,8,8"/>
               </ScrollViewer>
             </Grid>
@@ -5522,7 +5549,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $script:DingoWindow = $window
-foreach ($name in @('IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
+foreach ($name in @('IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','ToolFilterTextBox','ToolFilterClearButton','ToolFilterCountText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
 $desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -5873,8 +5900,26 @@ function New-SettingCard($Item) {
     return $border
 }
 
-foreach ($item in $script:Settings) {
+# The catalog order is the order the elevated worker applies the plan in, so a
+# tool that another one needs is listed first. That order is no help to a reader
+# looking for one name in a growing list, so the two tool lists are shown in
+# name order instead. Only the cards move; the plan still runs in catalog order.
+function Get-CardDisplayOrder($Items) {
+    $sortedTabs = @('Install tools','File associations')
+    $result = New-Object System.Collections.ArrayList
+    foreach ($item in $Items) { if ($item.Tab -notin $sortedTabs) { [void]$result.Add($item) } }
+    foreach ($tab in $sortedTabs) {
+        # A leading dot or digit, as in '.NET 10', must not jump the queue, and
+        # 'ripgrep' must sit with the letter R rather than after Z.
+        $ofTab = @($Items | Where-Object { $_.Tab -eq $tab } | Sort-Object @{ Expression = { ($_.Name -replace '[^A-Za-z0-9 ]', '').Trim() } }, Name)
+        foreach ($item in $ofTab) { [void]$result.Add($item) }
+    }
+    return ,$result
+}
+
+foreach ($item in (Get-CardDisplayOrder $script:Settings)) {
     $card = New-SettingCard $item
+    $item | Add-Member -NotePropertyName CardControl -NotePropertyValue $card -Force
     switch ($item.Tab) {
         'User' { [void]$UserSettingsPanel.Children.Add($card) }
         'System' { [void]$SystemSettingsPanel.Children.Add($card) }
@@ -5885,6 +5930,36 @@ foreach ($item in $script:Settings) {
         default { throw "Setting '$($item.Id)' asks for unknown tab '$($item.Tab)'." }
     }
 }
+
+# The search box hides cards, it does not unselect them. A tool you already
+# turned on stays in the plan while it is out of sight, so a half-typed search
+# can never quietly drop a tool from the run.
+function Update-ToolFilter {
+    $text = [string]$ToolFilterTextBox.Text
+    $needle = $text.Trim()
+    $toolItems = @($script:Settings | Where-Object { $_.Tab -eq 'Install tools' })
+    $shown = 0
+    foreach ($item in $toolItems) {
+        if (-not $item.CardControl) { continue }
+        $hit = $true
+        if ($needle) {
+            $haystack = @($item.Name, $item.Category, $item.Description) -join ' '
+            # Each word must appear somewhere, so 'log haya' finds Hayabusa too.
+            foreach ($word in @($needle -split '\s+' | Where-Object { $_ })) {
+                if ($haystack.IndexOf($word, [StringComparison]::OrdinalIgnoreCase) -lt 0) { $hit = $false; break }
+            }
+        }
+        $item.CardControl.Visibility = if ($hit) { 'Visible' } else { 'Collapsed' }
+        if ($hit) { $shown++ }
+    }
+    $ToolFilterClearButton.IsEnabled = [bool]$needle
+    $ToolFilterCountText.Text = if (-not $needle) { "$($toolItems.Count) tools" }
+        elseif ($shown -eq 0) { "No tool matches '$needle'" }
+        else { "$shown of $($toolItems.Count) tools" }
+}
+$ToolFilterTextBox.Add_TextChanged({ Update-ToolFilter })
+$ToolFilterClearButton.Add_Click({ $ToolFilterTextBox.Text = ''; [void]$ToolFilterTextBox.Focus() })
+Update-ToolFilter
 
 if ($UiSelfTest) {
     if ($script:ActionButtons | Where-Object IsEnabled) { throw 'Action buttons must remain disabled until the initial state scan finishes.' }
@@ -5923,6 +5998,49 @@ if ($UiSelfTest) {
     }
     if ($ToolTabs.Items.Count -ne @($script:Settings | Where-Object { $_.Section -eq 'Tools' } | Group-Object Tab).Count) {
         throw 'The Tools section does not hold exactly the tool tabs.'
+    }
+    # The tool lists are shown in name order, so a growing catalog stays readable.
+    foreach ($sortedTab in @('Install tools','File associations')) {
+        $panel = if ($sortedTab -eq 'Install tools') { $ToolSettingsPanel } else { $AssociationSettingsPanel }
+        $shownNames = @($script:Settings | Where-Object { $_.Tab -eq $sortedTab } | Where-Object { $panel.Children.Contains($_.CardControl) } | Sort-Object { $panel.Children.IndexOf($_.CardControl) } | ForEach-Object { $_.Name })
+        if ($shownNames.Count -ne @($script:Settings | Where-Object { $_.Tab -eq $sortedTab }).Count) {
+            throw "Not every '$sortedTab' card reached its panel."
+        }
+        $wanted = @($shownNames | Sort-Object @{ Expression = { ($_ -replace '[^A-Za-z0-9 ]', '').Trim() } }, @{ Expression = { $_ } })
+        if (($shownNames -join '|') -ne ($wanted -join '|')) {
+            throw "The '$sortedTab' cards are not in name order: $($shownNames -join ', ')"
+        }
+    }
+    # The catalog order is what the worker runs, and it must not have been
+    # reordered to match the display. The runtime still comes before its tools.
+    $displayedToolOrder = @($script:Settings | Where-Object { $_.Tab -eq 'Install tools' } | Sort-Object { $ToolSettingsPanel.Children.IndexOf($_.CardControl) } | ForEach-Object { $_.Id })
+    $planToolOrder = @($script:Settings | Where-Object { $_.Tab -eq 'Install tools' } | ForEach-Object { $_.Id })
+    if ([array]::IndexOf($planToolOrder, 'tool-dotnet-desktop-9') -gt [array]::IndexOf($planToolOrder, 'tool-eztools')) {
+        throw 'Sorting the cards must not reorder the plan.'
+    }
+    if ($displayedToolOrder.Count -ne $planToolOrder.Count) { throw 'The tool cards and the tool plan hold different tools.' }
+    # The search box hides cards. It must never change what is selected.
+    $filterProbe = $script:Settings | Where-Object { $_.Tab -eq 'Install tools' } | Select-Object -First 1
+    $savedFilterChoice = $filterProbe.ApplyControl.IsChecked
+    try {
+        $filterProbe.ApplyControl.IsChecked = $true
+        $ToolFilterTextBox.Text = 'zzz-no-tool-is-called-this'
+        if (@($script:Settings | Where-Object { $_.Tab -eq 'Install tools' -and $_.CardControl.Visibility -eq 'Visible' }).Count -ne 0) {
+            throw 'A search that matches nothing must hide every tool card.'
+        }
+        if ($ToolFilterCountText.Text -notmatch 'No tool matches') { throw 'A search that matches nothing must say so.' }
+        if (-not $filterProbe.ApplyControl.IsChecked) { throw 'The search box must not change what is selected.' }
+        $ToolFilterTextBox.Text = 'haya'
+        $hayaMatches = @($script:Settings | Where-Object { $_.Tab -eq 'Install tools' -and $_.CardControl.Visibility -eq 'Visible' })
+        if ($hayaMatches.Count -ne 1 -or $hayaMatches[0].Id -ne 'tool-hayabusa') { throw "Typing 'haya' must show Hayabusa alone." }
+        $ToolFilterTextBox.Text = ''
+        if (@($script:Settings | Where-Object { $_.Tab -eq 'Install tools' -and $_.CardControl.Visibility -ne 'Visible' }).Count -ne 0) {
+            throw 'An empty search box must show every tool card.'
+        }
+        if ($ToolFilterClearButton.IsEnabled) { throw 'The Clear button must be off when the search box is empty.' }
+    } finally {
+        $ToolFilterTextBox.Text = ''
+        $filterProbe.ApplyControl.IsChecked = $savedFilterChoice
     }
     if (-not $RestartExplorerCheckBox) { throw 'The Options section does not hold the File Explorer restart choice.' }
     if (-not $OpenLogButton) { throw 'The Options section does not hold the log folder button.' }
