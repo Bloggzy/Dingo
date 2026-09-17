@@ -10,7 +10,7 @@ It does three jobs:
 
 Nothing is applied until you select it. Every change is shown on a card first, and all but one are reversible.
 
-![Dingo main window: the Tweaks section open on the Whole computer tab, showing setting cards and the Tweaks, Tools, and Options sections](Assets/Dingo-main-screen-redacted.png)
+![Dingo main window: the Tweaks section open on the Whole computer tab, showing the Time zone, Win32 long paths and OneDrive file sync cards, with the Tweaks, Tools and Options sections across the top](Assets/Dingo-main-screen-800.jpg)
 
 Current version: **0.8.2**.
 
