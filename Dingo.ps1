@@ -870,12 +870,14 @@ function ConvertTo-ToolDefinition($Raw) {
 
     $install = Get-JsonField $Raw 'install' $null
     $installKind = [string](Get-JsonField $install 'kind' 'winget')
-    if ($installKind -notin @('winget','script','github-release')) { throw "Tool '$id' uses install kind '$installKind', which this version of Dingo cannot run." }
+    if ($installKind -notin @('winget','script','github-release','mega-page')) { throw "Tool '$id' uses install kind '$installKind', which this version of Dingo cannot run." }
     $package = [string](Get-JsonField $install 'package' '')
     $url = [string](Get-JsonField $install 'url' '')
     $dest = [string](Get-JsonField $install 'dest' '')
     $repo = [string](Get-JsonField $install 'repo' '')
     $assetPattern = [string](Get-JsonField $install 'assetPattern' '')
+    $linkName = [string](Get-JsonField $install 'linkName' '')
+    $stripRoot = [bool](Get-JsonField $install 'stripRoot' $false)
     $expectedHash = [string](Get-JsonField $install 'sha256' '')
     if ($expectedHash -and $expectedHash -notmatch '^[0-9a-fA-F]{64}$') { throw "Tool '$id' needs a 64-character SHA256 hash." }
     if ($installKind -eq 'winget') {
@@ -890,6 +892,16 @@ function ConvertTo-ToolDefinition($Raw) {
         if ($assetPattern -match '[\\/:"<>|]' -or $assetPattern -match '[\x00-\x1f]') { throw "Tool '$id' has an assetPattern that is not a usable file name." }
         if ($assetPattern -notlike '*.zip') { throw "Tool '$id' must name a .zip release file, because Dingo unpacks nothing else." }
         if ([string]::IsNullOrWhiteSpace($dest)) { throw "Tool '$id' needs a dest folder for its release download." }
+    } elseif ($installKind -eq 'mega-page') {
+        # A vendor who publishes only through MEGA issues a new link for every
+        # release, so the catalog names their download page and the product to
+        # look for on it. Dingo reads the link from that page each time.
+        if ($url -notmatch '^https://[^/\s]+/\S*$') { throw "Tool '$id' needs an https:// url for the page its download link is published on." }
+        if ([string]::IsNullOrWhiteSpace($linkName)) { throw "Tool '$id' needs a linkName naming the product to look for on its download page." }
+        if ([string]::IsNullOrWhiteSpace($assetPattern)) { throw "Tool '$id' needs an assetPattern, so a page that offers the wrong file is refused." }
+        if ($assetPattern -match '[\/:"<>|]' -or $assetPattern -match '[\x00-\x1f]') { throw "Tool '$id' has an assetPattern that is not a usable file name." }
+        if ($assetPattern -notlike '*.zip') { throw "Tool '$id' must name a .zip file, because Dingo unpacks nothing else." }
+        if ([string]::IsNullOrWhiteSpace($dest)) { throw "Tool '$id' needs a dest folder for its download." }
     } else {
         # A downloaded installer script runs with administrator rights, so refuse
         # anything that is not fetched over TLS from a named host.
@@ -898,7 +910,7 @@ function ConvertTo-ToolDefinition($Raw) {
     }
     $scope = [string](Get-JsonField $install 'scope' 'machine')
     if ($scope -notin @('machine','user')) { throw "Tool '$id' has scope '$scope'; use 'machine' or 'user'." }
-    $defaultTimeout = switch ($installKind) { 'script' { 45 }; 'github-release' { 30 }; default { 15 } }
+    $defaultTimeout = switch ($installKind) { 'script' { 45 }; 'github-release' { 30 }; 'mega-page' { 30 }; default { 15 } }
     $timeoutMinutes = [int](Get-JsonField $install 'timeoutMinutes' $defaultTimeout)
     if ($timeoutMinutes -lt 1 -or $timeoutMinutes -gt 240) { throw "Tool '$id' has a timeout of $timeoutMinutes minutes; use 1 to 240." }
 
@@ -995,6 +1007,8 @@ function ConvertTo-ToolDefinition($Raw) {
         Dest = $dest
         Repo = $repo
         AssetPattern = $assetPattern
+        LinkName = $linkName
+        StripRoot = $stripRoot
         Arguments = @(Get-JsonField $install 'arguments' @())
         Shims = $shims
         Shortcuts = @($shortcuts)
@@ -1056,8 +1070,18 @@ function Get-BuiltInToolCatalog {
             )
         },
         [PSCustomObject]@{
+            # Listed before the tools that need it, because the elevated worker
+            # applies the plan in catalog order.
+            id='tool-dotnet-desktop-10'; name='.NET 10 Desktop Runtime'; category='Forensics'
+            description="Newer analyst tools are built on .NET 10, which a fresh Windows 11 install does not include. Without this they fail to start with 'You must install .NET to run this application'. This sits beside the .NET 9 runtime; it does not replace it."
+            install=[PSCustomObject]@{ kind='winget'; package='Microsoft.DotNet.DesktopRuntime.10'; scope='machine' }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='C:/Program Files/dotnet/shared/Microsoft.WindowsDesktop.App/10.*' }
+            )
+        },
+        [PSCustomObject]@{
             id='tool-eztools'; name="Eric Zimmerman's tools"; category='Forensics'
-            description='The full DFIR tool set, including Timeline Explorer, Registry Explorer, EvtxECmd, and RECmd. Installed with the author''s own Get-ZimmermanTools script. Needs the .NET 9 Desktop Runtime, which is the card above.'
+            description='The full DFIR tool set, including Timeline Explorer, Registry Explorer, EvtxECmd, and RECmd. Installed with the author''s own Get-ZimmermanTools script. Needs the .NET 9 Desktop Runtime, which is a card of its own on this tab.'
             install=[PSCustomObject]@{
                 kind='script'; scope='machine'
                 url='https://raw.githubusercontent.com/EricZimmerman/Get-ZimmermanTools/d808d1dfe6446faf884576a8a1c11b6875197a19/Get-ZimmermanTools.ps1'
@@ -1165,6 +1189,30 @@ function Get-BuiltInToolCatalog {
             shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/DuckDB'; pattern='duckdb.exe'; recurse=$false }
             detect=@(
                 [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/DuckDB/duckdb.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-arsenalimagemounter'; name='Arsenal Image Mounter'; category='Disk images'
+            description='Mounts a forensic disk image as a real disk in Windows, so ordinary tools can read it. Window tool, with a command-line tool called aim_cli as well. Arsenal Recon publish it only through their own download page, so Dingo reads the current link from that page. The file carries a checksum inside its own link, and Dingo checks it before unpacking. Use of the tool is governed by the licence in its folder. Needs the .NET 10 Desktop Runtime.'
+            install=[PSCustomObject]@{
+                kind='mega-page'; scope='machine'
+                url='https://arsenalrecon.com/downloads'
+                linkName='Arsenal Image Mounter'
+                assetPattern='Arsenal-Image-Mounter-v*.zip'
+                dest='%DINGO_TOOL_ROOT%\ArsenalImageMounter'
+                # The archive wraps everything in a folder that carries the
+                # version. Taking it off keeps one steady path, so the shortcut
+                # and the launcher still work after an update.
+                stripRoot=$true
+                timeoutMinutes=45
+            }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/ArsenalImageMounter'; pattern='aim_cli.exe'; recurse=$false }
+            shortcuts=@(
+                [PSCustomObject]@{ name='Arsenal Image Mounter'; target='%DINGO_TOOL_ROOT%/ArsenalImageMounter/ArsenalImageMounter.exe' }
+            )
+            requires=@('tool-dotnet-desktop-10')
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/ArsenalImageMounter/ArsenalImageMounter.exe' }
             )
         }
     )
@@ -1855,7 +1903,7 @@ function Install-ScriptPackage($Tool) {
     }
 }
 
-function Expand-DingoZipArchive([string]$ArchivePath, [string]$Destination) {
+function Expand-DingoZipArchive([string]$ArchivePath, [string]$Destination, [switch]$StripRootFolder) {
     # Windows PowerShell 5.1 ships Expand-Archive, but it neither overwrites an
     # existing file nor refuses an entry whose name climbs out of the folder.
     # So every entry is checked first, and only then is anything written.
@@ -1872,9 +1920,29 @@ function Expand-DingoZipArchive([string]$ArchivePath, [string]$Destination) {
     $staging = "$root.dingo-unpack-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
     $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
     try {
+        # Some archives wrap everything in one folder that carries the version,
+        # such as Arsenal-Image-Mounter-v3.13.368. Keeping that folder would move
+        # every program on each update, and every shortcut pointing at one would
+        # break. So the catalog can ask for the wrapper to be taken off.
+        $strip = ''
+        if ($StripRootFolder) {
+            $roots = @(@($archive.Entries | ForEach-Object { (([string]$_.FullName).Replace('\', '/')).Trim('/') } |
+                Where-Object { $_ } | ForEach-Object { ($_ -split '/')[0] }) | Sort-Object -Unique)
+            if ($roots.Count -ne 1) {
+                throw "This download was expected to hold everything in one folder, but it holds $($roots.Count). Nothing was unpacked."
+            }
+            $strip = $roots[0] + '/'
+        }
         $planned = New-Object System.Collections.ArrayList
         foreach ($entry in $archive.Entries) {
-            $relative = ([string]$entry.FullName).Replace('/', '\')
+            $name = ([string]$entry.FullName).Replace('\', '/')
+            if ($strip) {
+                if (-not $name.StartsWith($strip, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "The archive entry '$($entry.FullName)' sits outside the '$($roots[0])' folder, so nothing was unpacked."
+                }
+                $name = $name.Substring($strip.Length)
+            }
+            $relative = $name.Replace('/', '\')
             if ([string]::IsNullOrWhiteSpace($relative)) { continue }
             if ([IO.Path]::IsPathRooted($relative) -or $relative.Contains(':')) {
                 throw "The archive entry '$($entry.FullName)' carries a full path, so nothing was unpacked."
@@ -2018,6 +2086,312 @@ function Install-GitHubReleasePackage($Tool) {
         Write-Log 'INFO' "Unpacked $written file(s) of $($Tool.Name) $tag into $destination."
     } finally {
         $ProgressPreference = $progress
+        Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Initialize-MegaCipher {
+    if ('Dingo.MegaCipher' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Security.Cryptography;
+
+namespace Dingo {
+    // MEGA keeps a file as AES-128-CTR ciphertext and never holds the key. The
+    // key lives in the part of the share link after the '#', which a browser
+    // does not send to the server. That key also carries a short MAC over the
+    // plaintext, so a file that decrypts to the expected MAC is exactly the file
+    // the uploader had. That is what stands in for a published SHA256 here.
+    public static class MegaCipher {
+        // MEGA cuts a file into chunks that grow by 128 KiB for the first eight
+        // and then stay at 1 MiB. Each chunk is MACed on its own, and those MACs
+        // are folded together into the 8-byte value held in the key.
+        public static int ChunkSize(int index) {
+            if (index < 0) throw new ArgumentOutOfRangeException("index");
+            if (index < 8) return (index + 1) * 131072;
+            return 1048576;
+        }
+
+        // Decrypts sourcePath into targetPath and returns the 8-byte MAC of what
+        // was written. The caller compares it with the MAC from the link.
+        public static byte[] DecryptFile(string sourcePath, string targetPath, byte[] key, byte[] nonce) {
+            if (key == null || key.Length != 16) throw new ArgumentException("A MEGA file key must be 16 bytes.", "key");
+            if (nonce == null || nonce.Length != 8) throw new ArgumentException("A MEGA file nonce must be 8 bytes.", "nonce");
+
+            using (Aes aes = Aes.Create()) {
+                aes.Mode = CipherMode.ECB;
+                aes.Padding = PaddingMode.None;
+                aes.KeySize = 128;
+                aes.Key = key;
+                using (ICryptoTransform ecb = aes.CreateEncryptor())
+                using (FileStream source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536))
+                using (FileStream target = new FileStream(targetPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536)) {
+                    long total = source.Length;
+                    const int Biggest = 1048576;
+                    byte[] cipher = new byte[Biggest];
+                    byte[] plain = new byte[Biggest];
+                    byte[] counters = new byte[Biggest];
+                    byte[] stream = new byte[Biggest];
+                    byte[] mac = new byte[16];
+                    byte[] scratch = new byte[16];
+                    byte[] fileMac = new byte[16];
+
+                    // Only the counter half of each block changes as the file is
+                    // read, so the nonce half is written once here.
+                    for (int offset = 0; offset < Biggest; offset += 16)
+                        Buffer.BlockCopy(nonce, 0, counters, offset, 8);
+
+                    long blockCounter = 0;
+                    long position = 0;
+                    for (int chunkIndex = 0; position < total; chunkIndex++) {
+                        int chunk = (int)Math.Min((long)ChunkSize(chunkIndex), total - position);
+                        int read = 0;
+                        while (read < chunk) {
+                            int got = source.Read(cipher, read, chunk - read);
+                            if (got <= 0) throw new EndOfStreamException("The download stopped early, so the file is incomplete.");
+                            read += got;
+                        }
+                        int blocks = (chunk + 15) / 16;
+
+                        for (int b = 0; b < blocks; b++) {
+                            long counter = blockCounter + b;
+                            int at = b * 16 + 8;
+                            counters[at]     = (byte)(counter >> 56); counters[at + 1] = (byte)(counter >> 48);
+                            counters[at + 2] = (byte)(counter >> 40); counters[at + 3] = (byte)(counter >> 32);
+                            counters[at + 4] = (byte)(counter >> 24); counters[at + 5] = (byte)(counter >> 16);
+                            counters[at + 6] = (byte)(counter >> 8);  counters[at + 7] = (byte)counter;
+                        }
+                        ecb.TransformBlock(counters, 0, blocks * 16, stream, 0);
+                        for (int i = 0; i < chunk; i++) plain[i] = (byte)(cipher[i] ^ stream[i]);
+                        // The MAC runs over whole blocks, so a short final chunk
+                        // is padded with zeros. Those bytes are never written.
+                        for (int i = chunk; i < blocks * 16; i++) plain[i] = 0;
+
+                        Buffer.BlockCopy(nonce, 0, mac, 0, 8);
+                        Buffer.BlockCopy(nonce, 0, mac, 8, 8);
+                        for (int b = 0; b < blocks; b++) {
+                            int at = b * 16;
+                            for (int i = 0; i < 16; i++) mac[i] ^= plain[at + i];
+                            ecb.TransformBlock(mac, 0, 16, scratch, 0);
+                            Buffer.BlockCopy(scratch, 0, mac, 0, 16);
+                        }
+                        for (int i = 0; i < 16; i++) fileMac[i] ^= mac[i];
+                        ecb.TransformBlock(fileMac, 0, 16, scratch, 0);
+                        Buffer.BlockCopy(scratch, 0, fileMac, 0, 16);
+
+                        target.Write(plain, 0, chunk);
+                        blockCounter += blocks;
+                        position += chunk;
+                    }
+
+                    byte[] metaMac = new byte[8];
+                    for (int i = 0; i < 4; i++) {
+                        metaMac[i] = (byte)(fileMac[i] ^ fileMac[i + 4]);
+                        metaMac[i + 4] = (byte)(fileMac[i + 8] ^ fileMac[i + 12]);
+                    }
+                    return metaMac;
+                }
+            }
+        }
+    }
+}
+'@ -ErrorAction Stop
+}
+
+function ConvertFrom-MegaBase64([string]$Text) {
+    # MEGA writes base64 with '-' and '_' in place of '+' and '/', and drops the
+    # '=' padding. Put all three back before .NET is asked to decode it.
+    if ($Text -notmatch '^[A-Za-z0-9_-]+$') { throw 'A MEGA link holds a character that is not part of its alphabet.' }
+    $padded = $Text.Replace('-', '+').Replace('_', '/')
+    switch ($padded.Length % 4) { 2 { $padded += '==' } 3 { $padded += '=' } 1 { throw 'A MEGA link is the wrong length to decode.' } }
+    return [Convert]::FromBase64String($padded)
+}
+
+function Get-MegaFileKey([string]$KeyText) {
+    # The 32 bytes behind the '#' are four values packed together: the AES key is
+    # the first half exclusive-ored with the second, the CTR nonce is the next
+    # eight bytes, and the last eight are the MAC of the plaintext.
+    $raw = ConvertFrom-MegaBase64 $KeyText
+    if ($raw.Length -ne 32) { throw "A MEGA file key must decode to 32 bytes, not $($raw.Length)." }
+    $key = New-Object byte[] 16
+    for ($i = 0; $i -lt 16; $i++) { $key[$i] = $raw[$i] -bxor $raw[$i + 16] }
+    $nonce = New-Object byte[] 8
+    [Array]::Copy($raw, 16, $nonce, 0, 8)
+    $metaMac = New-Object byte[] 8
+    [Array]::Copy($raw, 24, $metaMac, 0, 8)
+    return [PSCustomObject]@{ Key = $key; Nonce = $nonce; MetaMac = $metaMac }
+}
+
+function Get-MegaShareLinkParts([string]$Link) {
+    # Only a public link to a single file is accepted. A folder link, a login, or
+    # any other host is refused rather than guessed at.
+    $match = [regex]::Match($Link, '^https://mega\.nz/file/(?<id>[A-Za-z0-9_-]{1,32})#(?<key>[A-Za-z0-9_-]{43})$')
+    if (-not $match.Success) { throw "'$Link' is not a MEGA link to a single file." }
+    return [PSCustomObject]@{ FileId = $match.Groups['id'].Value; KeyText = $match.Groups['key'].Value }
+}
+
+function Select-MegaLinkFromHtml([string]$Html, [string]$LinkName, [string]$Where = 'the download page') {
+    # A download page lists several products, each with its own link. Take the
+    # words just before each link, with the markup taken out, and keep the link
+    # whose own product is named there. Reading it this way rather than by tag
+    # or class survives a redesign. Anything other than one match stops the
+    # install, because guessing which file to run is the one thing never to do.
+    $found = New-Object System.Collections.ArrayList
+    foreach ($match in [regex]::Matches($Html, 'https://mega\.nz/file/[A-Za-z0-9_-]{1,32}#[A-Za-z0-9_-]{43}')) {
+        $start = [Math]::Max(0, $match.Index - 600)
+        $before = ($Html.Substring($start, $match.Index - $start) -replace '<[^>]+>', ' ') -replace '\s+', ' '
+        if ($before.IndexOf($LinkName, [StringComparison]::OrdinalIgnoreCase) -ge 0) { [void]$found.Add($match.Value) }
+    }
+    $unique = @($found | Sort-Object -Unique)
+    if ($unique.Count -eq 0) {
+        throw "No download link for $LinkName was found on $Where. The page has probably been rebuilt. Download $LinkName by hand from that page, or report this so the catalog can be corrected."
+    }
+    if ($unique.Count -gt 1) {
+        throw "$($unique.Count) download links on $Where look like $LinkName, so Dingo could not tell which one is meant. Download it by hand from that page."
+    }
+    return $unique[0]
+}
+
+function Get-MegaLinkFromPage([string]$PageUrl, [string]$LinkName, [int]$TimeoutSeconds = 60) {
+    # The vendor publishes a fresh MEGA link for each release, so the address
+    # cannot live in the catalog. The catalog names the page and the product
+    # instead, and the link is read from the page next to that product name.
+    if ($PageUrl -notmatch '^https://[^/\s]+/\S*$') { throw "The download page address '$PageUrl' must be an https:// address." }
+    Initialize-DingoWebSession
+    Write-Log 'INFO' "Reading the $LinkName download link from $PageUrl."
+    try {
+        $page = Invoke-WithDownloadRetry {
+            Invoke-WebRequest -Uri $PageUrl -UseBasicParsing -TimeoutSec $TimeoutSeconds -ErrorAction Stop
+        } "Reading $PageUrl"
+    } catch { throw (New-DownloadFailure "The $LinkName download page" $PageUrl $_) }
+    return (Select-MegaLinkFromHtml ([string]$page.Content) $LinkName $PageUrl)
+}
+
+function Get-MegaApiFailureMessage([int]$Code) {
+    # MEGA answers a bad request with a bare negative number. Turn the ones a
+    # download can actually meet into the sentence that says what to do next.
+    switch ($Code) {
+        -3  { return 'MEGA is busy just now. Wait a few minutes, then try again.' }
+        -6  { return 'MEGA has been asked too many times from this address. Wait a while, then try again.' }
+        -9  { return 'MEGA no longer holds that file. The download page has probably been updated with a newer release, so try again; if it keeps happening, download the file by hand.' }
+        -11 { return 'MEGA refused access to that file.' }
+        -16 { return 'MEGA has blocked that file.' }
+        -17 { return 'The MEGA download limit for this address has been used up. Wait an hour or use a different network, then try again.' }
+        -18 { return 'That MEGA file is temporarily unavailable. Try again shortly.' }
+        -509 { return 'The MEGA download limit for this address has been used up. Wait an hour or use a different network, then try again.' }
+    }
+    return "MEGA refused the request with code $Code."
+}
+
+function Get-MegaFileInfo($LinkParts, $FileKey, [int]$TimeoutSeconds = 60) {
+    # One call asks MEGA for the size, the encrypted name, and a short-lived
+    # address to fetch the ciphertext from. The key never leaves this computer.
+    Initialize-DingoWebSession
+    $body = '[{"a":"g","g":1,"p":"' + $LinkParts.FileId + '"}]'
+    try {
+        $answer = Invoke-WithDownloadRetry {
+            Invoke-RestMethod -Uri 'https://g.api.mega.co.nz/cs?id=0' -Method Post -Body $body -ContentType 'application/json' -TimeoutSec $TimeoutSeconds -ErrorAction Stop
+        } 'Asking MEGA about the file'
+    } catch { throw (New-DownloadFailure 'The MEGA file details' 'https://g.api.mega.co.nz/cs' $_) }
+
+    $node = @($answer)[0]
+    if ($node -is [int] -or $node -is [long] -or $node -is [double]) { throw (Get-MegaApiFailureMessage ([int]$node)) }
+    $size = [int64](Get-JsonField $node 's' 0)
+    $downloadUrl = [string](Get-JsonField $node 'g' '')
+    $attributeText = [string](Get-JsonField $node 'at' '')
+    if ($size -le 0 -or -not $downloadUrl -or -not $attributeText) { throw 'MEGA answered without the file details Dingo needs.' }
+    # The temporary address is issued by MEGA and must stay on its own storage.
+    # MEGA hands it back as plain http. The ciphertext needs no secrecy in
+    # transit, and a changed byte is caught by the checksum in the link, but the
+    # storage nodes answer on https too, so ask for that and refuse anything
+    # else. It costs nothing and keeps the whole install over TLS.
+    if ($downloadUrl -match '^http://([A-Za-z0-9.-]+\.mega(\.co)?\.nz/.*)$') { $downloadUrl = 'https://' + $matches[1] }
+    if ($downloadUrl -notmatch '^https://[A-Za-z0-9.-]+\.mega(\.co)?\.nz/') {
+        throw "MEGA offered the file from '$downloadUrl', which is not a MEGA storage address."
+    }
+
+    # The name is encrypted with the same key, so a name that decodes is itself
+    # proof that the key in the link belongs to this file.
+    $aes = [Security.Cryptography.Aes]::Create()
+    try {
+        $aes.Mode = 'CBC'; $aes.Padding = 'None'; $aes.KeySize = 128
+        $aes.Key = $FileKey.Key; $aes.IV = (New-Object byte[] 16)
+        $attributes = ConvertFrom-MegaBase64 $attributeText
+        if ($attributes.Length % 16 -ne 0) { throw 'MEGA returned file details Dingo could not read.' }
+        $decoder = $aes.CreateDecryptor()
+        try { $plain = $decoder.TransformFinalBlock($attributes, 0, $attributes.Length) } finally { $decoder.Dispose() }
+    } finally { $aes.Dispose() }
+    $text = [Text.Encoding]::UTF8.GetString($plain).Trim([char]0)
+    if (-not $text.StartsWith('MEGA{')) { throw 'The file name did not decrypt, so the key in the link does not match the file MEGA offered.' }
+    $name = ''
+    try { $name = [string]((ConvertFrom-Json $text.Substring(4)).n) } catch { throw 'MEGA returned a file name Dingo could not read.' }
+    if ([string]::IsNullOrWhiteSpace($name)) { throw 'MEGA returned a file with no name.' }
+    return [PSCustomObject]@{ Name = $name; Size = $size; Url = $downloadUrl }
+}
+
+function Install-MegaPagePackage($Tool) {
+    # The vendor publishes only through MEGA, and the link changes with every
+    # release, so it is read from their download page each time. Three things
+    # are checked before anything is unpacked: the link is a MEGA file link, the
+    # name MEGA reports matches the pattern in the catalog, and the plaintext
+    # matches the MAC carried in the link. The last one is the strong check: it
+    # proves the bytes are exactly what the uploader had.
+    $link = Get-MegaLinkFromPage $Tool.Url $Tool.LinkName
+    $parts = Get-MegaShareLinkParts $link
+    $fileKey = Get-MegaFileKey $parts.KeyText
+    $info = Get-MegaFileInfo $parts $fileKey
+    Write-Log 'INFO' "MEGA offers $($info.Name) ($(Format-ByteSize $info.Size)) for $($Tool.Name)."
+    if ($info.Name -notlike $Tool.AssetPattern) {
+        throw "The download page offered '$($info.Name)' for $($Tool.Name), but a file named like '$($Tool.AssetPattern)' was expected. Nothing was downloaded."
+    }
+
+    $stem = Join-Path $env:TEMP ("Dingo-mega-{0}" -f [Guid]::NewGuid().ToString('N'))
+    $encryptedPath = "$stem.bin"
+    $archivePath = "$stem.zip"
+    $progress = $ProgressPreference
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        # The encrypted copy and the decrypted copy both exist for a moment.
+        Assert-EnoughFreeSpace $encryptedPath ($info.Size * 2) "Downloading $($info.Name)"
+        Initialize-MegaCipher
+        Write-Log 'INFO' "Downloading $($info.Name) from MEGA."
+        try {
+            Invoke-WithDownloadRetry {
+                Invoke-WebRequest -Uri $info.Url -OutFile $encryptedPath -UseBasicParsing -TimeoutSec ([Math]::Min($Tool.TimeoutSeconds, 3600)) -ErrorAction Stop
+            } "The $($info.Name) download"
+        } catch { throw (New-DownloadFailure $info.Name 'MEGA' $_) }
+        $downloaded = (Get-Item -LiteralPath $encryptedPath -ErrorAction Stop).Length
+        if ($downloaded -ne $info.Size) {
+            throw "$($info.Name) should be $(Format-ByteSize $info.Size) but $(Format-ByteSize $downloaded) arrived, so nothing was unpacked."
+        }
+
+        Write-Log 'INFO' "Decrypting $($info.Name)."
+        $actualMac = [Dingo.MegaCipher]::DecryptFile($encryptedPath, $archivePath, $fileKey.Key, $fileKey.Nonce)
+        Remove-Item -LiteralPath $encryptedPath -Force -ErrorAction SilentlyContinue
+        $wantedMac = ($fileKey.MetaMac | ForEach-Object { $_.ToString('x2') }) -join ''
+        $gotMac = ($actualMac | ForEach-Object { $_.ToString('x2') }) -join ''
+        $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256 -ErrorAction Stop).Hash
+        Write-OperationJournal 'InstallerProvenance' ([Guid]::NewGuid().ToString('N')) $Tool.Id $Tool.Scope @{
+            Url=$Tool.Url; Link=$link; Asset=$info.Name; Bytes=$info.Size
+            Sha256=$hash; ExpectedSha256=''; MegaMetaMac=$wantedMac; ComputedMetaMac=$gotMac
+        }
+        if ($wantedMac -ne $gotMac) {
+            throw "$($info.Name) does not match the checksum carried in its own download link, so it was thrown away and nothing was unpacked. Try again; if it keeps happening, do not use the file."
+        }
+        Write-Log 'INFO' "$($info.Name) matches the checksum in its link. SHA256 $hash."
+
+        $destination = Expand-ToolRootPath $Tool.Dest
+        if (-not (Test-PathIsOnLocalDrive $destination)) { throw "The install folder '$destination' for $($Tool.Name) is not a full path on a drive of this computer." }
+        if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
+            New-Item -ItemType Directory -Path $destination -Force -ErrorAction Stop | Out-Null
+            Write-Log 'INFO' "Created $destination."
+        }
+        $written = Expand-DingoZipArchive $archivePath $destination -StripRootFolder:$Tool.StripRoot
+        Write-Log 'INFO' "Unpacked $written file(s) of $($info.Name) into $destination."
+    } finally {
+        $ProgressPreference = $progress
+        Remove-Item -LiteralPath $encryptedPath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
     }
 }
@@ -2641,6 +3015,7 @@ function Set-PackageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     if ($tool.InstallKind -eq 'winget') { Install-WingetPackage $tool $update }
     elseif ($tool.InstallKind -eq 'script') { Install-ScriptPackage $tool }
     elseif ($tool.InstallKind -eq 'github-release') { Install-GitHubReleasePackage $tool }
+    elseif ($tool.InstallKind -eq 'mega-page') { Install-MegaPagePackage $tool }
     else { throw "Install kind '$($tool.InstallKind)' is not supported in this version of Dingo." }
 }
 
@@ -4638,7 +5013,7 @@ if ($SelfTest) {
     }
     # Tool cards offer an explicit update action, but never uninstall.
     $builtInTools = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
-    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9','tool-memprocfs','tool-volatility3','tool-hayabusa','tool-duckdb')) {
+    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9','tool-dotnet-desktop-10','tool-memprocfs','tool-volatility3','tool-hayabusa','tool-duckdb')) {
         if (@($builtInTools | Where-Object Id -eq $expectedId).Count -ne 1) { throw "The built-in tool catalog is missing '$expectedId'." }
     }
     # The tools that come straight from a GitHub release. Each one must name a
@@ -4818,6 +5193,182 @@ if ($SelfTest) {
     if ($runtimeIndex -lt 0 -or $ezIndex -lt 0 -or $runtimeIndex -gt $ezIndex) {
         throw 'The .NET runtime must be listed before the tools that need it.'
     }
+    # The .NET runtimes live side by side. Each must look for its own major
+    # version only, or installing one would mark the other as already present.
+    foreach ($pair in @(@('tool-dotnet-desktop-9','9'), @('tool-dotnet-desktop-10','10'))) {
+        $runtimeTool = $builtInTools | Where-Object Id -eq $pair[0] | Select-Object -First 1
+        if (-not $runtimeTool) { throw "The catalog is missing '$($pair[0])'." }
+        if ($runtimeTool.Package -ne "Microsoft.DotNet.DesktopRuntime.$($pair[1])") { throw "'$($pair[0])' must install the .NET $($pair[1]) desktop runtime." }
+        $paths = @($runtimeTool.Detect | ForEach-Object { $_.Path })
+        if (@($paths | Where-Object { $_ -like "*/Microsoft.WindowsDesktop.App/$($pair[1]).*" }).Count -ne 1) {
+            throw "'$($pair[0])' must detect only its own major version."
+        }
+    }
+    # Arsenal Recon publish only through their own page, behind a link that
+    # changes with every release. The card must therefore name a page and a
+    # product rather than an address, and must still land in the tools folder.
+    $aimTool = $builtInTools | Where-Object Id -eq 'tool-arsenalimagemounter' | Select-Object -First 1
+    if (-not $aimTool) { throw "The catalog is missing 'tool-arsenalimagemounter'." }
+    if ($aimTool.InstallKind -ne 'mega-page') { throw 'Arsenal Image Mounter must use the mega-page install kind.' }
+    if ($aimTool.Url -notmatch '^https://arsenalrecon\.com/') { throw 'Arsenal Image Mounter must read its link from the vendor page over https.' }
+    if ($aimTool.LinkName -ne 'Arsenal Image Mounter') { throw 'Arsenal Image Mounter must name the product to look for on the page.' }
+    if ($aimTool.AssetPattern -notlike '*.zip') { throw 'Arsenal Image Mounter must expect a .zip file.' }
+    if (-not $aimTool.StripRoot) { throw 'Arsenal Image Mounter must drop the versioned folder, or its shortcut breaks on every update.' }
+    if ($aimTool.Scope -ne 'machine') { throw 'Writing to the tools folder needs administrator approval, so Arsenal Image Mounter must be machine scope.' }
+    if ($aimTool.Dest -notlike "$($script:ToolRootToken)*") { throw 'Arsenal Image Mounter must unpack inside the tools folder.' }
+    if (@($aimTool.Requires) -notcontains 'tool-dotnet-desktop-10') { throw 'Arsenal Image Mounter must declare the .NET 10 runtime it needs.' }
+    # The runtime has to be installed before the tool that will not start without it.
+    $aimIndex = [array]::IndexOf(@($builtInTools | ForEach-Object { $_.Id }), 'tool-arsenalimagemounter')
+    $net10Index = [array]::IndexOf(@($builtInTools | ForEach-Object { $_.Id }), 'tool-dotnet-desktop-10')
+    if ($net10Index -lt 0 -or $aimIndex -lt 0 -or $net10Index -gt $aimIndex) {
+        throw 'The .NET 10 runtime must be listed before Arsenal Image Mounter.'
+    }
+    $aimSetting = $script:Settings | Where-Object Id -eq 'tool-arsenalimagemounter' | Select-Object -First 1
+    if (-not $aimSetting) { throw 'Arsenal Image Mounter produced no card.' }
+    if (-not $aimSetting.RequiresAdmin) { throw 'Arsenal Image Mounter must request administrator approval.' }
+    if ([bool]$aimSetting.Requirements['WingetRequired']) { throw 'A page download must not be blocked by a missing winget.' }
+
+    # A mega-page entry that could send the download elsewhere is refused.
+    foreach ($badInstall in @(
+        @{ Why = 'a page that is not https'; Install = [PSCustomObject]@{ kind='mega-page'; url='http://example.com/d'; linkName='X'; assetPattern='x.zip'; dest='%DINGO_TOOL_ROOT%/X' } },
+        @{ Why = 'no product name to look for'; Install = [PSCustomObject]@{ kind='mega-page'; url='https://example.com/d'; assetPattern='x.zip'; dest='%DINGO_TOOL_ROOT%/X' } },
+        @{ Why = 'a file that is not a zip'; Install = [PSCustomObject]@{ kind='mega-page'; url='https://example.com/d'; linkName='X'; assetPattern='x.exe'; dest='%DINGO_TOOL_ROOT%/X' } },
+        @{ Why = 'no folder to unpack into'; Install = [PSCustomObject]@{ kind='mega-page'; url='https://example.com/d'; linkName='X'; assetPattern='x.zip' } }
+    )) {
+        $refused = $false
+        try {
+            [void](ConvertTo-ToolDefinition ([PSCustomObject]@{
+                id='tool-badmega'; name='Bad'; install=$badInstall.Install
+                detect=@([PSCustomObject]@{ kind='file'; path='C:/nowhere.exe' })
+            }))
+        } catch { $refused = $true }
+        if (-not $refused) { throw "A mega-page tool with $($badInstall.Why) was accepted." }
+    }
+
+    # MEGA writes base64 with a different alphabet and no padding.
+    $keyBytes = New-Object byte[] 32
+    for ($i = 0; $i -lt 32; $i++) { $keyBytes[$i] = [byte]($i * 7 -band 0xFF) }
+    $keyText = ([Convert]::ToBase64String($keyBytes).TrimEnd('=')).Replace('+', '-').Replace('/', '_')
+    $roundTrip = ConvertFrom-MegaBase64 $keyText
+    if ($roundTrip.Length -ne 32) { throw "A MEGA key decoded to $($roundTrip.Length) bytes, not 32." }
+    for ($i = 0; $i -lt 32; $i++) { if ($roundTrip[$i] -ne $keyBytes[$i]) { throw 'A MEGA key did not survive decoding.' } }
+    $parsedKey = Get-MegaFileKey $keyText
+    if ($parsedKey.Key.Length -ne 16 -or $parsedKey.Nonce.Length -ne 8 -or $parsedKey.MetaMac.Length -ne 8) {
+        throw 'A MEGA file key must split into a 16-byte key, an 8-byte nonce, and an 8-byte checksum.'
+    }
+    for ($i = 0; $i -lt 16; $i++) {
+        if ($parsedKey.Key[$i] -ne ($keyBytes[$i] -bxor $keyBytes[$i + 16])) { throw 'The MEGA AES key is not the two halves combined.' }
+    }
+    foreach ($badKey in @('', 'not base64!', 'AAAA')) {
+        $refused = $false
+        try { [void](Get-MegaFileKey $badKey) } catch { $refused = $true }
+        if (-not $refused) { throw "A MEGA key of '$badKey' was accepted." }
+    }
+
+    # Only a public link to one file is accepted.
+    $goodLink = "https://mega.nz/file/n5ADXSZR#$keyText"
+    $linkParts = Get-MegaShareLinkParts $goodLink
+    if ($linkParts.FileId -ne 'n5ADXSZR' -or $linkParts.KeyText -ne $keyText) { throw 'A MEGA file link was not read correctly.' }
+    foreach ($badLink in @(
+        "http://mega.nz/file/n5ADXSZR#$keyText",
+        "https://mega.nz.example.com/file/n5ADXSZR#$keyText",
+        "https://mega.nz/folder/n5ADXSZR#$keyText",
+        'https://mega.nz/file/n5ADXSZR',
+        "https://example.com/file/n5ADXSZR#$keyText"
+    )) {
+        $refused = $false
+        try { [void](Get-MegaShareLinkParts $badLink) } catch { $refused = $true }
+        if (-not $refused) { throw "'$badLink' was accepted as a MEGA file link." }
+    }
+
+    # Reading the right link off a page that lists several products.
+    $otherKey = ([Convert]::ToBase64String((New-Object byte[] 32)).TrimEnd('=')).Replace('+', '-').Replace('/', '_')
+    $samplePage = @"
+<div><img alt="Hibernation Recon"> Hibernation Recon <a href="https://mega.nz/file/AAAAAAAA#$otherKey">DOWNLOAD</a></div>
+<div><img alt="Arsenal Image Mounter"> Arsenal Image Mounter <a href="$goodLink">DOWNLOAD v3.13.368</a></div>
+"@
+    if ((Select-MegaLinkFromHtml $samplePage 'Arsenal Image Mounter') -ne $goodLink) { throw 'The wrong download link was read from the sample page.' }
+    $refused = $false
+    try { [void](Select-MegaLinkFromHtml $samplePage 'Nothing Like This') } catch { $refused = $true }
+    if (-not $refused) { throw 'A page with no matching product must stop the install.' }
+    $refused = $false
+    try { [void](Select-MegaLinkFromHtml ($samplePage + $samplePage.Replace($goodLink, "https://mega.nz/file/BBBBBBBB#$otherKey")) 'Arsenal Image Mounter') } catch { $refused = $true }
+    if (-not $refused) { throw 'A page offering two links for one product must stop the install, not guess.' }
+
+    # The MEGA cipher. CTR undoes itself, so decrypting twice must give back
+    # exactly what went in. The size is chosen to cross several chunk edges and
+    # to leave a part-full chunk at the end, which is where a MAC goes wrong.
+    Initialize-MegaCipher
+    if ([Dingo.MegaCipher]::ChunkSize(0) -ne 131072) { throw 'The first MEGA chunk must be 128 KiB.' }
+    if ([Dingo.MegaCipher]::ChunkSize(7) -ne 1048576 -or [Dingo.MegaCipher]::ChunkSize(8) -ne 1048576) { throw 'MEGA chunks must level off at 1 MiB.' }
+    $cipherRoot = Join-Path $env:TEMP ("Dingo-megatest-{0}" -f [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $cipherRoot -Force -ErrorAction Stop | Out-Null
+    try {
+        $plainPath = Join-Path $cipherRoot 'plain.bin'
+        $middlePath = Join-Path $cipherRoot 'middle.bin'
+        $backPath = Join-Path $cipherRoot 'back.bin'
+        $sample = New-Object byte[] 700000
+        (New-Object Random 20260917).NextBytes($sample)
+        [IO.File]::WriteAllBytes($plainPath, $sample)
+        $firstMac = [Dingo.MegaCipher]::DecryptFile($plainPath, $middlePath, $parsedKey.Key, $parsedKey.Nonce)
+        $secondMac = [Dingo.MegaCipher]::DecryptFile($middlePath, $backPath, $parsedKey.Key, $parsedKey.Nonce)
+        $returned = [IO.File]::ReadAllBytes($backPath)
+        if ($returned.Length -ne $sample.Length) { throw 'The MEGA cipher changed the length of the file.' }
+        for ($i = 0; $i -lt $sample.Length; $i++) {
+            if ($returned[$i] -ne $sample[$i]) { throw "The MEGA cipher did not undo itself at byte $i." }
+        }
+        if ($firstMac.Length -ne 8 -or $secondMac.Length -ne 8) { throw 'A MEGA checksum must be 8 bytes.' }
+        # The checksum is taken over what was written, so the two passes wrote
+        # different data and must not agree.
+        if ((($firstMac | ForEach-Object { $_.ToString('x2') }) -join '') -eq (($secondMac | ForEach-Object { $_.ToString('x2') }) -join '')) {
+            throw 'The MEGA checksum does not depend on the file it is taken over.'
+        }
+        # A changed byte must change the checksum, or the check is worthless.
+        $tampered = Join-Path $cipherRoot 'tampered.bin'
+        $middle = [IO.File]::ReadAllBytes($middlePath)
+        $middle[500000] = [byte](($middle[500000] + 1) -band 0xFF)
+        [IO.File]::WriteAllBytes($tampered, $middle)
+        $tamperedMac = [Dingo.MegaCipher]::DecryptFile($tampered, (Join-Path $cipherRoot 'out.bin'), $parsedKey.Key, $parsedKey.Nonce)
+        if ((($tamperedMac | ForEach-Object { $_.ToString('x2') }) -join '') -eq (($secondMac | ForEach-Object { $_.ToString('x2') }) -join '')) {
+            throw 'One changed byte left the MEGA checksum the same.'
+        }
+
+        # Taking the versioned wrapper folder off an archive.
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        $zipPath = Join-Path $cipherRoot 'wrapped.zip'
+        $zip = [IO.Compression.ZipFile]::Open($zipPath, 'Create')
+        try {
+            foreach ($entryName in @('Tool-v1.2.3/', 'Tool-v1.2.3/tool.exe', 'Tool-v1.2.3/sub/data.txt')) {
+                [void]$zip.CreateEntry($entryName)
+            }
+        } finally { $zip.Dispose() }
+        $unpackRoot = Join-Path $cipherRoot 'unpacked'
+        [void](Expand-DingoZipArchive $zipPath $unpackRoot -StripRootFolder)
+        if (-not (Test-Path -LiteralPath (Join-Path $unpackRoot 'tool.exe') -PathType Leaf)) {
+            throw 'The versioned wrapper folder was not taken off the archive.'
+        }
+        if (Test-Path -LiteralPath (Join-Path $unpackRoot 'Tool-v1.2.3') ) {
+            throw 'The versioned wrapper folder was left in place.'
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $unpackRoot 'sub\data.txt') -PathType Leaf)) {
+            throw 'A file below the wrapper folder was lost.'
+        }
+        # Two top-level folders means the archive is not shaped as expected, and
+        # unpacking it would scatter files. It must stop instead.
+        $twoRootZip = Join-Path $cipherRoot 'two-roots.zip'
+        $zip = [IO.Compression.ZipFile]::Open($twoRootZip, 'Create')
+        try {
+            [void]$zip.CreateEntry('one/a.txt')
+            [void]$zip.CreateEntry('two/b.txt')
+        } finally { $zip.Dispose() }
+        $refused = $false
+        try { [void](Expand-DingoZipArchive $twoRootZip (Join-Path $cipherRoot 'scattered') -StripRootFolder) } catch { $refused = $true }
+        if (-not $refused) { throw 'An archive with two top-level folders was unpacked anyway.' }
+    } finally {
+        Remove-Item -LiteralPath $cipherRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     $missingTool = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-absent'; name='Absent'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='file'; path='%ProgramFiles%\Dingo-Definitely-Absent\x.exe' }) })
     if (Find-InstalledTool $missingTool) { throw 'Tool detection reported a missing tool as installed.' }
     # A wildcard rule must match a versioned folder and report its name as the version.
@@ -5438,11 +5989,17 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
         <TabControl Name="ToolTabs" BorderThickness="0" Margin="0,6,0,0" FontSize="14">
           <TabItem Header="Install tools">
             <Grid>
-              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
               <Border Background="#E8F6EE" Padding="12" Margin="8">
                 <TextBlock Name="ToolsScopeText" Text="Analyst tools. Dingo checks whether each one is already installed, and installs the missing ones with winget. Dingo never removes a tool." TextWrapping="Wrap"/>
               </Border>
-              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+              <Grid Grid.Row="1" Margin="8,0,8,6">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <TextBox Name="ToolFilterTextBox" Grid.Column="0" Padding="6,5" VerticalAlignment="Center" AutomationProperties.Name="Search the tool list"/>
+                <Button Name="ToolFilterClearButton" Grid.Column="1" Content="Clear" Margin="8,0,0,0"/>
+                <TextBlock Name="ToolFilterCountText" Grid.Column="2" Text="" VerticalAlignment="Center" Foreground="#52606D" Margin="12,0,4,0"/>
+              </Grid>
+              <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                 <StackPanel Name="ToolSettingsPanel" Margin="8,0,8,8"/>
               </ScrollViewer>
             </Grid>
@@ -5522,7 +6079,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $script:DingoWindow = $window
-foreach ($name in @('IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
+foreach ($name in @('IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','ToolFilterTextBox','ToolFilterClearButton','ToolFilterCountText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
 $desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -5873,8 +6430,26 @@ function New-SettingCard($Item) {
     return $border
 }
 
-foreach ($item in $script:Settings) {
+# The catalog order is the order the elevated worker applies the plan in, so a
+# tool that another one needs is listed first. That order is no help to a reader
+# looking for one name in a growing list, so the two tool lists are shown in
+# name order instead. Only the cards move; the plan still runs in catalog order.
+function Get-CardDisplayOrder($Items) {
+    $sortedTabs = @('Install tools','File associations')
+    $result = New-Object System.Collections.ArrayList
+    foreach ($item in $Items) { if ($item.Tab -notin $sortedTabs) { [void]$result.Add($item) } }
+    foreach ($tab in $sortedTabs) {
+        # A leading dot or digit, as in '.NET 10', must not jump the queue, and
+        # 'ripgrep' must sit with the letter R rather than after Z.
+        $ofTab = @($Items | Where-Object { $_.Tab -eq $tab } | Sort-Object @{ Expression = { ($_.Name -replace '[^A-Za-z0-9 ]', '').Trim() } }, Name)
+        foreach ($item in $ofTab) { [void]$result.Add($item) }
+    }
+    return ,$result
+}
+
+foreach ($item in (Get-CardDisplayOrder $script:Settings)) {
     $card = New-SettingCard $item
+    $item | Add-Member -NotePropertyName CardControl -NotePropertyValue $card -Force
     switch ($item.Tab) {
         'User' { [void]$UserSettingsPanel.Children.Add($card) }
         'System' { [void]$SystemSettingsPanel.Children.Add($card) }
@@ -5885,6 +6460,36 @@ foreach ($item in $script:Settings) {
         default { throw "Setting '$($item.Id)' asks for unknown tab '$($item.Tab)'." }
     }
 }
+
+# The search box hides cards, it does not unselect them. A tool you already
+# turned on stays in the plan while it is out of sight, so a half-typed search
+# can never quietly drop a tool from the run.
+function Update-ToolFilter {
+    $text = [string]$ToolFilterTextBox.Text
+    $needle = $text.Trim()
+    $toolItems = @($script:Settings | Where-Object { $_.Tab -eq 'Install tools' })
+    $shown = 0
+    foreach ($item in $toolItems) {
+        if (-not $item.CardControl) { continue }
+        $hit = $true
+        if ($needle) {
+            $haystack = @($item.Name, $item.Category, $item.Description) -join ' '
+            # Each word must appear somewhere, so 'log haya' finds Hayabusa too.
+            foreach ($word in @($needle -split '\s+' | Where-Object { $_ })) {
+                if ($haystack.IndexOf($word, [StringComparison]::OrdinalIgnoreCase) -lt 0) { $hit = $false; break }
+            }
+        }
+        $item.CardControl.Visibility = if ($hit) { 'Visible' } else { 'Collapsed' }
+        if ($hit) { $shown++ }
+    }
+    $ToolFilterClearButton.IsEnabled = [bool]$needle
+    $ToolFilterCountText.Text = if (-not $needle) { "$($toolItems.Count) tools" }
+        elseif ($shown -eq 0) { "No tool matches '$needle'" }
+        else { "$shown of $($toolItems.Count) tools" }
+}
+$ToolFilterTextBox.Add_TextChanged({ Update-ToolFilter })
+$ToolFilterClearButton.Add_Click({ $ToolFilterTextBox.Text = ''; [void]$ToolFilterTextBox.Focus() })
+Update-ToolFilter
 
 if ($UiSelfTest) {
     if ($script:ActionButtons | Where-Object IsEnabled) { throw 'Action buttons must remain disabled until the initial state scan finishes.' }
@@ -5923,6 +6528,49 @@ if ($UiSelfTest) {
     }
     if ($ToolTabs.Items.Count -ne @($script:Settings | Where-Object { $_.Section -eq 'Tools' } | Group-Object Tab).Count) {
         throw 'The Tools section does not hold exactly the tool tabs.'
+    }
+    # The tool lists are shown in name order, so a growing catalog stays readable.
+    foreach ($sortedTab in @('Install tools','File associations')) {
+        $panel = if ($sortedTab -eq 'Install tools') { $ToolSettingsPanel } else { $AssociationSettingsPanel }
+        $shownNames = @($script:Settings | Where-Object { $_.Tab -eq $sortedTab } | Where-Object { $panel.Children.Contains($_.CardControl) } | Sort-Object { $panel.Children.IndexOf($_.CardControl) } | ForEach-Object { $_.Name })
+        if ($shownNames.Count -ne @($script:Settings | Where-Object { $_.Tab -eq $sortedTab }).Count) {
+            throw "Not every '$sortedTab' card reached its panel."
+        }
+        $wanted = @($shownNames | Sort-Object @{ Expression = { ($_ -replace '[^A-Za-z0-9 ]', '').Trim() } }, @{ Expression = { $_ } })
+        if (($shownNames -join '|') -ne ($wanted -join '|')) {
+            throw "The '$sortedTab' cards are not in name order: $($shownNames -join ', ')"
+        }
+    }
+    # The catalog order is what the worker runs, and it must not have been
+    # reordered to match the display. The runtime still comes before its tools.
+    $displayedToolOrder = @($script:Settings | Where-Object { $_.Tab -eq 'Install tools' } | Sort-Object { $ToolSettingsPanel.Children.IndexOf($_.CardControl) } | ForEach-Object { $_.Id })
+    $planToolOrder = @($script:Settings | Where-Object { $_.Tab -eq 'Install tools' } | ForEach-Object { $_.Id })
+    if ([array]::IndexOf($planToolOrder, 'tool-dotnet-desktop-9') -gt [array]::IndexOf($planToolOrder, 'tool-eztools')) {
+        throw 'Sorting the cards must not reorder the plan.'
+    }
+    if ($displayedToolOrder.Count -ne $planToolOrder.Count) { throw 'The tool cards and the tool plan hold different tools.' }
+    # The search box hides cards. It must never change what is selected.
+    $filterProbe = $script:Settings | Where-Object { $_.Tab -eq 'Install tools' } | Select-Object -First 1
+    $savedFilterChoice = $filterProbe.ApplyControl.IsChecked
+    try {
+        $filterProbe.ApplyControl.IsChecked = $true
+        $ToolFilterTextBox.Text = 'zzz-no-tool-is-called-this'
+        if (@($script:Settings | Where-Object { $_.Tab -eq 'Install tools' -and $_.CardControl.Visibility -eq 'Visible' }).Count -ne 0) {
+            throw 'A search that matches nothing must hide every tool card.'
+        }
+        if ($ToolFilterCountText.Text -notmatch 'No tool matches') { throw 'A search that matches nothing must say so.' }
+        if (-not $filterProbe.ApplyControl.IsChecked) { throw 'The search box must not change what is selected.' }
+        $ToolFilterTextBox.Text = 'haya'
+        $hayaMatches = @($script:Settings | Where-Object { $_.Tab -eq 'Install tools' -and $_.CardControl.Visibility -eq 'Visible' })
+        if ($hayaMatches.Count -ne 1 -or $hayaMatches[0].Id -ne 'tool-hayabusa') { throw "Typing 'haya' must show Hayabusa alone." }
+        $ToolFilterTextBox.Text = ''
+        if (@($script:Settings | Where-Object { $_.Tab -eq 'Install tools' -and $_.CardControl.Visibility -ne 'Visible' }).Count -ne 0) {
+            throw 'An empty search box must show every tool card.'
+        }
+        if ($ToolFilterClearButton.IsEnabled) { throw 'The Clear button must be off when the search box is empty.' }
+    } finally {
+        $ToolFilterTextBox.Text = ''
+        $filterProbe.ApplyControl.IsChecked = $savedFilterChoice
     }
     if (-not $RestartExplorerCheckBox) { throw 'The Options section does not hold the File Explorer restart choice.' }
     if (-not $OpenLogButton) { throw 'The Options section does not hold the log folder button.' }
