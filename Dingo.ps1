@@ -4508,7 +4508,7 @@ function Write-CliStatus([string]$Message) {
 
 function Get-DingoHelpText {
 @'
-Dingo - Windows 11 preferences
+Dingo - Windows 11 DFIR Tweaks and Tools
 
 GUI:
   Start-Dingo.cmd
@@ -5891,7 +5891,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Dingo - Windows 11 Preferences" Width="1280" Height="820" MinWidth="980" MinHeight="640"
+        Title="Dingo - Windows 11 DFIR Tweaks and Tools" Width="1280" Height="820" MinWidth="980" MinHeight="640"
         WindowStartupLocation="CenterScreen" Background="#F4F6F8" FontFamily="Segoe UI">
   <Window.Resources>
     <Style TargetType="Button"><Setter Property="Padding" Value="13,8"/><Setter Property="Margin" Value="0,0,8,0"/></Style>
@@ -5934,7 +5934,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     <Grid Grid.Row="0" Margin="0,0,0,12">
       <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
       <StackPanel Grid.Column="0">
-        <TextBlock Text="Dingo - Windows 11 Preferences" FontSize="25" FontWeight="SemiBold" Foreground="#17212B"/>
+        <TextBlock Name="TitleText" Text="Dingo - Windows 11 DFIR Tweaks and Tools" FontSize="25" FontWeight="SemiBold" Foreground="#17212B"/>
         <TextBlock Name="IntroText" Text="Tweaks changes Windows settings. Tools installs analyst software and wires it up. Options is about Dingo itself. Nothing changes until you click Apply selected changes." Foreground="#52606D" FontSize="14" TextWrapping="Wrap" Margin="0,4,0,0"/>
       </StackPanel>
       <TextBlock Name="VersionText" Grid.Column="1" Text="" Foreground="#52606D" FontSize="13" VerticalAlignment="Top" HorizontalAlignment="Right" Margin="16,6,0,0"/>
@@ -6079,7 +6079,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $script:DingoWindow = $window
-foreach ($name in @('IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','ToolFilterTextBox','ToolFilterClearButton','ToolFilterCountText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
+foreach ($name in @('TitleText','IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','ToolFilterTextBox','ToolFilterClearButton','ToolFilterCountText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
 $desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -6586,6 +6586,16 @@ if ($UiSelfTest) {
     }
     foreach ($sectionName in @('Tweaks','Tools','Options')) {
         if ($IntroText.Text -notmatch $sectionName) { throw "The window's opening sentence does not mention the '$sectionName' section." }
+    }
+    # The name is written in three places: the title bar, the heading on screen,
+    # and the first line of -Help. They drifted apart once, and the old name
+    # outlived what Dingo had grown into, so they are tied together here.
+    if ($window.Title -ne $TitleText.Text) {
+        throw "The title bar says '$($window.Title)' but the heading says '$($TitleText.Text)'."
+    }
+    $helpTitle = @((Get-DingoHelpText) -split "`n")[0].Trim()
+    if ($helpTitle -ne $TitleText.Text) {
+        throw "-Help opens with '$helpTitle' but the window says '$($TitleText.Text)'."
     }
     "UI self-test passed: $($script:Settings.Count) setting cards across $innerTabCount tabs, plus an Options section."
     $window.Close()
