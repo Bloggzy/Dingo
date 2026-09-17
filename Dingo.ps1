@@ -1221,6 +1221,38 @@ function Test-EndpointReachable([string]$Url, [int]$TimeoutSeconds = 20) {
     }
 }
 
+function Get-WebErrorStatus($ErrorRecord) {
+    # The status number of a failed web call, or 0 when the call never reached
+    # a server at all. Reading it must never raise a second fault.
+    try {
+        $response = $ErrorRecord.Exception.Response
+        if (-not $response) { return 0 }
+        return [int]$response.StatusCode
+    } catch { return 0 }
+}
+
+function Get-DownloadFailureAdvice([string]$Url, $ErrorRecord) {
+    # A raw .NET message such as "The remote name could not be resolved" names
+    # neither the cause nor the cure. Turn the common network faults into the
+    # sentence that says what to do next. An empty answer means Dingo has
+    # nothing to add, and the original message is used on its own.
+    switch (Get-WebErrorStatus $ErrorRecord) {
+        407 { return 'The network proxy asked for a sign-in that Dingo cannot give. Ask whoever runs the proxy to allow this address, then try again.' }
+        429 { return 'The server has been asked too many times and refused this one. Wait a while, then try again.' }
+    }
+    if (-not (Test-EndpointReachable $Url)) {
+        return "This computer cannot reach $Url. Check the network, the proxy, and any firewall rule, then try again."
+    }
+    return ''
+}
+
+function New-DownloadFailure([string]$What, [string]$Url, $ErrorRecord) {
+    $advice = Get-DownloadFailureAdvice $Url $ErrorRecord
+    $detail = $ErrorRecord.Exception.Message
+    if ($advice) { return "$What could not be downloaded from $Url. $advice The server said: $detail" }
+    return "$What could not be downloaded from $Url. $detail"
+}
+
 function Get-WingetRepairEndpoints {
     # Repair-WinGetPackageManager downloads App Installer itself, so that
     # address is always needed. The gallery is needed only when this computer
@@ -1288,10 +1320,41 @@ function Set-RunScopedFlag([string]$Name, [bool]$Value) {
     Set-Variable -Name $Name -Scope Script -Value $Value
 }
 
+function Complete-WingetRepair([string]$Action) {
+    # The tail both repair paths share. Repair-WinGetPackageManager leaves the
+    # client in a new package folder, so it has to be found again, and the
+    # client it left has to be able to read the package source.
+    $repaired = Get-WingetPath
+    if (-not $repaired) { throw "The winget $Action reported success, but winget is still not on this computer. Install App Installer from https://aka.ms/getwinget, then try again." }
+    $after = Test-WingetVersionSupported $repaired
+    if (-not $after.Supported) {
+        throw "The winget $Action finished, but winget still reports version $($after.Version), below $($after.Minimum). Install the latest App Installer from https://aka.ms/getwinget, then try again."
+    }
+    Write-Log 'INFO' "The winget $Action finished and winget now reports version $($after.Version)."
+    Set-RunScopedFlag 'WingetVersionVerified' $true
+    return $repaired
+}
+
 function Resolve-UsableWinget([string]$WingetPath) {
-    # Returns a winget that can read the package source, repairing the client
-    # once per run if it is too old. Checking costs one fast process call, and
-    # only until the first pass, because only a repair can change the answer.
+    # Returns a winget that can read the package source, installing or repairing
+    # the client once per run when it is absent or too old. Checking costs one
+    # fast process call, and only until the first pass, because only a repair
+    # can change the answer.
+    if (-not $WingetPath) {
+        # Windows Server, an LTSC build, and some locked-down images carry no
+        # App Installer at all. Repair-WinGetPackageManager puts one down, so
+        # the same command that mends an old client also supplies a missing one.
+        Write-Log 'WARN' 'winget is not on this computer.'
+        if (Get-RunScopedFlag 'WingetRepairAttempted') {
+            throw 'winget is not on this computer, and the repair earlier in this run did not supply it. Install App Installer from https://aka.ms/getwinget, then try again.'
+        }
+        Set-RunScopedFlag 'WingetRepairAttempted' $true
+        if (-not (Test-IsAdministrator)) {
+            throw 'winget is not on this computer. Run Dingo as an administrator so it can install winget, or install App Installer from https://aka.ms/getwinget yourself.'
+        }
+        Repair-WingetClient
+        return (Complete-WingetRepair 'install')
+    }
     if (Get-RunScopedFlag 'WingetVersionVerified') { return $WingetPath }
     $check = Test-WingetVersionSupported $WingetPath
     if ($check.Supported) {
@@ -1308,16 +1371,7 @@ function Resolve-UsableWinget([string]$WingetPath) {
         throw "winget $($check.Version) is too old to install anything. Run Dingo as an administrator so it can repair winget, or install the latest App Installer from https://aka.ms/getwinget yourself."
     }
     Repair-WingetClient
-    # The repaired client sits in a new package folder, so find it again.
-    $repaired = Get-WingetPath
-    if (-not $repaired) { throw 'The winget repair reported success, but winget is still not on this computer.' }
-    $after = Test-WingetVersionSupported $repaired
-    if (-not $after.Supported) {
-        throw "The winget repair finished, but winget still reports version $($after.Version), below $($after.Minimum). Install the latest App Installer from https://aka.ms/getwinget, then try again."
-    }
-    Write-Log 'INFO' "winget was repaired and now reports version $($after.Version)."
-    Set-RunScopedFlag 'WingetVersionVerified' $true
-    return $repaired
+    return (Complete-WingetRepair 'repair')
 }
 
 function Get-UninstallEntry([string]$Match) {
@@ -1457,9 +1511,9 @@ function Get-MissingToolRequirements($Tool) {
 
 function Install-WingetPackage($Tool, [bool]$AllowUpgrade = $false) {
     $TimeoutSeconds = $Tool.TimeoutSeconds
-    $winget = Get-WingetPath
-    if (-not $winget) { throw 'winget is not available on this computer, so Dingo cannot install anything.' }
-    $winget = Resolve-UsableWinget $winget
+    # An absent winget is handed on rather than refused here, because Dingo can
+    # install one when it holds administrator rights.
+    $winget = Resolve-UsableWinget (Get-WingetPath)
     $arguments = @(
         'install','--id',$Tool.Package,'--exact','--source',$Tool.Source,'--scope',$Tool.Scope,
         '--accept-package-agreements','--accept-source-agreements','--disable-interactivity','--silent'
@@ -1627,7 +1681,8 @@ function Install-ScriptPackage($Tool) {
         # Windows PowerShell 5.1 can still default to an older protocol.
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         Write-Log 'INFO' "Downloading the $($Tool.Name) install script from $($Tool.Url)."
-        Invoke-WebRequest -Uri $Tool.Url -OutFile $scriptPath -UseBasicParsing -TimeoutSec 120 -MaximumRedirection 0 -ErrorAction Stop
+        try { Invoke-WebRequest -Uri $Tool.Url -OutFile $scriptPath -UseBasicParsing -TimeoutSec 120 -MaximumRedirection 0 -ErrorAction Stop }
+        catch { throw (New-DownloadFailure "The $($Tool.Name) install script" $Tool.Url $_) }
         # Record what was actually executed, so a run can be audited afterwards.
         $hash = (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
         Write-Log 'INFO' "Install script SHA256 $hash for $($Tool.Name)."
@@ -1706,7 +1761,20 @@ function Get-GitHubLatestRelease([string]$Repo, [int]$TimeoutSeconds = 60) {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     $uri = "https://api.github.com/repos/$Repo/releases/latest"
     $headers = @{ 'Accept' = 'application/vnd.github+json'; 'User-Agent' = "Dingo/$script:DingoVersion" }
-    return Invoke-RestMethod -Uri $uri -Headers $headers -UseBasicParsing -TimeoutSec $TimeoutSeconds -ErrorAction Stop
+    try { return Invoke-RestMethod -Uri $uri -Headers $headers -UseBasicParsing -TimeoutSec $TimeoutSeconds -ErrorAction Stop }
+    catch {
+        # GitHub answers a computer that is not signed in only 60 times an hour,
+        # and it counts by address. A whole office behind one address runs out
+        # quickly, and the answer is a bare 403 that never mentions waiting.
+        $status = Get-WebErrorStatus $_
+        if ($status -eq 403 -or $status -eq 429) {
+            throw "GitHub refused to name the latest $Repo release, which almost always means this computer's address has asked too many times this hour. Wait an hour and try again, or download the file by hand from https://github.com/$Repo/releases/latest. The server said: $($_.Exception.Message)"
+        }
+        if ($status -eq 404) {
+            throw "GitHub has no published release for $Repo. Check the repository name in the tool catalog. The server said: $($_.Exception.Message)"
+        }
+        throw (New-DownloadFailure "The latest $Repo release information" $uri $_)
+    }
 }
 
 function Install-GitHubReleasePackage($Tool) {
@@ -1735,7 +1803,8 @@ function Install-GitHubReleasePackage($Tool) {
         # The progress bar makes Invoke-WebRequest many times slower on a large file.
         $ProgressPreference = 'SilentlyContinue'
         Write-Log 'INFO' "Downloading $assetName from $downloadUrl."
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -UseBasicParsing -TimeoutSec ([Math]::Min($Tool.TimeoutSeconds, 3600)) -ErrorAction Stop
+        try { Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -UseBasicParsing -TimeoutSec ([Math]::Min($Tool.TimeoutSeconds, 3600)) -ErrorAction Stop }
+        catch { throw (New-DownloadFailure $assetName $downloadUrl $_) }
         # A release file is built fresh for every version, so no hash can be kept
         # in the catalog. Record what was fetched, so a run can be audited later.
         $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256 -ErrorAction Stop).Hash
@@ -3987,7 +4056,14 @@ function Test-SettingPreflight($Setting) {
         }
         if ($Setting.Requirements.ContainsKey('WingetRequired') -and [bool]$Setting.Requirements['WingetRequired']) {
             if (($Setting.CurrentState.Status -ne 'Preferred' -or $Setting.DesiredState -eq 'Update installed tool') -and -not (Get-WingetPath)) {
-                [void]$problems.Add('winget is not available, so this tool cannot be installed')
+                # Dingo can install a missing winget, but only with administrator
+                # rights. A card that runs elevated will have them; one that does
+                # not is only blocked when this process does not have them either.
+                if ($Setting.RequiresAdmin -or (Test-IsAdministrator)) {
+                    Write-Log 'WARN' "winget is not on this computer. Dingo will install it before installing $($Setting.Name)."
+                } else {
+                    [void]$problems.Add('winget is not available, and Dingo needs administrator rights to install it')
+                }
             }
         }
         if ($Setting.Kind -eq 'Package' -and $Setting.DesiredState -eq 'Update installed tool' -and
