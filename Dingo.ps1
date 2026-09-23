@@ -6186,7 +6186,14 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
         </Grid>
       </TabItem>
       <TabItem Header="Tools">
-        <TabControl Name="ToolTabs" BorderThickness="0" Margin="0,6,0,0" FontSize="14">
+        <Grid>
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <WrapPanel Grid.Row="0" Margin="8,10,8,0">
+            <Button Name="AllToolsButton" Content="Choose all tools" Background="#E5F2FF"/>
+            <Button Name="MissingToolsButton" Content="Select only tools not yet in place"/>
+            <TextBlock Text="These two buttons act on the Tools section only." VerticalAlignment="Center" Foreground="#52606D" Margin="12,0,0,0"/>
+          </WrapPanel>
+        <TabControl Name="ToolTabs" Grid.Row="1" BorderThickness="0" Margin="0,6,0,0" FontSize="14">
           <TabItem Header="Install tools">
             <Grid>
               <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
@@ -6227,6 +6234,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
             </Grid>
           </TabItem>
         </TabControl>
+        </Grid>
       </TabItem>
       <TabItem Header="Options">
         <Grid>
@@ -6279,7 +6287,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $script:DingoWindow = $window
-foreach ($name in @('TitleText','IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','ToolFilterTextBox','ToolFilterClearButton','ToolFilterCountText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
+foreach ($name in @('TitleText','IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','ToolFilterTextBox','ToolFilterClearButton','ToolFilterCountText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','AllToolsButton','MissingToolsButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
 $desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -6294,7 +6302,7 @@ $VersionText.Text = "Version $($script:DingoVersion)"
 $LogPathText.Text = [string]$script:LogFile
 $ToolRootTextBox.Text = $script:ActiveToolRoot
 # The tools folder is changed here too, so it is locked while a plan runs.
-$script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$UncheckButton,$RefreshButton,
+$script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$AllToolsButton,$MissingToolsButton,$UncheckButton,$RefreshButton,
     $ToolRootTextBox,$ToolRootBrowseButton,$ToolRootSaveButton,$ToolRootDefaultButton)
 
 function Set-ToolRootStatus([string]$Text, [bool]$IsProblem) {
@@ -6958,6 +6966,31 @@ $NeededButton.Add_Click({
     $unknown = @($tweaks | Where-Object { $_.CurrentState.Status -in @('Error','Unavailable','Unknown') }).Count
     $SummaryText.Text = 'Only Tweaks settings known not to match your preference are selected. Tool selections were left as they are.'
     if ($unknown) { $SummaryText.Text += " $unknown unreadable or unavailable setting$(if ($unknown -eq 1) { ' was' } else { 's were' }) left unselected." }
+})
+# The same pair for the Tools half: every tab in it, so the shortcuts, the
+# PATH launchers and the file types come with the tools they point at. A
+# tweak is never touched, and Update installed tool is only ever chosen by hand.
+function Get-ToolSectionSettings {
+    @($script:Settings | Where-Object { $_.Section -eq 'Tools' })
+}
+$AllToolsButton.Add_Click({
+    foreach ($item in (Get-ToolSectionSettings)) { $item.DesiredState = $item.PreferredState; $item.Selected = $true }
+    Refresh-UI
+    $SummaryText.Text = 'Every tool is selected, with its shortcuts, launchers and file types. Tweaks selections were left as they are. Click Apply selected changes when ready.'
+})
+$MissingToolsButton.Add_Click({
+    $tools = Get-ToolSectionSettings
+    foreach ($item in $tools) {
+        $item.DesiredState = $item.PreferredState
+        $item.Selected = ($item.CurrentState.Status -in @('Alternate','Partial'))
+    }
+    Refresh-UI
+    $chosen = @($tools | Where-Object Selected).Count
+    $SummaryText.Text = if ($chosen) {
+        "Only tools, shortcuts, launchers and file types not yet in place are selected: $chosen. Tweaks selections were left as they are."
+    } else { 'Every tool is already in place. Nothing in the Tools section is selected.' }
+    $unknown = @($tools | Where-Object { $_.CurrentState.Status -in @('Error','Unavailable','Unknown') }).Count
+    if ($unknown) { $SummaryText.Text += " $unknown unreadable or unavailable card$(if ($unknown -eq 1) { ' was' } else { 's were' }) left unselected." }
 })
 $UncheckButton.Add_Click({
     foreach ($item in $script:Settings) { $item.Selected = $false }

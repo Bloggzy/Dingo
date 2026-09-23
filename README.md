@@ -22,7 +22,7 @@ Current version: **0.8.4**.
    - **Tweaks** - Windows settings (My account / Whole computer).
    - **Tools** - Install tools, Tool shortcuts, File associations.
    - **Options** - Dingo's own choices, such as the log folder and where tools are installed.
-4. Turn on the switch on each card you want, or press **Choose all my preferred settings**.
+4. Turn on the switch on each card you want. Or press **Choose all my preferred settings** in Tweaks, and **Choose all tools** in Tools.
 5. Press **Apply selected changes**. Windows asks for approval if the plan touches the whole computer.
 
 You need nothing else. Windows PowerShell 5.1 is already part of Windows 11.
@@ -217,6 +217,13 @@ Restart Edge after these.
 ## Tools
 
 Each tool card has two choices: **Installed** (install it if missing, leave it alone if present) and **Update installed tool**. Neither choice removes a tool.
+
+Two buttons at the top of the Tools section select cards for you. They act on every tab in Tools: the tools, their shortcuts, the **Run tools from anywhere** launchers, and the file types. They never touch a Tweaks card.
+
+- **Choose all tools** selects every card in the Tools section.
+- **Select only tools not yet in place** selects only the cards whose check says they are missing or incomplete. A tool that is already installed is left out. A card Dingo could not read is left out too.
+
+Both buttons pick **Installed**, never **Update installed tool**. To update a tool, choose that on its card.
 
 The cards are shown in name order, and the **Install tools** tab has a search box above the list. Type part of a name, such as `haya`, and only the matching cards stay on screen. Type more than one word and a card must match every word. The search only hides cards; a tool you already selected stays in the plan while it is out of sight. Press **Clear** to show the whole list again.
 
