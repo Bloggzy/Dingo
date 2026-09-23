@@ -225,6 +225,8 @@ The cards are shown in name order, and the **Install tools** tab has a search bo
 | `tool-7zip` | 7-Zip | yes |
 | `tool-notepadplusplus` | Notepad++ | yes |
 | `tool-ripgrep` | ripgrep | no |
+| `tool-powershell` | PowerShell 7 | yes |
+| `tool-python` | Python 3.13 | yes |
 | `tool-sqlitebrowser` | DB Browser for SQLite | yes |
 | `tool-dotnet-desktop-9` | .NET 9 Desktop Runtime | yes |
 | `tool-dotnet-desktop-10` | .NET 10 Desktop Runtime | yes |
@@ -234,6 +236,7 @@ The cards are shown in name order, and the **Install tools** tab has a search bo
 | `tool-hayabusa` | Hayabusa | yes |
 | `tool-duckdb` | DuckDB | yes |
 | `tool-arsenalimagemounter` | Arsenal Image Mounter | yes |
+| `tool-dissect` | Dissect | yes |
 
 Select .NET 9 as well as Eric Zimmerman's tools. Those tools need it, and a fresh Windows 11 does not have it. Dingo installs it first, so one run installs both in the right order.
 
@@ -281,6 +284,33 @@ Use of the tool is governed by the Arsenal Recon licence, which is in that folde
 Hayabusa puts its version in the program name, such as `hayabusa-4.1.0-win-x64.exe`. Dingo always names the launcher `hayabusa` and points it at the newest copy in the folder, so the command never changes when you update.
 
 Dingo builds the download address itself from the repository name, so a catalog entry can never send the download to another site. A release file is rebuilt for every version, so no SHA256 can be pinned in advance; Dingo records the hash of what it actually fetched in the log and the journal. Choose **Update installed tool** to fetch the newest release again.
+
+### PowerShell 7, Python, and Dissect
+
+**PowerShell 7** installs `pwsh.exe` beside Windows PowerShell 5.1. It does not replace it, and Dingo itself still runs on 5.1. The installer puts `pwsh` on the PATH.
+
+**Python 3.13** installs for every account, in `C:\Program Files\Python313`. The installer puts `python` and `py` on the PATH.
+
+The version is 3.13 on purpose. Dissect installs on Python 3.14, but it does not start there: its path code covers Python 3.10 to 3.13 only. Python 3.14 goes in a different folder, so a later Python card does not replace this one.
+
+**Dissect** is Fox-IT's forensic framework. It is on PyPI, not in winget. Select the Python card as well. Dingo installs Python first, so one run installs both.
+
+Dingo puts Dissect in a venv of its own: `Dissect` inside the tools folder, so `C:\DFIR\Tools\Dissect` by default. A venv is a private Python folder. Dissect's many packages stay in it, and never mix with the Python you use for your own scripts.
+
+1. Dingo makes the venv with `C:\Program Files\Python313\python.exe`. It never uses plain `python`, because on a fresh Windows that is the Microsoft Store stub.
+2. It updates pip inside the venv.
+3. It runs `pip install dissect`.
+4. It writes the version of every package in the venv to the log and the journal, so a run can be audited afterwards.
+
+**Update installed tool** runs `pip install --upgrade dissect` in the same venv.
+
+| Tool | Folder | Command |
+| --- | --- | --- |
+| Dissect | `Dissect` | `target-query`, `target-shell`, `target-fs`, `target-info`, `rdump`, and about 30 more |
+
+Select **Run tools from anywhere** to type these from any folder. The venv holds its own `python.exe` and `pip.exe` too. Dingo makes no launcher for those, so `python` still means the real Python.
+
+A venv is tied to the Python that made it. If you remove Python 3.13, Dissect stops working. Install Python again, then choose **Update installed tool** on Dissect.
 
 ### Where tools are installed
 
@@ -372,25 +402,29 @@ Any path may hold `%DINGO_TOOL_ROOT%`, which Dingo replaces with the tools folde
 | `name` | yes | Shown on the card |
 | `category` | no | Defaults to `Tools` |
 | `description` | no | Defaults to "Install \<name\>" |
-| `install.kind` | no | `winget` (default), `script`, `github-release`, or `mega-page` |
+| `install.kind` | no | `winget` (default), `script`, `github-release`, `mega-page`, or `python-venv` |
 | `install.package` | winget only | The exact winget package id |
 | `install.url` | script and mega-page | `https://` address. Plain `http` is refused. For mega-page it is the page the link is published on, not the file |
 | `install.sha256` | no | Expected SHA256 for a script. A mismatch blocks it |
 | `install.repo` | github-release only | The repository as `owner/name`. Dingo builds the address from it |
 | `install.assetPattern` | github-release and mega-page | Wildcard for the file, such as `duckdb_cli-windows-amd64.zip`. It must be a `.zip`. For github-release it must match exactly one release file; for mega-page the name the server reports must match it, or nothing is unpacked |
-| `install.dest` | script, github-release, and mega-page | Folder to install into |
+| `install.dest` | script, github-release, mega-page, and python-venv | Folder to install into. For python-venv it is the venv folder |
+| `install.python` | python-venv only | Full path of the `python.exe` that builds the venv, such as `%ProgramFiles%/Python313/python.exe`. Plain `python` is refused |
+| `install.packages` | python-venv only | List of pip package names. Each may carry an extra and one version condition, such as `dissect.target[full]==3.25.1`. Anything that looks like a pip option is refused |
 | `install.linkName` | mega-page only | The product name to look for on the page. Exactly one link must sit next to it, or Dingo stops |
 | `install.stripRoot` | no | mega-page only. `true` takes off a single wrapping folder, for an archive whose top folder carries the version |
 | `install.arguments` | no | Extra arguments. `-Dest` is always passed for you |
-| `install.timeoutMinutes` | no | 1 to 240. Default 15 (winget), 30 (github-release and mega-page), or 45 (script) |
+| `install.timeoutMinutes` | no | 1 to 240. Default 15 (winget), 30 (github-release, mega-page, and python-venv), or 45 (script) |
 | `install.scope` | no | `machine` (default) or `user` |
 | `install.source` | no | winget only. Defaults to `winget` |
+| `install.installerType` | no | winget only. Passed as `--installer-type`, such as `wix`. Use it when a package also offers an MSIX that fails for a machine install |
 | `detect` | yes | One or more detect rules |
 | `detectMode` | no | `any` (default) or `all` |
 | `requires` | no | Other tool IDs this one needs |
 | `shims.from` | no | Folder to scan for command-line programs, for the PATH card |
 | `shims.pattern` | no | Defaults to `*.exe` |
 | `shims.recurse` | no | Defaults to `true` |
+| `shims.exclude` | no | List of file name wildcards that get no launcher, such as `python*.exe` in a venv |
 | `shims.name` | no | One steady launcher name. Use it when the program name holds its version. Dingo then writes one launcher, pointing at the newest matching file |
 | `shortcuts[].name` | yes, in the list | Becomes a file name, so slashes and colons are refused |
 | `shortcuts[].target` | yes, in the list | The program. Use forward slashes |
