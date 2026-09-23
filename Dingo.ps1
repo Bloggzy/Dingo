@@ -110,7 +110,7 @@ $script:PendingApply = $null
 $script:ApplyInProgress = $false
 $script:ApplyRestartExplorer = $false
 $script:SettingHandlers = @{}
-$script:DingoVersion = '0.8.2'
+$script:DingoVersion = '0.8.3'
 $script:DeviceIsManaged = $null
 $script:ToolCatalogWarning = ''
 $script:ToolCatalogCache = $null
@@ -870,7 +870,7 @@ function ConvertTo-ToolDefinition($Raw) {
 
     $install = Get-JsonField $Raw 'install' $null
     $installKind = [string](Get-JsonField $install 'kind' 'winget')
-    if ($installKind -notin @('winget','script','github-release','mega-page')) { throw "Tool '$id' uses install kind '$installKind', which this version of Dingo cannot run." }
+    if ($installKind -notin @('winget','script','github-release','mega-page','python-venv')) { throw "Tool '$id' uses install kind '$installKind', which this version of Dingo cannot run." }
     $package = [string](Get-JsonField $install 'package' '')
     $url = [string](Get-JsonField $install 'url' '')
     $dest = [string](Get-JsonField $install 'dest' '')
@@ -880,8 +880,16 @@ function ConvertTo-ToolDefinition($Raw) {
     $stripRoot = [bool](Get-JsonField $install 'stripRoot' $false)
     $expectedHash = [string](Get-JsonField $install 'sha256' '')
     if ($expectedHash -and $expectedHash -notmatch '^[0-9a-fA-F]{64}$') { throw "Tool '$id' needs a 64-character SHA256 hash." }
+    $python = [string](Get-JsonField $install 'python' '')
+    $packages = @(Get-JsonField $install 'packages' @() | ForEach-Object { [string]$_ })
+    $installerType = [string](Get-JsonField $install 'installerType' '')
     if ($installKind -eq 'winget') {
         if ([string]::IsNullOrWhiteSpace($package)) { throw "Tool '$id' has no winget package id." }
+        # Some packages offer an MSIX and a classic installer under one id, and
+        # winget may take the MSIX even when asked for a machine install.
+        if ($installerType -and $installerType -notin @('msix','msi','appx','exe','zip','inno','nullsoft','wix','burn','portable')) {
+            throw "Tool '$id' has winget installer type '$installerType', which winget does not know."
+        }
     } elseif ($installKind -eq 'github-release') {
         # Dingo builds the address itself from the repository name, so a release
         # download can never be pointed at another host by the catalog.
@@ -902,6 +910,20 @@ function ConvertTo-ToolDefinition($Raw) {
         if ($assetPattern -match '[\/:"<>|]' -or $assetPattern -match '[\x00-\x1f]') { throw "Tool '$id' has an assetPattern that is not a usable file name." }
         if ($assetPattern -notlike '*.zip') { throw "Tool '$id' must name a .zip file, because Dingo unpacks nothing else." }
         if ([string]::IsNullOrWhiteSpace($dest)) { throw "Tool '$id' needs a dest folder for its download." }
+    } elseif ($installKind -eq 'python-venv') {
+        # The venv is built from one named Python, never from whatever 'python'
+        # means on the PATH. On a fresh Windows that is the Microsoft Store stub.
+        if ($python -notmatch '[\\/]python\.exe$' -or $python -match '[*?]') { throw "Tool '$id' needs the full path of a python.exe to build its venv with." }
+        if (-not $packages.Count) { throw "Tool '$id' needs at least one pip package." }
+        # pip reads anything that starts with a dash as an option, and an option
+        # can point it at another package index. So only a plain package name
+        # is taken, with an optional extra and one version condition.
+        foreach ($packageName in $packages) {
+            if ($packageName -notmatch '^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?(\[[A-Za-z0-9._,-]+\])?((==|>=|<=|~=|!=|<|>)[A-Za-z0-9.*+!_-]+)?$') {
+                throw "Tool '$id' names the pip package '$packageName', which is not a plain package name."
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($dest)) { throw "Tool '$id' needs a dest folder for its venv." }
     } else {
         # A downloaded installer script runs with administrator rights, so refuse
         # anything that is not fetched over TLS from a named host.
@@ -910,7 +932,7 @@ function ConvertTo-ToolDefinition($Raw) {
     }
     $scope = [string](Get-JsonField $install 'scope' 'machine')
     if ($scope -notin @('machine','user')) { throw "Tool '$id' has scope '$scope'; use 'machine' or 'user'." }
-    $defaultTimeout = switch ($installKind) { 'script' { 45 }; 'github-release' { 30 }; 'mega-page' { 30 }; default { 15 } }
+    $defaultTimeout = switch ($installKind) { 'script' { 45 }; 'github-release' { 30 }; 'mega-page' { 30 }; 'python-venv' { 30 }; default { 15 } }
     $timeoutMinutes = [int](Get-JsonField $install 'timeoutMinutes' $defaultTimeout)
     if ($timeoutMinutes -lt 1 -or $timeoutMinutes -gt 240) { throw "Tool '$id' has a timeout of $timeoutMinutes minutes; use 1 to 240." }
 
@@ -946,11 +968,18 @@ function ConvertTo-ToolDefinition($Raw) {
         if ($shimName -and $shimName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
             throw "Tool '$id' has a shim named '$shimName', which is not a usable file name."
         }
+        # A venv holds its own python.exe and pip.exe beside the tool's programs.
+        # A launcher for those would hide the real Python, so they can be left out.
+        $exclude = @(Get-JsonField $rawShims 'exclude' @() | ForEach-Object { [string]$_ })
+        foreach ($excluded in $exclude) {
+            if ([string]::IsNullOrWhiteSpace($excluded) -or $excluded -match '[\\/:"<>|]') { throw "Tool '$id' has a shims exclude '$excluded', which is not a usable file name pattern." }
+        }
         $shims = [PSCustomObject]@{
             From = $from
             Pattern = [string](Get-JsonField $rawShims 'pattern' '*.exe')
             Recurse = [bool](Get-JsonField $rawShims 'recurse' $true)
             Name = $shimName
+            Exclude = $exclude
         }
     }
 
@@ -1000,6 +1029,7 @@ function ConvertTo-ToolDefinition($Raw) {
         Description = [string](Get-JsonField $Raw 'description' "Install $name.")
         InstallKind = $installKind
         Package = $package
+        InstallerType = $installerType
         Source = [string](Get-JsonField $install 'source' 'winget')
         Scope = $scope
         Url = $url
@@ -1009,6 +1039,8 @@ function ConvertTo-ToolDefinition($Raw) {
         AssetPattern = $assetPattern
         LinkName = $linkName
         StripRoot = $stripRoot
+        Python = $python
+        Packages = $packages
         Arguments = @(Get-JsonField $install 'arguments' @())
         Shims = $shims
         Shortcuts = @($shortcuts)
@@ -1057,6 +1089,33 @@ function Get-BuiltInToolCatalog {
             detect=@(
                 [PSCustomObject]@{ kind='uninstall-key'; match='RipGrep*' },
                 [PSCustomObject]@{ kind='command'; command='rg.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-powershell'; name='PowerShell 7'; category='Scripting'
+            description='The current PowerShell, pwsh.exe. It sits beside Windows PowerShell 5.1 and does not replace it. Many newer DFIR scripts need it. The installer adds pwsh to the PATH itself.'
+            # The package also offers an MSIX, and winget picks it first. Deployed
+            # machine-wide it fails with 0x8A150113, "The current system
+            # configuration does not support the installation of this package".
+            # The MSI (wix) is the one that installs to Program Files.
+            install=[PSCustomObject]@{ kind='winget'; package='Microsoft.PowerShell'; scope='machine'; installerType='wix' }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\PowerShell\7\pwsh.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            # Listed before the tools that need it, because the elevated worker
+            # applies the plan in catalog order. The minor version is fixed on
+            # purpose: a venv is tied to the Python folder that built it, and
+            # winget puts each minor version in a folder of its own. It is 3.13
+            # and not 3.14, because Dissect installs on 3.14 but fails to start:
+            # dissect.target 3.25 has path code for Python 3.10 to 3.13 only.
+            # Move both cards together, and only once target-query runs.
+            id='tool-python'; name='Python 3.13'; category='Scripting'
+            description='Python for every account on this computer, in C:\Program Files\Python313. The installer puts python and py on the PATH. Dissect is built on it.'
+            install=[PSCustomObject]@{ kind='winget'; package='Python.Python.3.13'; scope='machine' }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\Python313\python.exe' }
             )
         },
         [PSCustomObject]@{
@@ -1213,6 +1272,26 @@ function Get-BuiltInToolCatalog {
             requires=@('tool-dotnet-desktop-10')
             detect=@(
                 [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/ArsenalImageMounter/ArsenalImageMounter.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-dissect'; name='Dissect'; category='Forensics'
+            description='Fox-IT''s framework that reads disk images, VM disks, and live file systems as one target. Command-line tools such as target-query, target-shell, target-fs, and rdump. Installed with pip into a venv of its own in the tools folder. Needs Python 3.13, which is a card of its own on this tab.'
+            install=[PSCustomObject]@{
+                kind='python-venv'; scope='machine'
+                python='%ProgramFiles%\Python313\python.exe'
+                packages=@('dissect')
+                dest='%DINGO_TOOL_ROOT%\Dissect'
+            }
+            # The venv's own Python, pip, and IPython sit in the same folder.
+            # A launcher for them would hide the real Python on the PATH.
+            shims=[PSCustomObject]@{
+                from='%DINGO_TOOL_ROOT%/Dissect/Scripts'; pattern='*.exe'; recurse=$false
+                exclude=@('python*.exe','pip*.exe','ipython*.exe','pygmentize.exe')
+            }
+            requires=@('tool-python')
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/Dissect/Scripts/target-query.exe' }
             )
         }
     )
@@ -1697,6 +1776,7 @@ function Install-WingetPackage($Tool, [bool]$AllowUpgrade = $false) {
         '--accept-package-agreements','--accept-source-agreements','--disable-interactivity','--silent'
     )
     if (-not $AllowUpgrade) { $arguments += '--no-upgrade' }
+    if ([string](Get-JsonField $Tool 'InstallerType' '')) { $arguments += @('--installer-type', $Tool.InstallerType) }
     Write-Log 'INFO' "Installing $($Tool.Name): winget $($arguments -join ' ')"
     # winget writes UTF-8 to a pipe, not the OEM code page. install has no
     # switch to hide its progress bars, so strip them before anything logs them.
@@ -2418,6 +2498,59 @@ function Install-MegaPagePackage($Tool) {
     }
 }
 
+function Install-PythonVenvPackage($Tool, [bool]$AllowUpgrade = $false) {
+    # A pip tool gets a venv of its own inside the tools folder, so its many
+    # dependencies never mix with the Python an analyst uses for other work.
+    $python = Expand-ToolRootPath $Tool.Python
+    if (-not (Test-PathIsOnLocalDrive $python)) { throw "The Python for $($Tool.Name), '$python', is not a full path on a drive of this computer." }
+    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+        throw "$($Tool.Name) is built with the Python at $python, and it is not there. Install the Python card first, then try again."
+    }
+    $destination = Expand-ToolRootPath $Tool.Dest
+    if (-not (Test-PathIsOnLocalDrive $destination)) { throw "The install folder '$destination' for $($Tool.Name) is not a full path on a drive of this computer." }
+    $venvPython = Join-Path $destination 'Scripts\python.exe'
+
+    if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+        # pip downloads whatever the packages depend on, so the size is not
+        # knowable here. A drive this close to full is worth a warning only.
+        $free = Get-FreeSpaceBytes $destination
+        if ($free -ge 0 -and $free -lt 1GB) {
+            Write-Log 'WARN' "The drive holding $destination has only $(Format-ByteSize $free) free. The $($Tool.Name) install may not fit."
+        }
+        Write-Log 'INFO' "Creating a Python venv for $($Tool.Name) in $destination with $python."
+        $run = Invoke-ChildProcess $python @('-m','venv',$destination) 300 "Creating the $($Tool.Name) venv"
+        Write-Log 'DEBUG' "venv exit code $($run.ExitCode) for $($Tool.Name): $(Get-OutputTail $run.Output 2000)"
+        if ($run.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+            throw "Python could not create the $($Tool.Name) venv in $destination (exit code $($run.ExitCode)). $(Get-OutputTail $run.Output)"
+        }
+    }
+
+    # The pip a venv starts with is as old as the Python that made it, and an
+    # old pip can miss the wheels a new package publishes for Windows.
+    $pipOptions = @('--disable-pip-version-check','--no-input')
+    Write-Log 'INFO' "Updating pip in the $($Tool.Name) venv."
+    $run = Invoke-ChildProcess $venvPython (@('-m','pip','install','--upgrade','pip') + $pipOptions) 600 "The pip update for $($Tool.Name)"
+    Write-Log 'DEBUG' "pip update exit code $($run.ExitCode) for $($Tool.Name): $(Get-OutputTail $run.Output 2000)"
+    if ($run.ExitCode -ne 0) { throw "pip could not update itself in the $($Tool.Name) venv (exit code $($run.ExitCode)). $(Get-OutputTail $run.Output)" }
+
+    $arguments = @('-m','pip','install') + $pipOptions
+    if ($AllowUpgrade) { $arguments += '--upgrade' }
+    $arguments += @($Tool.Packages)
+    Write-Log 'INFO' "Installing $($Tool.Name): pip $($arguments[2..($arguments.Count - 1)] -join ' ')"
+    $run = Invoke-ChildProcess $venvPython $arguments $Tool.TimeoutSeconds "The pip install of $($Tool.Name)"
+    Write-Log 'DEBUG' "pip exit code $($run.ExitCode) for $($Tool.Name): $(Get-OutputTail $run.Output 2000)"
+    if ($run.ExitCode -ne 0) { throw "pip exited with code $($run.ExitCode) for $($Tool.Name). $(Get-OutputTail $run.Output)" }
+
+    # PyPI keeps no single file whose hash the catalog could hold, so record
+    # every package version the venv ended up with, for an audit afterwards.
+    $freeze = Invoke-ChildProcess $venvPython (@('-m','pip','freeze','--all') + $pipOptions) 120 "Listing the $($Tool.Name) packages"
+    $installed = if ($freeze.ExitCode -eq 0) { [string]$freeze.Output } else { '' }
+    Write-Log 'INFO' "The $($Tool.Name) venv holds: $installed"
+    Write-OperationJournal 'InstallerProvenance' ([Guid]::NewGuid().ToString('N')) $Tool.Id $Tool.Scope @{
+        Python=$python; Venv=$destination; Packages=(@($Tool.Packages) -join ' '); Installed=$installed
+    }
+}
+
 function Send-EnvironmentChange {
     if (-not ('Dingo.NativeMethods' -as [type])) { Send-InternationalSettingChange | Out-Null }
     $result = [IntPtr]::Zero
@@ -2492,6 +2625,8 @@ function Get-ExpectedShims {
         $from = Expand-ToolRootPath $tool.Shims.From
         if (-not (Test-Path -LiteralPath $from -PathType Container)) { continue }
         $files = @(Get-ChildItem -LiteralPath $from -Filter $tool.Shims.Pattern -File -Recurse:$tool.Shims.Recurse -ErrorAction SilentlyContinue)
+        $exclude = @(Get-JsonField $tool.Shims 'Exclude' @())
+        if ($exclude.Count) { $files = @($files | Where-Object { $fileName = $_.Name; -not @($exclude | Where-Object { $fileName -like $_ }).Count }) }
         # A tool that keeps its version in the program name, such as
         # hayabusa-4.1.0-win-x64.exe, leaves the older copies behind when it is
         # updated. One launcher under a steady name points at the newest one.
@@ -3038,6 +3173,7 @@ function Set-PackageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     elseif ($tool.InstallKind -eq 'script') { Install-ScriptPackage $tool }
     elseif ($tool.InstallKind -eq 'github-release') { Install-GitHubReleasePackage $tool }
     elseif ($tool.InstallKind -eq 'mega-page') { Install-MegaPagePackage $tool }
+    elseif ($tool.InstallKind -eq 'python-venv') { Install-PythonVenvPackage $tool $update }
     else { throw "Install kind '$($tool.InstallKind)' is not supported in this version of Dingo." }
 }
 
@@ -5131,6 +5267,7 @@ if ($SelfTest) {
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a'; scope='everyone' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a' }; detect=@() },
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='guess' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a'; installerType='--force' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a'; timeoutMinutes=0 }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a'; timeoutMinutes=999 }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
         # A downloaded installer script runs elevated, so plain http, a non-url,
@@ -5147,7 +5284,17 @@ if ($SelfTest) {
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name'; assetPattern='..\\a.zip'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
         [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name'; assetPattern='a.exe'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
-        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name'; assetPattern='a.zip' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) }
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='github-release'; repo='owner/name'; assetPattern='a.zip' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        # A venv must name the python.exe that builds it, and pip must never be
+        # handed an option dressed up as a package name.
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='python-venv'; packages=@('a'); dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='python-venv'; python='python'; packages=@('a'); dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='python-venv'; python='C:\Python3*\python.exe'; packages=@('a'); dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='python-venv'; python='C:\P\python.exe'; dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='python-venv'; python='C:\P\python.exe'; packages=@('--index-url=https://evil.example.com/simple'); dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='python-venv'; python='C:\P\python.exe'; packages=@('a b'); dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ kind='python-venv'; python='C:\P\python.exe'; packages=@('a') }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) },
+        [PSCustomObject]@{ id='tool-x'; name='x'; install=[PSCustomObject]@{ package='a' }; shims=[PSCustomObject]@{ from='C:\x'; exclude=@('..\python.exe') }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) }
     )) {
         $rejected = $false
         try { [void](ConvertTo-ToolDefinition $badTool) } catch { $rejected = $true }
@@ -5171,6 +5318,21 @@ if ($SelfTest) {
     # move it. A literal here would silently ignore the option.
     if ($ezTool.Dest -ne "$($script:ToolRootToken)\EZTools") { throw "The Eric Zimmerman tool set must install to $($script:ToolRootToken)\EZTools." }
     if ($ezTool.Scope -ne 'machine') { throw 'Writing to the tools folder needs administrator approval.' }
+    $venvTool = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-venv'; name='Venv'; install=[PSCustomObject]@{ kind='python-venv'; python='C:/P/python.exe'; packages=@('dissect','dissect.target[full]==3.25.1'); dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) })
+    if ($venvTool.Packages.Count -ne 2 -or $venvTool.TimeoutSeconds -ne 1800) { throw 'A python-venv tool lost its packages or its default timeout.' }
+    # Dissect is built in a venv from the Python card, never from the PATH, and
+    # its venv's own python.exe must not get a launcher that hides the real one.
+    $pwshTool = $builtInTools | Where-Object Id -eq 'tool-powershell' | Select-Object -First 1
+    if ($pwshTool.InstallerType -ne 'wix') { throw 'PowerShell 7 must ask winget for the MSI; the MSIX fails machine-wide.' }
+    $dissectTool = $builtInTools | Where-Object Id -eq 'tool-dissect' | Select-Object -First 1
+    $pythonTool = $builtInTools | Where-Object Id -eq 'tool-python' | Select-Object -First 1
+    if ($dissectTool.InstallKind -ne 'python-venv' -or $dissectTool.Requires -notcontains 'tool-python') { throw 'Dissect must install into a venv and require the Python card.' }
+    if ($dissectTool.Python -ne $pythonTool.Detect[0].Path) { throw 'Dissect must be built with the same python.exe the Python card detects.' }
+    if ([array]::IndexOf(@($builtInTools.Id), 'tool-python') -gt [array]::IndexOf(@($builtInTools.Id), 'tool-dissect')) { throw 'Python must come before Dissect, because the worker installs in catalog order.' }
+    foreach ($hidden in @('python.exe','pythonw.exe','pip.exe','pip3.13.exe','ipython.exe')) {
+        if (-not @($dissectTool.Shims.Exclude | Where-Object { $hidden -like $_ }).Count) { throw "Dissect would get a launcher for $hidden." }
+    }
+    if (@($dissectTool.Shims.Exclude | Where-Object { 'target-query.exe' -like $_ }).Count) { throw 'Dissect would get no launcher for target-query.' }
     # The tools folder: one rule set decides what may be used, and the token is
     # what makes every catalog path follow it.
     foreach ($bad in @(
