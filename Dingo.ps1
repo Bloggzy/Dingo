@@ -1778,8 +1778,11 @@ function Install-WingetPackage($Tool, [bool]$AllowUpgrade = $false) {
     if (-not $AllowUpgrade) { $arguments += '--no-upgrade' }
     if ([string](Get-JsonField $Tool 'InstallerType' '')) { $arguments += @('--installer-type', $Tool.InstallerType) }
     Write-Log 'INFO' "Installing $($Tool.Name): winget $($arguments -join ' ')"
-    $run = Invoke-ChildProcess $winget $arguments $TimeoutSeconds "The winget install of $($Tool.Package)"
-    Write-Log 'DEBUG' "winget exit code $($run.ExitCode) for $($Tool.Package): $($run.Output)"
+    # winget writes UTF-8 to a pipe, not the OEM code page. install has no
+    # switch to hide its progress bars, so strip them before anything logs them.
+    $run = Invoke-ChildProcess $winget $arguments $TimeoutSeconds "The winget install of $($Tool.Package)" (New-Object Text.UTF8Encoding $false)
+    $output = Remove-ProgressNoise $run.Output
+    Write-Log 'DEBUG' "winget exit code $($run.ExitCode) for $($Tool.Package): $output"
     # UPDATE_NOT_APPLICABLE (0x8A15002B), or PACKAGE_ALREADY_INSTALLED
     # (0x8A150061) when --no-upgrade prevented an implicit upgrade. The shared
     # executor still verifies installation using the catalog's detection rules.
@@ -1794,7 +1797,7 @@ function Install-WingetPackage($Tool, [bool]$AllowUpgrade = $false) {
         $hint = if ($run.ExitCode -eq -1978335217) {
             " The winget package source could not be opened. Run 'winget source reset --force' as an administrator, and check this computer can reach https://cdn.winget.microsoft.com."
         } else { '' }
-        throw "winget exited with code $($run.ExitCode) for $($Tool.Package). $(Get-OutputTail $run.Output)$hint"
+        throw "winget exited with code $($run.ExitCode) for $($Tool.Package). $(Get-OutputTail $output)$hint"
     }
 }
 
@@ -1883,7 +1886,7 @@ function Stop-InstallerProcessTree($Process) {
     [void]$Process.WaitForExit(5000)
 }
 
-function Invoke-ChildProcess([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label) {
+function Invoke-ChildProcess([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label, [Text.Encoding]$PipeEncoding = $null) {
     # Start-Process -PassThru does not keep the process handle, so its ExitCode
     # stays empty and a success would look like a failure. Own the handle here.
     $startInfo = New-Object Diagnostics.ProcessStartInfo
@@ -1895,6 +1898,12 @@ function Invoke-ChildProcess([string]$FilePath, [string[]]$Arguments, [int]$Time
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    # Without this the pipes are read in the OEM code page, which suits
+    # powershell.exe but garbles a child that writes UTF-8.
+    if ($PipeEncoding) {
+        $startInfo.StandardOutputEncoding = $PipeEncoding
+        $startInfo.StandardErrorEncoding = $PipeEncoding
+    }
     $process = $null
     $job = New-Object Dingo.InstallerJob
     $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -1930,6 +1939,19 @@ function Invoke-ChildProcess([string]$FilePath, [string[]]$Arguments, [int]$Time
 function Get-OutputTail([string]$Text, [int]$Length = 300) {
     if ($Text.Length -gt $Length) { return $Text.Substring($Text.Length - $Length) }
     return $Text
+}
+
+function Remove-ProgressNoise([string]$Text) {
+    # winget redraws progress in place, so a redirected run holds every frame:
+    # block-character bars, spinner runs such as '- \ | /', and 'NN%' or
+    # '12.5 MB / 105 MB' counters. One install can write several KB of them.
+    # The mojibake form is the same bar, UTF-8 read in the OEM code page.
+    $clean = $Text -replace '(?:[\u2580-\u259F]|\u0393\u00FB.)+', ' '
+    $clean = $clean -replace '\d+(?:\.\d+)?\s*[KMGT]?B\s*/\s*\d+(?:\.\d+)?\s*[KMGT]?B', ' '
+    $clean = $clean -replace '(?<!\S)\d{1,3}%(?!\S)', ' '
+    # A lone '-' or '/' can be real text, so only a run of two or more goes.
+    $clean = $clean -replace '(?<!\S)[-\\|/](?:\s+[-\\|/])+(?!\S)', ' '
+    return ($clean -replace '\s+', ' ').Trim()
 }
 
 function Install-ScriptPackage($Tool) {
@@ -5282,6 +5304,12 @@ if ($SelfTest) {
     $minimalTool = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-minimal'; name='Minimal'; install=[PSCustomObject]@{ package='a' }; detect=@([PSCustomObject]@{ kind='command'; command='cmd.exe' }) })
     if ($minimalTool.Scope -ne 'machine' -or $minimalTool.Source -ne 'winget' -or $minimalTool.Category -ne 'Tools') { throw 'Tool defaults are wrong.' }
     if (-not (Find-InstalledTool $minimalTool)) { throw 'Tool detection did not find cmd.exe on the PATH.' }
+    # winget progress must not reach the log, but its real messages must.
+    $bar = [string][char]0x2588 * 6 + [string][char]0x2592 * 4
+    $mojibake = ([string][char]0x0393 + [char]0x00FB + [char]0x00EA) * 3
+    $noisy = "Found PowerShell - \ | / - \ | / Downloading https://example.test/a.msi $bar 12.5 MB / 105 MB $bar 100% $mojibake 42% Successfully installed - done / 7"
+    $quiet = Remove-ProgressNoise $noisy
+    if ($quiet -ne 'Found PowerShell Downloading https://example.test/a.msi Successfully installed - done / 7') { throw "winget progress noise was not stripped: '$quiet'" }
     # Eric Zimmerman's tools are fetched by the author's own script, not by winget.
     $ezTool = $builtInTools | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1
     if ($ezTool.InstallKind -ne 'script') { throw 'The Eric Zimmerman tool set must use the script install kind.' }
