@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Sets up a fresh Windows 11 machine for DFIR work: settings, debloat, and tools.
 .DESCRIPTION
@@ -3286,8 +3286,10 @@ function Get-Settings {
     # "is_default": false to another entry makes Edge reject the whole policy
     # silently. DefaultSearchProviderSearchURL suppresses ManagedSearchEngines, so
     # the old values must be absent for the preferred state to hold.
-    $searchEngines = '[{"is_default":true,"keyword":"google.com","name":"Google","search_url":"https://www.google.com/search?q={searchTerms}"},{"keyword":"duckduckgo.com","name":"DuckDuckGo","search_url":"https://duckduckgo.com/?q={searchTerms}","suggest_url":"https://duckduckgo.com/ac/?q={searchTerms}&type=list"}]'
-    [void]$settings.Add((New-Setting 'edge-search-engines' 'Microsoft Edge' 'Search engines' 'Offer Google and DuckDuckGo only, with Google as the default. Bing is never added. Restart Edge to finish applying it.' 'Google and DuckDuckGo, no Bing' 'Browser default (includes Bing)' 'Registry' @(
+    # DuckDuckGo is the default because Google now asks for a CAPTCHA on most
+    # analysis VMs. Google stays in the list.
+    $searchEngines = '[{"is_default":true,"keyword":"duckduckgo.com","name":"DuckDuckGo","search_url":"https://duckduckgo.com/?q={searchTerms}","suggest_url":"https://duckduckgo.com/ac/?q={searchTerms}&type=list"},{"keyword":"google.com","name":"Google","search_url":"https://www.google.com/search?q={searchTerms}"}]'
+    [void]$settings.Add((New-Setting 'edge-search-engines' 'Microsoft Edge' 'Search engines' 'Offer DuckDuckGo and Google only, with DuckDuckGo as the default. Bing is never added. Restart Edge to finish applying it.' 'DuckDuckGo and Google, no Bing' 'Browser default (includes Bing)' 'Registry' @(
         (New-Entry Machine "$edge\Recommended" 'ManagedSearchEngines' $searchEngines $script:RemoveValue String),
         (New-Entry Machine $edge 'DefaultSearchProviderEnabled' $script:RemoveValue $script:RemoveValue),
         (New-Entry Machine $edge 'DefaultSearchProviderName' $script:RemoveValue $script:RemoveValue String),
@@ -5086,8 +5088,8 @@ if ($SelfTest) {
     if ($engineNames -contains 'Bing') { throw 'Bing must not appear in the engine list.' }
     # Edge rejects the whole policy if a non-default entry carries is_default.
     $defaultEntries = @($engineList | Where-Object { $_.PSObject.Properties['is_default'] })
-    if ($defaultEntries.Count -ne 1 -or -not $defaultEntries[0].is_default -or $defaultEntries[0].name -ne 'Google') {
-        throw 'Exactly one engine may carry is_default, it must be true, and it must be Google.'
+    if ($defaultEntries.Count -ne 1 -or -not $defaultEntries[0].is_default -or $defaultEntries[0].name -ne 'DuckDuckGo') {
+        throw 'Exactly one engine may carry is_default, it must be true, and it must be DuckDuckGo.'
     }
     foreach ($suppressor in @('DefaultSearchProviderEnabled','DefaultSearchProviderSearchURL')) {
         $entry = $searchSetting.Entries | Where-Object Name -eq $suppressor | Select-Object -First 1

@@ -35,6 +35,14 @@ You need nothing else. Windows PowerShell 5.1 is already part of Windows 11.
 Start-Dingo.cmd -Apply -Include tweaks,tools
 ```
 
+To apply everything except the display language, run this:
+
+```bat
+.\Start-Dingo.cmd -Apply -Include tweaks,tools -Exclude display-language
+```
+
+The display language takes longer than all the other changes together. When the computer has no pack for the language, Windows downloads it, which usually takes about ten minutes. Without it, a full run takes a few minutes.
+
 The rest of this section is the detail.
 
 Preview a plan. Nothing is changed:
@@ -203,7 +211,7 @@ Restart Edge after these.
 | `edge-first-run` | First-run and import extras | yes | Suppressed |
 | `edge-passwords` | Edge password manager | yes | Disabled |
 | `edge-copilot` | Copilot in Edge | yes | Disabled |
-| `edge-search-engines` | Search engines | yes | Google and DuckDuckGo, no Bing |
+| `edge-search-engines` | Search engines | yes | DuckDuckGo (default) and Google, no Bing |
 | `edge-debloat` | Clutter and new tab page | yes | Removed |
 
 ### Windows Terminal and Start menu
