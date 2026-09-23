@@ -1184,7 +1184,7 @@ try {
         $tweak.Id = 'tools'
         Assert-Throws { Resolve-QuickApplySettings @($tweak,$tool) @() @() } 'clashes'
     }
-    Test-Case 'The Tweaks buttons never select a tool card' {
+    Test-Case 'The Tweaks and Tools buttons each stay in their own section' {
         # Run the real click handlers, not a copy of them, against a stub window.
         $handlerOf = {
             param([string]$Name)
@@ -1214,6 +1214,29 @@ try {
             Assert ($chosenTools.Count -eq 1 -and $chosenTools[0].Id -eq $heldTool.Id) "$handlerName changed a tool selection."
             Assert (@($script:Settings | Where-Object { $_.Section -eq 'Tweaks' -and $_.Selected }).Count -eq $tweakCount) "$handlerName missed a tweak."
         }
+        # The Tools pair is the mirror image: every Tools tab, and never a tweak.
+        $toolCount = @($script:Settings | Where-Object { $_.Section -eq 'Tools' }).Count
+        foreach ($handlerName in @('AllToolsButton','MissingToolsButton')) {
+            foreach ($item in $script:Settings) {
+                $item.Selected = $false
+                $item.CurrentState = New-StateResult 'Partial' 'stub'
+            }
+            $heldTweak = @($script:Settings | Where-Object { $_.Section -eq 'Tweaks' })[0]
+            $heldTweak.Selected = $true
+            & (& $handlerOf $handlerName)
+            $chosenTweaks = @($script:Settings | Where-Object { $_.Section -eq 'Tweaks' -and $_.Selected })
+            Assert ($chosenTweaks.Count -eq 1 -and $chosenTweaks[0].Id -eq $heldTweak.Id) "$handlerName changed a tweak selection."
+            Assert (@($script:Settings | Where-Object { $_.Section -eq 'Tools' -and $_.Selected }).Count -eq $toolCount) "$handlerName missed a tool card."
+            Assert (-not @($script:Settings | Where-Object { $_.Section -eq 'Tools' -and $_.DesiredState -ne $_.PreferredState }).Count) "$handlerName chose something other than the preferred state."
+        }
+        # A tool already in place, or one Dingo cannot read, is left alone.
+        $tools = @($script:Settings | Where-Object { $_.Section -eq 'Tools' })
+        foreach ($item in $tools) { $item.Selected = $true; $item.CurrentState = New-StateResult 'Preferred' 'stub' }
+        $tools[0].CurrentState = New-StateResult 'Partial' 'stub'
+        $tools[1].CurrentState = New-StateResult 'Error' 'stub'
+        & (& $handlerOf 'MissingToolsButton')
+        $chosen = @($tools | Where-Object Selected)
+        Assert ($chosen.Count -eq 1 -and $chosen[0].Id -eq $tools[0].Id) 'Select only tools not yet in place picked the wrong cards.'
         # Clearing is a whole-window action, so it does reach both sections.
         foreach ($item in $script:Settings) { $item.Selected = $true }
         & (& $handlerOf 'UncheckButton')
