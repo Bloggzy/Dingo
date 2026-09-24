@@ -597,7 +597,29 @@ try {
         Assert ((Get-ScopePill 'System').Text -eq 'Whole computer') 'The computer pill has the wrong words.'
         Assert ((Get-ScopePill 'Both').Text -eq 'Account + computer') 'The two-part pill has the wrong words.'
         Assert (($script:Settings | Where-Object Id -eq 'long-paths').Tab -eq 'Windows features') 'Win32 long paths is not with the Windows features.'
-        Assert (($script:Settings | Where-Object Id -eq 'resume').Tab -eq 'Taskbar') 'Cross-device Resume left the Taskbar, where Windows Settings shows it.'
+        Assert (($script:Settings | Where-Object Id -eq 'resume').Tab -eq 'Windows features') 'Cross-device Resume is not with the Windows features.'
+        # A tweak people may look for on the Taskbar leaves a signpost there.
+        foreach ($signpost in (Get-TweakSignposts)) {
+            $target = $script:Settings | Where-Object Id -eq $signpost.Id
+            Assert ([bool]$target) "The signpost for '$($signpost.Id)' points at nothing."
+            Assert ($signpost.Tab -in (Get-TweakTabOrder) -and $signpost.Tab -ne $target.Tab) "The signpost for '$($signpost.Id)' is not on another tweak tab."
+        }
+        Assert (@(Get-TweakSignposts | Where-Object { $_.Tab -eq 'Taskbar' }).Id -join ',' -eq 'resume,windows-copilot') 'The Taskbar tab does not point to Resume and Copilot.'
+    }
+    Test-Case 'Resume turns off the feature and the taskbar badge Settings shows' {
+        $card = $script:Settings | Where-Object Id -eq 'resume'
+        $names = @($card.Entries | ForEach-Object { $_.Name })
+        Assert ('IsResumeAllowed' -in $names -and 'IsEnabled' -in $names -and 'value' -in $names) "Resume writes $($names -join ', ')."
+        $badge = $card.Entries | Where-Object Name -eq 'IsEnabled'
+        Assert ($badge.Path -eq 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -and $badge.Preferred -eq 0 -and $badge.Missing -eq 1) 'The Resume badge value is wrong.'
+        Assert ($card.RestartExplorer) 'The taskbar badge needs File Explorer to restart.'
+        # The badge value is absent until someone changes it, and absent means On.
+        function Get-EntryValue($Entry) {
+            if ($Entry.Name -eq 'IsEnabled') { return [pscustomobject]@{Status='Missing';Exists=$false;Value=$null;ValueType='';ErrorMessage=''} }
+            $value = if ($Entry.Name -eq 'value') { 0 } else { 1 }
+            [pscustomobject]@{Status='Present';Exists=$true;Value=$value;ValueType='DWord';ErrorMessage=''}
+        }
+        Assert ((Get-RegistryKindState $card).DisplayText -like '*Enabled') 'An untouched badge value did not read as Resume enabled.'
     }
     Test-Case 'Taskbar alignment is an account setting that reads a missing value as Centre' {
         $card = $script:Settings | Where-Object Id -eq 'taskbar-alignment'

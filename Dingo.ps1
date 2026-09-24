@@ -645,7 +645,10 @@ function New-Entry {
         $Preferred,
         $Alternate = '__REMOVE_VALUE__',
         [ValidateSet('DWord','QWord','String')][string]$Type = 'DWord',
-        [hashtable]$States = $null
+        [hashtable]$States = $null,
+        # What Windows means when the value is not there at all. Some values
+        # are only written once the choice is changed in Settings.
+        $Missing = $null
     )
     # States gives one value per named choice. A card that offers only a pair
     # leaves it empty and keeps using Preferred and Alternate.
@@ -654,7 +657,7 @@ function New-Entry {
         $stateMap = @{}
         foreach ($key in $States.Keys) { $stateMap[[string]$key] = $States[$key] }
     }
-    [PSCustomObject]@{ Scope=$Scope; Path=$Path; Name=$Name; Preferred=$Preferred; Alternate=$Alternate; Type=$Type; States=$stateMap }
+    [PSCustomObject]@{ Scope=$Scope; Path=$Path; Name=$Name; Preferred=$Preferred; Alternate=$Alternate; Type=$Type; States=$stateMap; Missing=$Missing }
 }
 
 function Get-EntryWantedValue($Entry, [string]$DesiredState, $Setting) {
@@ -674,6 +677,15 @@ function Get-SettingSection([string]$TabName) {
 
 # The Tweaks tabs, in the order they are shown. A tweak sits on the tab named by
 # its area, and a pill on the card says who it affects.
+# Tweaks that people may look for on another tab. Each one leaves a signpost
+# there, so nobody decides Dingo lacks a setting it has.
+function Get-TweakSignposts {
+    @(
+        [PSCustomObject]@{ Tab='Taskbar'; Id='resume'; Text='Cross-device Resume, and its badge on the taskbar, is on the Windows features tab, because it turns off the whole Resume feature.' },
+        [PSCustomObject]@{ Tab='Taskbar'; Id='windows-copilot'; Text='The Copilot taskbar button is on the Windows features tab, as part of Windows Copilot and taskbar icon, because that card turns off Copilot itself as well as the button.' }
+    )
+}
+
 function Get-TweakTabOrder {
     @('Region & language','Windows features','Microsoft Edge','Windows Update','Taskbar','File Explorer','Start menu','Windows Terminal')
 }
@@ -3210,14 +3222,10 @@ function Get-Settings {
         (New-Entry User $advanced 'ShowTaskViewButton' 0 $script:RemoveValue)
     ) $true))
     [void]$settings.Add((New-Setting 'widgets' 'Taskbar' 'Windows Widgets' 'Remove the Windows Widgets packages from this Windows account. Other user profiles are left unchanged.' 'Removed' $null 'WidgetsPackage' @() $true $true))
-    [void]$settings.Add((New-Setting 'resume' 'Taskbar' 'Cross-device Resume' 'Disable or enable activity hand-off from linked devices.' 'Disabled' 'Enabled' 'Registry' @(
-        (New-Entry User 'Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsResumeAllowed' 0 1),
-        (New-Entry Machine 'SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume' 'value' 1 0)
-    )))
     # Windows 11 writes no TaskbarAl value until the choice is changed, and a
-    # missing value means Centre. Get-RegistryKindState reads it that way.
+    # missing value means Centre.
     [void]$settings.Add((New-Setting 'taskbar-alignment' 'Taskbar' 'Taskbar alignment' 'Line up the taskbar buttons in the centre, or on the left as in older versions of Windows.' 'Centre' 'Left' 'Registry' @(
-        (New-Entry User $advanced 'TaskbarAl' 1 0)
+        (New-Entry User $advanced 'TaskbarAl' 1 0 -Missing 1)
     ) $true -DefaultStateText 'Centre'))
     [void]$settings.Add((New-Setting 'taskbar-combine' 'Taskbar' 'Combine taskbar buttons' 'Choose whether taskbar buttons are combined.' 'Never combine' 'Always combine' 'Registry' @(
         (New-Entry User $advanced 'TaskbarGlomLevel' 2 $script:RemoveValue),
@@ -3250,12 +3258,22 @@ function Get-Settings {
         (New-Entry Machine 'SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSyncNGSC' 1 $script:RemoveValue),
         (New-Entry Machine 'SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSync' 1 $script:RemoveValue)
     ) $false $true))
-    [void]$settings.Add((New-Setting 'windows-copilot' 'Windows features' 'Windows Copilot and taskbar icon' 'Disables legacy Windows Copilot integration and removes detectable Copilot taskbar shortcuts. It does not uninstall standalone apps; a packaged-app pin may need to be unpinned manually.' 'Disabled' 'Enabled/default' 'Registry' @(
+    [void]$settings.Add((New-Setting 'windows-copilot' 'Windows features' 'Windows Copilot and taskbar icon' 'Turns off the built-in Windows Copilot by policy, hides the Copilot taskbar button, and removes the Copilot taskbar pins Dingo can find. It does not uninstall the Copilot app; a pin for that app may need to be removed by hand.' 'Disabled' 'Enabled/default' 'Registry' @(
         (New-Entry Machine 'SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1 $script:RemoveValue),
         (New-Entry ElevatedUser 'Software\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1 $script:RemoveValue),
         (New-Entry User $advanced 'ShowCopilotButton' 0 1),
         (New-Entry User 'SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsCopilot' 'AllowCopilotRuntime' 0 1)
     ) $true $true))
+
+    # Windows shows two Resume switches. Settings > Apps > Resume turns the
+    # feature off (IsResumeAllowed, and the policy for every account).
+    # Settings > Personalisation > Taskbar > Resume only hides the taskbar badge,
+    # and that switch writes IsEnabled. The badge value is absent until changed.
+    [void]$settings.Add((New-Setting 'resume' 'Windows features' 'Cross-device Resume' 'Turn off Resume, which offers to continue on this PC an app or file you were using on a linked phone. Also hides the Resume badge on the taskbar. Windows shows these as Settings > Apps > Resume and Settings > Personalisation > Taskbar > Resume.' 'Disabled' 'Enabled' 'Registry' @(
+        (New-Entry User 'Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsResumeAllowed' 0 1),
+        (New-Entry User $advanced 'IsEnabled' 0 1 -Missing 1),
+        (New-Entry Machine 'SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume' 'value' 1 0)
+    ) $true))
 
     [void]$settings.Add((New-Setting 'windows-update' 'Windows Update' 'Forensic continuity: manual update configuration' 'CAUTION: configures registry policies for manual update maintenance and suppresses update notifications, including restart warnings. Dingo verifies the stored values, not effective restart prevention. Pending restarts, Windows policy prerequisites, and organisation management can affect behavior. Schedule maintenance and independently check restart conditions before processing evidence.' 'Configured; manual maintenance' 'Windows-managed/default' 'Registry' @(
         (New-Entry Machine $windowsUpdateAU 'NoAutoUpdate' 1 $script:RemoveValue),
@@ -3420,6 +3438,9 @@ function Test-EntryValue($Entry, $Expected) {
         throw "Could not read $(Get-EntryPath $Entry)\$($Entry.Name): $($actual.ErrorMessage)"
     }
     if ($Expected -eq $script:RemoveValue) { return -not $actual.Exists }
+    # A value Windows has not written yet still counts as its documented default.
+    $missingProperty = $Entry.PSObject.Properties['Missing']
+    if (-not $actual.Exists -and $missingProperty -and $null -ne $missingProperty.Value) { return [string]$missingProperty.Value -ceq [string]$Expected }
     return $actual.Exists -and $actual.ValueType -eq $Entry.Type -and ([string]$actual.Value -ceq [string]$Expected)
 }
 
@@ -4033,9 +4054,6 @@ function Get-RegistryKindState($Setting) {
     }
     if (@($Setting.Entries | Where-Object { $_.Path -match '(^SOFTWARE\\Policies\\|PolicyManager\\)' }).Count -and $state.Status -in @('Preferred','Alternate') -and $state.DisplayText -notlike 'Configured*') {
         $state.DisplayText = "Configured: $($state.DisplayText)"
-    }
-    if ($Setting.Id -eq 'taskbar-alignment' -and $state.Status -eq 'Partial' -and -not (Get-EntryValue @($Setting.Entries)[0]).Exists) {
-        return New-StateResultForSetting $Setting $Setting.PreferredState
     }
     return $state
 }
@@ -6695,6 +6713,42 @@ foreach ($item in (Get-CardDisplayOrder $script:Settings)) {
     }
 }
 
+# A signpost is not a setting. It has no switch, and its button only takes you
+# to the tab where the real card is.
+$script:SignpostControls = New-Object System.Collections.ArrayList
+foreach ($signpost in (Get-TweakSignposts)) {
+    $target = $script:Settings | Where-Object Id -eq $signpost.Id | Select-Object -First 1
+    if (-not $target) { throw "Signpost on '$($signpost.Tab)' points at unknown setting '$($signpost.Id)'." }
+    if ($target.Tab -eq $signpost.Tab) { throw "Signpost for '$($signpost.Id)' sits on the tab that already holds its card." }
+    $border = New-Object Windows.Controls.Border
+    $border.Background = '#F5F7FA'
+    $border.BorderBrush = '#CBD2D9'
+    $border.BorderThickness = '1'
+    $border.CornerRadius = '4'
+    $border.Padding = '12'
+    $border.Margin = '0,0,0,8'
+    $row = New-Object Windows.Controls.DockPanel
+    $button = New-Object Windows.Controls.Button
+    $button.Content = "Go to $($target.Tab)"
+    $button.VerticalAlignment = 'Center'
+    $button.Tag = $target
+    $button.Add_Click({
+        param($sender, $eventArgs)
+        $card = $sender.Tag
+        $TweakTabs.SelectedItem = @($TweakTabs.Items | Where-Object { $_.Header -eq $card.Tab })[0]
+        $card.CardControl.BringIntoView()
+    })
+    [Windows.Controls.DockPanel]::SetDock($button, 'Right')
+    [void]$row.Children.Add($button)
+    $words = New-Object Windows.Controls.StackPanel
+    [void]$words.Children.Add((New-CardText $target.Name 15 'SemiBold' '#52606D'))
+    [void]$words.Children.Add((New-CardText $signpost.Text 12 'Normal' '#52606D'))
+    [void]$row.Children.Add($words)
+    $border.Child = $row
+    [void]$script:TweakPanels[$signpost.Tab].Children.Add($border)
+    [void]$script:SignpostControls.Add([PSCustomObject]@{ Signpost=$signpost; Control=$border; Button=$button })
+}
+
 # The search box hides cards, it does not unselect them. A tool you already
 # turned on stays in the plan while it is out of sight, so a half-typed search
 # can never quietly drop a tool from the run.
@@ -6763,6 +6817,13 @@ if ($UiSelfTest) {
     $tweakHeaders = @($TweakTabs.Items | ForEach-Object { [string]$_.Header })
     if (($tweakHeaders -join '|') -ne ((Get-TweakTabOrder) -join '|')) { throw "The Tweaks tabs are out of order: $($tweakHeaders -join ', ')" }
     if (@($script:Settings | Where-Object { $_.Section -eq 'Tweaks' -and -not $_.ScopeBadgeControl }).Count) { throw 'Every tweak card must show who it affects.' }
+    foreach ($shown in $script:SignpostControls) {
+        if (-not $script:TweakPanels[$shown.Signpost.Tab].Children.Contains($shown.Control)) { throw "The signpost for '$($shown.Signpost.Id)' is not on the $($shown.Signpost.Tab) tab." }
+        $shown.Button.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+        $wanted = ($script:Settings | Where-Object Id -eq $shown.Signpost.Id).Tab
+        if ([string]$TweakTabs.SelectedItem.Header -ne $wanted) { throw "The signpost for '$($shown.Signpost.Id)' did not open the $wanted tab." }
+    }
+    $TweakTabs.SelectedIndex = 0
     if ($ToolTabs.Items.Count -ne @($script:Settings | Where-Object { $_.Section -eq 'Tools' } | Group-Object Tab).Count) {
         throw 'The Tools section does not hold exactly the tool tabs.'
     }
