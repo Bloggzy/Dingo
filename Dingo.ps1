@@ -672,6 +672,12 @@ function Get-SettingSection([string]$TabName) {
     return 'Tweaks'
 }
 
+# The Tweaks tabs, in the order they are shown. A tweak sits on the tab named by
+# its area, and a pill on the card says who it affects.
+function Get-TweakTabOrder {
+    @('Region & language','Windows features','Microsoft Edge','Windows Update','Taskbar','File Explorer','Start menu','Windows Terminal')
+}
+
 function New-Setting {
     param(
         [string]$Id,
@@ -715,8 +721,8 @@ function New-Setting {
     } else {
         $AlternateState
     }
-    # Cards are grouped by who a setting affects unless it declares its own tab.
-    $tabName = if ([string]::IsNullOrWhiteSpace($Tab)) { $displayScope } else { $Tab }
+    # Cards are grouped by the area they change unless they declare their own tab.
+    $tabName = if ([string]::IsNullOrWhiteSpace($Tab)) { $Category } else { $Tab }
     $sectionName = Get-SettingSection $tabName
     [PSCustomObject]@{
         Selected=$false; Id=$Id; Category=$Category; Name=$Name; Description=$Description
@@ -3208,6 +3214,11 @@ function Get-Settings {
         (New-Entry User 'Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsResumeAllowed' 0 1),
         (New-Entry Machine 'SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume' 'value' 1 0)
     )))
+    # Windows 11 writes no TaskbarAl value until the choice is changed, and a
+    # missing value means Centre. Get-RegistryKindState reads it that way.
+    [void]$settings.Add((New-Setting 'taskbar-alignment' 'Taskbar' 'Taskbar alignment' 'Line up the taskbar buttons in the centre, or on the left as in older versions of Windows.' 'Centre' 'Left' 'Registry' @(
+        (New-Entry User $advanced 'TaskbarAl' 1 0)
+    ) $true -DefaultStateText 'Centre'))
     [void]$settings.Add((New-Setting 'taskbar-combine' 'Taskbar' 'Combine taskbar buttons' 'Choose whether taskbar buttons are combined.' 'Never combine' 'Always combine' 'Registry' @(
         (New-Entry User $advanced 'TaskbarGlomLevel' 2 $script:RemoveValue),
         (New-Entry User $advanced 'MMTaskbarGlomLevel' 2 $script:RemoveValue)
@@ -3231,7 +3242,7 @@ function Get-Settings {
     [void]$settings.Add((New-Setting 'expand-nav' 'File Explorer' 'Expand navigation pane' 'Expand the navigation tree to the current folder.' 'Enabled' 'Disabled' 'Registry' @(
         (New-Entry User $advanced 'NavPaneExpandToCurrentFolder' 1 $script:RemoveValue)
     ) $true))
-    [void]$settings.Add((New-Setting 'long-paths' 'File Explorer' 'Win32 long paths' 'Allow long-path-aware applications to exceed MAX_PATH.' 'Enabled' 'Disabled/default' 'Registry' @(
+    [void]$settings.Add((New-Setting 'long-paths' 'Windows features' 'Win32 long paths' 'Allow long-path-aware applications to exceed MAX_PATH.' 'Enabled' 'Disabled/default' 'Registry' @(
         (New-Entry Machine 'SYSTEM\CurrentControlSet\Control\FileSystem' 'LongPathsEnabled' 1 0)
     ) $false $true))
 
@@ -4022,6 +4033,9 @@ function Get-RegistryKindState($Setting) {
     }
     if (@($Setting.Entries | Where-Object { $_.Path -match '(^SOFTWARE\\Policies\\|PolicyManager\\)' }).Count -and $state.Status -in @('Preferred','Alternate') -and $state.DisplayText -notlike 'Configured*') {
         $state.DisplayText = "Configured: $($state.DisplayText)"
+    }
+    if ($Setting.Id -eq 'taskbar-alignment' -and $state.Status -eq 'Partial' -and -not (Get-EntryValue @($Setting.Entries)[0]).Exists) {
+        return New-StateResultForSetting $Setting $Setting.PreferredState
     }
     return $state
 }
@@ -4930,7 +4944,7 @@ if ($FinalizeInternationalSettings) {
 
 if ($SelfTest) {
     # Tools.json may add tools, so the total is the fixed settings plus the catalog.
-    $expectedSettingCount = 30 + @(Get-ToolCatalog).Count + @(Get-ToolCatalog | Where-Object { @($_.Associations).Count }).Count
+    $expectedSettingCount = 31 + @(Get-ToolCatalog).Count + @(Get-ToolCatalog | Where-Object { @($_.Associations).Count }).Count
     if ($script:Settings.Count -ne $expectedSettingCount) { throw "Expected $expectedSettingCount settings, found $($script:Settings.Count)." }
     foreach ($workerHelper in @('Test-DisplayLanguagePackInstalled','Install-DisplayLanguagePack','Write-Utf8FileAtomically','New-ApplyResult','New-OperationComponent')) {
         if (-not (Get-Command $workerHelper -CommandType Function -ErrorAction SilentlyContinue)) { throw "Elevated-worker helper is unavailable: $workerHelper" }
@@ -6150,41 +6164,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
             <Button Name="NeededButton" Content="Select only settings that need changing"/>
             <TextBlock Text="These two buttons act on the Tweaks section only." VerticalAlignment="Center" Foreground="#52606D" Margin="12,0,0,0"/>
           </WrapPanel>
-        <TabControl Name="TweakTabs" Grid.Row="1" BorderThickness="0" Margin="0,6,0,0" FontSize="14">
-          <TabItem Header="My account">
-            <Grid>
-              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-              <Border Background="#EAF4FF" Padding="12" Margin="8">
-                <TextBlock Name="UserScopeText" Text="These settings affect only your signed-in Windows account. Most run directly as you; Windows may request administrator approval for a protected policy, but Dingo still targets your account." TextWrapping="Wrap"/>
-              </Border>
-              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <StackPanel Name="UserSettingsPanel" Margin="8,0,8,8"/>
-              </ScrollViewer>
-            </Grid>
-          </TabItem>
-          <TabItem Header="Whole computer">
-            <Grid>
-              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-              <Border Background="#FFF4DF" Padding="12" Margin="8">
-                <TextBlock Text="These settings affect everyone who uses this computer. Windows will ask for an administrator account when you apply them." TextWrapping="Wrap"/>
-              </Border>
-              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <StackPanel Name="SystemSettingsPanel" Margin="8,0,8,8"/>
-              </ScrollViewer>
-            </Grid>
-          </TabItem>
-          <TabItem Header="My account + whole computer">
-            <Grid>
-              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-              <Border Background="#F2EBFF" Padding="12" Margin="8">
-                <TextBlock Name="BothScopeText" Text="These choices have two parts: one for your account and one for the whole computer. Administrator approval is needed for the computer-wide part." TextWrapping="Wrap"/>
-              </Border>
-              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <StackPanel Name="BothSettingsPanel" Margin="8,0,8,8"/>
-              </ScrollViewer>
-            </Grid>
-          </TabItem>
-        </TabControl>
+        <TabControl Name="TweakTabs" Grid.Row="1" BorderThickness="0" Margin="0,6,0,0" FontSize="14"/>
         </Grid>
       </TabItem>
       <TabItem Header="Tools">
@@ -6289,12 +6269,25 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $script:DingoWindow = $window
-foreach ($name in @('TitleText','IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','ToolFilterTextBox','ToolFilterClearButton','ToolFilterCountText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','AllToolsButton','MissingToolsButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
+foreach ($name in @('TitleText','IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','ToolFilterTextBox','ToolFilterClearButton','ToolFilterCountText','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','AllToolsButton','MissingToolsButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
-$desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$UserScopeText.Text = "These settings affect only $desktopIdentity. A gold 'Admin approval required' label identifies a protected per-account policy that needs elevation."
-$BothScopeText.Text = "These choices affect $desktopIdentity and the whole computer. Administrator approval is used only for the computer-wide part."
+# One tab per area of Windows. The pills on each card say who a tweak affects,
+# so the tab does not have to.
+$script:TweakPanels = @{}
+foreach ($tabName in (Get-TweakTabOrder)) {
+    $scroll = New-Object Windows.Controls.ScrollViewer
+    $scroll.VerticalScrollBarVisibility = 'Auto'
+    $scroll.HorizontalScrollBarVisibility = 'Disabled'
+    $panel = New-Object Windows.Controls.StackPanel
+    $panel.Margin = '8,8,8,8'
+    $scroll.Content = $panel
+    $tabItem = New-Object Windows.Controls.TabItem
+    $tabItem.Header = $tabName
+    $tabItem.Content = $scroll
+    [void]$TweakTabs.Items.Add($tabItem)
+    $script:TweakPanels[$tabName] = $panel
+}
 $ToolsScopeText.Text = "Installed leaves an existing tool unchanged and installs it only if missing. Choose Update installed tool explicitly to update it. Dingo never removes a tool. Add more tools with Tools.json beside Dingo.ps1. Shortcuts and command-line access are on the next tab."
 if ($script:ToolCatalogWarning) {
     $ToolsScopeText.Text = "$($script:ToolCatalogWarning) The built-in tool list is being used instead."
@@ -6380,6 +6373,30 @@ function New-CardText {
 function Add-CardColumn($Grid, $Control, [int]$Column) {
     [Windows.Controls.Grid]::SetColumn($Control, $Column)
     [void]$Grid.Children.Add($Control)
+}
+
+# The words and colours of the pill that says who a tweak affects.
+function Get-ScopePill([string]$DisplayScope) {
+    switch ($DisplayScope) {
+        'User' { [PSCustomObject]@{ Text='Account only'; Background='#EAF4FF'; Foreground='#1D4E89'; ToolTip='This setting changes only the Windows account you are signed in with. Other accounts on this computer are left alone.' } }
+        'System' { [PSCustomObject]@{ Text='Whole computer'; Background='#E4E7EB'; Foreground='#323F4B'; ToolTip='This setting changes the whole computer, so it affects every account that signs in to it.' } }
+        'Both' { [PSCustomObject]@{ Text='Account + computer'; Background='#F2EBFF'; Foreground='#5B3A99'; ToolTip='This setting has two parts: one for the account you are signed in with, and one for the whole computer.' } }
+        default { throw "Unknown display scope '$DisplayScope'." }
+    }
+}
+
+function New-CardPill([string]$Text, [string]$Background, [string]$Foreground, [string]$ToolTip) {
+    $pill = New-Object Windows.Controls.Border
+    $pill.Background = $Background
+    $pill.CornerRadius = '9'
+    $pill.Padding = '7,2'
+    $pill.Margin = '0,0,6,0'
+    $pill.HorizontalAlignment = 'Left'
+    $pill.ToolTip = $ToolTip
+    $pillText = New-CardText $Text 10 'SemiBold' $Foreground
+    $pillText.Margin = '0'
+    $pill.Child = $pillText
+    return $pill
 }
 
 function Request-AdministratorStop($Pending) {
@@ -6522,26 +6539,30 @@ function New-SettingCard($Item) {
 
     $about = New-Object Windows.Controls.StackPanel
     [void]$about.Children.Add((New-CardText $Item.Name 15 'SemiBold' '#17212B'))
-    [void]$about.Children.Add((New-CardText $Item.Category 11 'SemiBold' '#627D98'))
-    [void]$about.Children.Add((New-CardText $Item.Description 12 'Normal' '#52606D'))
+    # A tweak's tab already names its area, so its card shows who it affects
+    # instead. A tool card keeps its category, because its tab does not say it.
+    if ($Item.Section -ne 'Tweaks') {
+        [void]$about.Children.Add((New-CardText $Item.Category 11 'SemiBold' '#627D98'))
+    }
+    $pills = New-Object Windows.Controls.WrapPanel
+    $pills.Margin = '0,7,0,0'
+    $scopeBadge = $null
+    if ($Item.Section -eq 'Tweaks') {
+        $scopePill = Get-ScopePill $Item.DisplayScope
+        $scopeBadge = New-CardPill $scopePill.Text $scopePill.Background $scopePill.Foreground $scopePill.ToolTip
+        [void]$pills.Children.Add($scopeBadge)
+    }
     $adminBadge = $null
     if ($Item.RequiresAdmin) {
-        $adminBadge = New-Object Windows.Controls.Border
-        $adminBadge.Background = '#FFF4DF'
-        $adminBadge.CornerRadius = '9'
-        $adminBadge.Padding = '7,2'
-        $adminBadge.Margin = '0,7,0,0'
-        $adminBadge.HorizontalAlignment = 'Left'
-        $adminBadge.ToolTip = if ($Item.DisplayScope -eq 'User') {
+        $adminToolTip = if ($Item.DisplayScope -eq 'User') {
             'This setting affects only your account, but Windows protects its policy value and requires administrator approval to change it.'
         } else {
             'This setting includes a computer-wide change and requires administrator approval.'
         }
-        $badgeText = New-CardText 'Admin approval required' 10 'SemiBold' '#8A4B08'
-        $badgeText.Margin = '0'
-        $adminBadge.Child = $badgeText
-        [void]$about.Children.Add($adminBadge)
+        $adminBadge = New-CardPill 'Admin approval required' '#FFF4DF' '#8A4B08' $adminToolTip
+        [void]$pills.Children.Add($adminBadge)
     }
+    if ($pills.Children.Count) { [void]$about.Children.Add($pills) }
     # Show a caveat that applying the setting cannot resolve, so the card never
     # implies a result Windows or the target application will not honour.
     $advisory = Get-SettingAdvisory $Item
@@ -6635,6 +6656,7 @@ function New-SettingCard($Item) {
     $Item | Add-Member -NotePropertyName DetailsControl -NotePropertyValue $detailsText -Force
     $Item | Add-Member -NotePropertyName ChoiceControls -NotePropertyValue $choiceControls -Force
     $Item | Add-Member -NotePropertyName AdminBadgeControl -NotePropertyValue $adminBadge -Force
+    $Item | Add-Member -NotePropertyName ScopeBadgeControl -NotePropertyValue $scopeBadge -Force
     $Item | Add-Member -NotePropertyName AdvisoryControl -NotePropertyValue $advisoryText -Force
     Update-CardAdvisory $Item
     return $border
@@ -6660,10 +6682,12 @@ function Get-CardDisplayOrder($Items) {
 foreach ($item in (Get-CardDisplayOrder $script:Settings)) {
     $card = New-SettingCard $item
     $item | Add-Member -NotePropertyName CardControl -NotePropertyValue $card -Force
+    if ($item.Section -eq 'Tweaks') {
+        if (-not $script:TweakPanels.ContainsKey($item.Tab)) { throw "Setting '$($item.Id)' asks for unknown tab '$($item.Tab)'." }
+        [void]$script:TweakPanels[$item.Tab].Children.Add($card)
+        continue
+    }
     switch ($item.Tab) {
-        'User' { [void]$UserSettingsPanel.Children.Add($card) }
-        'System' { [void]$SystemSettingsPanel.Children.Add($card) }
-        'Both' { [void]$BothSettingsPanel.Children.Add($card) }
         'Install tools' { [void]$ToolSettingsPanel.Children.Add($card) }
         'Tool shortcuts' { [void]$ShortcutSettingsPanel.Children.Add($card) }
         'File associations' { [void]$AssociationSettingsPanel.Children.Add($card) }
@@ -6736,6 +6760,9 @@ if ($UiSelfTest) {
     if ($TweakTabs.Items.Count -ne @($script:Settings | Where-Object { $_.Section -eq 'Tweaks' } | Group-Object Tab).Count) {
         throw 'The Tweaks section does not hold exactly the tweak tabs.'
     }
+    $tweakHeaders = @($TweakTabs.Items | ForEach-Object { [string]$_.Header })
+    if (($tweakHeaders -join '|') -ne ((Get-TweakTabOrder) -join '|')) { throw "The Tweaks tabs are out of order: $($tweakHeaders -join ', ')" }
+    if (@($script:Settings | Where-Object { $_.Section -eq 'Tweaks' -and -not $_.ScopeBadgeControl }).Count) { throw 'Every tweak card must show who it affects.' }
     if ($ToolTabs.Items.Count -ne @($script:Settings | Where-Object { $_.Section -eq 'Tools' } | Group-Object Tab).Count) {
         throw 'The Tools section does not hold exactly the tool tabs.'
     }

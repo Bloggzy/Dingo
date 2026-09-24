@@ -19,7 +19,7 @@ Current version: **0.8.6**.
 1. Copy the whole Dingo folder to the machine.
 2. Double-click `Start-Dingo.cmd`. Do **not** use *Run as administrator*. Dingo asks for administrator rights later, only when it needs them.
 3. Pick a section:
-   - **Tweaks** - Windows settings (My account / Whole computer).
+   - **Tweaks** - Windows settings, with one tab per area: Region & language, Windows features, Microsoft Edge, Windows Update, Taskbar, File Explorer, Start menu, and Windows Terminal. A pill on each card says who it affects: **Account only**, **Whole computer**, or **Account + computer**. A gold pill marks a tweak that needs admin approval.
    - **Tools** - Install tools, Tool shortcuts, File associations.
    - **Options** - Dingo's own choices, such as the log folder and where tools are installed.
 4. Turn on the switch on each card you want. Or press **Choose all my preferred settings** in Tweaks, and **Choose all tools** in Tools.
@@ -180,6 +180,7 @@ Each card offers a list to choose from.
 | `task-view` | Task View button | no | Hidden |
 | `widgets` | Windows Widgets | no | Removed for this account |
 | `resume` | Cross-device Resume | yes | Disabled |
+| `taskbar-alignment` | Taskbar alignment | no | Centre |
 | `taskbar-combine` | Combine taskbar buttons | no | Never combine |
 | `end-task` | End task on right-click | no | Enabled |
 
@@ -192,7 +193,6 @@ Each card offers a list to choose from.
 | `file-extensions` | File-name extensions | no | Shown |
 | `protected-files` | Protected system files | no | Shown (caution) |
 | `expand-nav` | Expand navigation pane | no | Enabled |
-| `long-paths` | Win32 long paths | yes | Enabled |
 
 ### Windows features and updates
 
@@ -200,6 +200,7 @@ Each card offers a list to choose from.
 | --- | --- | --- | --- |
 | `onedrive` | OneDrive file sync | yes | Disabled by policy |
 | `windows-copilot` | Windows Copilot | yes | Disabled |
+| `long-paths` | Win32 long paths | yes | Enabled |
 | `windows-update` | Manual update configuration | yes | Configured |
 
 ### Microsoft Edge

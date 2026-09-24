@@ -518,9 +518,15 @@ try {
             Assert ($SummaryText.TextWrapping -eq [Windows.TextWrapping]::Wrap) 'Completion guidance cannot wrap within its own row.'
             function Get-SettingAdvisory { '' }
             $script:Settings = Get-Settings
-            $panels = @{ User='UserSettingsPanel'; System='SystemSettingsPanel'; Both='BothSettingsPanel'; 'Install tools'='ToolSettingsPanel'; 'Tool shortcuts'='ShortcutSettingsPanel'; 'File associations'='AssociationSettingsPanel' }
+            # The tweak tabs are built in code, so tweak cards go on a spare panel here.
+            $panels = @{ 'Install tools'='ToolSettingsPanel'; 'Tool shortcuts'='ShortcutSettingsPanel'; 'File associations'='AssociationSettingsPanel' }
+            $tweakPanel = New-Object Windows.Controls.StackPanel
             foreach ($item in $script:Settings) {
-                [void]$window.FindName($panels[$item.Tab]).Children.Add((New-SettingCard $item))
+                $panel = if ($item.Section -eq 'Tweaks') { $tweakPanel } else { $window.FindName($panels[$item.Tab]) }
+                [void]$panel.Children.Add((New-SettingCard $item))
+            }
+            foreach ($item in @($script:Settings | Where-Object Section -eq 'Tweaks')) {
+                Assert ([bool]$item.ScopeBadgeControl) "Tweak '$($item.Id)' shows no pill saying who it affects."
             }
             $script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$UncheckButton,$RefreshButton)
             Set-ActionButtonsEnabled $false
@@ -577,6 +583,39 @@ try {
         }
         Assert (@($script:Settings | Where-Object { $_.Section -eq 'Tweaks' }).Count -gt 0) 'No tweaks.'
         Assert (@($script:Settings | Where-Object { $_.Section -eq 'Tools' }).Count -gt 0) 'No tools.'
+    }
+    Test-Case 'Tweaks sit on one tab per area of Windows and say who they affect' {
+        $tweaks = @($script:Settings | Where-Object Section -eq 'Tweaks')
+        foreach ($item in $tweaks) {
+            Assert ($item.Tab -eq $item.Category) "'$($item.Id)' is on tab '$($item.Tab)', not its area '$($item.Category)'."
+            Assert ($item.Tab -in (Get-TweakTabOrder)) "'$($item.Id)' asks for tab '$($item.Tab)', which the window does not build."
+        }
+        foreach ($tabName in (Get-TweakTabOrder)) {
+            Assert (@($tweaks | Where-Object Tab -eq $tabName).Count) "The '$tabName' tab would be empty."
+        }
+        Assert ((Get-ScopePill 'User').Text -eq 'Account only') 'The account pill has the wrong words.'
+        Assert ((Get-ScopePill 'System').Text -eq 'Whole computer') 'The computer pill has the wrong words.'
+        Assert ((Get-ScopePill 'Both').Text -eq 'Account + computer') 'The two-part pill has the wrong words.'
+        Assert (($script:Settings | Where-Object Id -eq 'long-paths').Tab -eq 'Windows features') 'Win32 long paths is not with the Windows features.'
+        Assert (($script:Settings | Where-Object Id -eq 'resume').Tab -eq 'Taskbar') 'Cross-device Resume left the Taskbar, where Windows Settings shows it.'
+    }
+    Test-Case 'Taskbar alignment is an account setting that reads a missing value as Centre' {
+        $card = $script:Settings | Where-Object Id -eq 'taskbar-alignment'
+        Assert ($card.Tab -eq 'Taskbar' -and $card.DisplayScope -eq 'User' -and -not $card.RequiresAdmin) 'Taskbar alignment must be an account setting on the Taskbar tab with no admin approval.'
+        Assert ($card.PreferredState -eq 'Centre' -and $card.AlternateState -eq 'Left' -and $card.DefaultState -eq 'Centre') 'Taskbar alignment must offer Centre, preferred and default, and Left.'
+        $script:alignValue = $null
+        function Get-EntryValue($Entry) {
+            if ($null -eq $script:alignValue) { return [pscustomobject]@{Status='Missing';Exists=$false;Value=$null;ValueType='';ErrorMessage=''} }
+            [pscustomobject]@{Status='Present';Exists=$true;Value=$script:alignValue;ValueType='DWord';ErrorMessage=''}
+        }
+        $state = Get-RegistryKindState $card
+        Assert ($state.Status -eq 'Preferred' -and $state.DisplayText -eq 'Centre') "A missing value read as '$($state.DisplayText)', not Centre."
+        $script:alignValue = 0
+        Assert ((Get-RegistryKindState $card).DisplayText -eq 'Left') 'TaskbarAl 0 did not read as Left.'
+        $script:alignValue = 1
+        Assert ((Get-RegistryKindState $card).DisplayText -eq 'Centre') 'TaskbarAl 1 did not read as Centre.'
+        $script:alignValue = 7
+        Assert ((Get-RegistryKindState $card).Status -eq 'Partial') 'An unknown TaskbarAl value was read as a real choice.'
     }
     Test-Case 'Section words stand for every ID in that section' {
         foreach ($sectionName in @('Tweaks','Tools')) {
