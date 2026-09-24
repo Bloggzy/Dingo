@@ -12,7 +12,7 @@ Nothing is applied until you select it. Every change is shown on a card first, a
 
 ![Dingo main window: the Tweaks section open on the Whole computer tab, showing the Time zone, Win32 long paths and OneDrive file sync cards, with the Tweaks, Tools and Options sections across the top](Assets/Dingo-main-screen-800.jpg)
 
-Current version: **0.8.6**.
+Current version: **0.8.7**.
 
 ## Use the window
 
