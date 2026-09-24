@@ -606,38 +606,14 @@ try {
         }
         Assert (@(Get-TweakSignposts | Where-Object { $_.Tab -eq 'Taskbar' }).Id -join ',' -eq 'resume,windows-copilot') 'The Taskbar tab does not point to Resume and Copilot.'
     }
-    Test-Case 'Resume turns off the feature and the taskbar badge Settings shows' {
+    Test-Case 'Resume stays the feature switch, not the taskbar badge Windows ignores' {
         $card = $script:Settings | Where-Object Id -eq 'resume'
-        $names = @($card.Entries | ForEach-Object { $_.Name })
-        Assert ('IsResumeAllowed' -in $names -and 'IsEnabled' -in $names -and 'value' -in $names) "Resume writes $($names -join ', ')."
-        $badge = $card.Entries | Where-Object Name -eq 'IsEnabled'
-        Assert ($badge.Path -eq 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -and $badge.Preferred -eq 0 -and $badge.Missing -eq 1) 'The Resume badge value is wrong.'
-        Assert ($card.RestartExplorer) 'The taskbar badge needs File Explorer to restart.'
-        # The badge value is absent until someone changes it, and absent means On.
-        function Get-EntryValue($Entry) {
-            if ($Entry.Name -eq 'IsEnabled') { return [pscustomobject]@{Status='Missing';Exists=$false;Value=$null;ValueType='';ErrorMessage=''} }
-            $value = if ($Entry.Name -eq 'value') { 0 } else { 1 }
-            [pscustomobject]@{Status='Present';Exists=$true;Value=$value;ValueType='DWord';ErrorMessage=''}
-        }
-        Assert ((Get-RegistryKindState $card).DisplayText -like '*Enabled') 'An untouched badge value did not read as Resume enabled.'
-    }
-    Test-Case 'Taskbar alignment is an account setting that reads a missing value as Centre' {
-        $card = $script:Settings | Where-Object Id -eq 'taskbar-alignment'
-        Assert ($card.Tab -eq 'Taskbar' -and $card.DisplayScope -eq 'User' -and -not $card.RequiresAdmin) 'Taskbar alignment must be an account setting on the Taskbar tab with no admin approval.'
-        Assert ($card.PreferredState -eq 'Centre' -and $card.AlternateState -eq 'Left' -and $card.DefaultState -eq 'Centre') 'Taskbar alignment must offer Centre, preferred and default, and Left.'
-        $script:alignValue = $null
-        function Get-EntryValue($Entry) {
-            if ($null -eq $script:alignValue) { return [pscustomobject]@{Status='Missing';Exists=$false;Value=$null;ValueType='';ErrorMessage=''} }
-            [pscustomobject]@{Status='Present';Exists=$true;Value=$script:alignValue;ValueType='DWord';ErrorMessage=''}
-        }
-        $state = Get-RegistryKindState $card
-        Assert ($state.Status -eq 'Preferred' -and $state.DisplayText -eq 'Centre') "A missing value read as '$($state.DisplayText)', not Centre."
-        $script:alignValue = 0
-        Assert ((Get-RegistryKindState $card).DisplayText -eq 'Left') 'TaskbarAl 0 did not read as Left.'
-        $script:alignValue = 1
-        Assert ((Get-RegistryKindState $card).DisplayText -eq 'Centre') 'TaskbarAl 1 did not read as Centre.'
-        $script:alignValue = 7
-        Assert ((Get-RegistryKindState $card).Status -eq 'Partial') 'An unknown TaskbarAl value was read as a real choice.'
+        $names = @($card.Entries | ForEach-Object { $_.Name }) -join ','
+        Assert ($names -eq 'IsResumeAllowed,value') "Resume writes $names."
+        # Windows 11 25H2 ignores TaskbarAl and the badge's IsEnabled unless
+        # Settings writes them, so a card for either would report a change
+        # that never shows. See the comment on the Resume card.
+        Assert (-not @($script:Settings | Where-Object Id -eq 'taskbar-alignment').Count) 'A Taskbar alignment card is back, but Windows ignores TaskbarAl.'
     }
     Test-Case 'Section words stand for every ID in that section' {
         foreach ($sectionName in @('Tweaks','Tools')) {

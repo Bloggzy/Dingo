@@ -645,10 +645,7 @@ function New-Entry {
         $Preferred,
         $Alternate = '__REMOVE_VALUE__',
         [ValidateSet('DWord','QWord','String')][string]$Type = 'DWord',
-        [hashtable]$States = $null,
-        # What Windows means when the value is not there at all. Some values
-        # are only written once the choice is changed in Settings.
-        $Missing = $null
+        [hashtable]$States = $null
     )
     # States gives one value per named choice. A card that offers only a pair
     # leaves it empty and keeps using Preferred and Alternate.
@@ -657,7 +654,7 @@ function New-Entry {
         $stateMap = @{}
         foreach ($key in $States.Keys) { $stateMap[[string]$key] = $States[$key] }
     }
-    [PSCustomObject]@{ Scope=$Scope; Path=$Path; Name=$Name; Preferred=$Preferred; Alternate=$Alternate; Type=$Type; States=$stateMap; Missing=$Missing }
+    [PSCustomObject]@{ Scope=$Scope; Path=$Path; Name=$Name; Preferred=$Preferred; Alternate=$Alternate; Type=$Type; States=$stateMap }
 }
 
 function Get-EntryWantedValue($Entry, [string]$DesiredState, $Setting) {
@@ -681,7 +678,7 @@ function Get-SettingSection([string]$TabName) {
 # there, so nobody decides Dingo lacks a setting it has.
 function Get-TweakSignposts {
     @(
-        [PSCustomObject]@{ Tab='Taskbar'; Id='resume'; Text='Cross-device Resume, and its badge on the taskbar, is on the Windows features tab, because it turns off the whole Resume feature.' },
+        [PSCustomObject]@{ Tab='Taskbar'; Id='resume'; Text='Cross-device Resume is on the Windows features tab, because it turns off the whole Resume feature, not only its taskbar badge.' },
         [PSCustomObject]@{ Tab='Taskbar'; Id='windows-copilot'; Text='The Copilot taskbar button is on the Windows features tab, as part of Windows Copilot and taskbar icon, because that card turns off Copilot itself as well as the button.' }
     )
 }
@@ -3222,11 +3219,6 @@ function Get-Settings {
         (New-Entry User $advanced 'ShowTaskViewButton' 0 $script:RemoveValue)
     ) $true))
     [void]$settings.Add((New-Setting 'widgets' 'Taskbar' 'Windows Widgets' 'Remove the Windows Widgets packages from this Windows account. Other user profiles are left unchanged.' 'Removed' $null 'WidgetsPackage' @() $true $true))
-    # Windows 11 writes no TaskbarAl value until the choice is changed, and a
-    # missing value means Centre.
-    [void]$settings.Add((New-Setting 'taskbar-alignment' 'Taskbar' 'Taskbar alignment' 'Line up the taskbar buttons in the centre, or on the left as in older versions of Windows.' 'Centre' 'Left' 'Registry' @(
-        (New-Entry User $advanced 'TaskbarAl' 1 0 -Missing 1)
-    ) $true -DefaultStateText 'Centre'))
     [void]$settings.Add((New-Setting 'taskbar-combine' 'Taskbar' 'Combine taskbar buttons' 'Choose whether taskbar buttons are combined.' 'Never combine' 'Always combine' 'Registry' @(
         (New-Entry User $advanced 'TaskbarGlomLevel' 2 $script:RemoveValue),
         (New-Entry User $advanced 'MMTaskbarGlomLevel' 2 $script:RemoveValue)
@@ -3265,15 +3257,14 @@ function Get-Settings {
         (New-Entry User 'SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsCopilot' 'AllowCopilotRuntime' 0 1)
     ) $true $true))
 
-    # Windows shows two Resume switches. Settings > Apps > Resume turns the
-    # feature off (IsResumeAllowed, and the policy for every account).
-    # Settings > Personalisation > Taskbar > Resume only hides the taskbar badge,
-    # and that switch writes IsEnabled. The badge value is absent until changed.
-    [void]$settings.Add((New-Setting 'resume' 'Windows features' 'Cross-device Resume' 'Turn off Resume, which offers to continue on this PC an app or file you were using on a linked phone. Also hides the Resume badge on the taskbar. Windows shows these as Settings > Apps > Resume and Settings > Personalisation > Taskbar > Resume.' 'Disabled' 'Enabled' 'Registry' @(
+    # This is the switch under Settings > Apps > Resume, not the badge switch
+    # under Settings > Taskbar. The badge switch writes IsEnabled under
+    # Explorer\Advanced, but Windows 11 25H2 ignores that value when anything
+    # other than Settings writes it, even after a sign-out.
+    [void]$settings.Add((New-Setting 'resume' 'Windows features' 'Cross-device Resume' 'Turn off Resume, which offers to continue on this PC an app or file you were using on a linked phone. This is the switch in Settings > Apps > Resume. The Resume switch in the taskbar settings only hides a badge, and Dingo cannot change it.' 'Disabled' 'Enabled' 'Registry' @(
         (New-Entry User 'Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsResumeAllowed' 0 1),
-        (New-Entry User $advanced 'IsEnabled' 0 1 -Missing 1),
         (New-Entry Machine 'SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume' 'value' 1 0)
-    ) $true))
+    )))
 
     [void]$settings.Add((New-Setting 'windows-update' 'Windows Update' 'Forensic continuity: manual update configuration' 'CAUTION: configures registry policies for manual update maintenance and suppresses update notifications, including restart warnings. Dingo verifies the stored values, not effective restart prevention. Pending restarts, Windows policy prerequisites, and organisation management can affect behavior. Schedule maintenance and independently check restart conditions before processing evidence.' 'Configured; manual maintenance' 'Windows-managed/default' 'Registry' @(
         (New-Entry Machine $windowsUpdateAU 'NoAutoUpdate' 1 $script:RemoveValue),
@@ -3438,9 +3429,6 @@ function Test-EntryValue($Entry, $Expected) {
         throw "Could not read $(Get-EntryPath $Entry)\$($Entry.Name): $($actual.ErrorMessage)"
     }
     if ($Expected -eq $script:RemoveValue) { return -not $actual.Exists }
-    # A value Windows has not written yet still counts as its documented default.
-    $missingProperty = $Entry.PSObject.Properties['Missing']
-    if (-not $actual.Exists -and $missingProperty -and $null -ne $missingProperty.Value) { return [string]$missingProperty.Value -ceq [string]$Expected }
     return $actual.Exists -and $actual.ValueType -eq $Entry.Type -and ([string]$actual.Value -ceq [string]$Expected)
 }
 
@@ -4962,7 +4950,7 @@ if ($FinalizeInternationalSettings) {
 
 if ($SelfTest) {
     # Tools.json may add tools, so the total is the fixed settings plus the catalog.
-    $expectedSettingCount = 31 + @(Get-ToolCatalog).Count + @(Get-ToolCatalog | Where-Object { @($_.Associations).Count }).Count
+    $expectedSettingCount = 30 + @(Get-ToolCatalog).Count + @(Get-ToolCatalog | Where-Object { @($_.Associations).Count }).Count
     if ($script:Settings.Count -ne $expectedSettingCount) { throw "Expected $expectedSettingCount settings, found $($script:Settings.Count)." }
     foreach ($workerHelper in @('Test-DisplayLanguagePackInstalled','Install-DisplayLanguagePack','Write-Utf8FileAtomically','New-ApplyResult','New-OperationComponent')) {
         if (-not (Get-Command $workerHelper -CommandType Function -ErrorAction SilentlyContinue)) { throw "Elevated-worker helper is unavailable: $workerHelper" }

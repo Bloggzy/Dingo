@@ -179,7 +179,6 @@ Each card offers a list to choose from.
 | `taskbar-search` | Search box | no | Hidden |
 | `task-view` | Task View button | no | Hidden |
 | `widgets` | Windows Widgets | no | Removed for this account |
-| `taskbar-alignment` | Taskbar alignment | no | Centre |
 | `taskbar-combine` | Combine taskbar buttons | no | Never combine |
 | `end-task` | End task on right-click | no | Enabled |
 
@@ -200,7 +199,7 @@ Each card offers a list to choose from.
 | `onedrive` | OneDrive file sync | yes | Disabled by policy |
 | `windows-copilot` | Windows Copilot | yes | Disabled |
 | `long-paths` | Win32 long paths | yes | Enabled |
-| `resume` | Cross-device Resume, and its taskbar badge | yes | Disabled |
+| `resume` | Cross-device Resume | yes | Disabled |
 | `windows-update` | Manual update configuration | yes | Configured |
 
 ### Microsoft Edge
