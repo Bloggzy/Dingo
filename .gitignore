@@ -12,7 +12,3 @@ artifacts/
 
 # Your own tool catalog. Tools.example.json is the template that is tracked.
 Tools.json
-
-# Working screenshots. Only the trimmed copy the README shows is tracked, so a
-# full-desktop shot cannot be published by a stray 'git add -A'.
-Assets/Dingo-main-screen.png
