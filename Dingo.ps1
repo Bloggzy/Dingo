@@ -325,7 +325,7 @@ function Get-SettingAdvisory($Setting) {
         return "This computer has no display pack for $($Setting.DesiredState), so Windows must download one from Windows Update. That one step usually takes about ten minutes, and can hold up the whole run. Dingo waits fifteen minutes at most, stops sooner if nothing is moving, and every other selected change still runs."
     }
     if ($Setting.Id -eq 'windows-update') {
-        return 'Registry configuration only: automatic-restart prevention is not verified. This does not cancel pending or user-scheduled restarts, establish effective management policy, or guarantee an uninterrupted processing window. Update notifications, including restart warnings, are suppressed by this selection.'
+        return 'Dingo checks that the policy values are written. Whether Windows obeys them is not verified. A restart that is already pending, or that someone has scheduled, still happens, and an organisation''s management tools can override these policies. Before a long job, check Settings > Windows Update for a pending restart.'
     }
     # A caveat that Dingo cannot fix by writing the setting. Dingo still applies
     # the value, because it takes effect if the VM is later joined to a domain
@@ -672,6 +672,21 @@ function Get-SettingSection([string]$TabName) {
     return 'Tweaks'
 }
 
+# The Tweaks tabs, in the order they are shown. A tweak sits on the tab named by
+# its area, and a pill on the card says who it affects.
+# Tweaks that people may look for on another tab. Each one leaves a signpost
+# there, so nobody decides Dingo lacks a setting it has.
+function Get-TweakSignposts {
+    @(
+        [PSCustomObject]@{ Tab='Taskbar'; Id='resume'; Text='Cross-device Resume is on the Windows features tab, because it turns off the whole Resume feature, not only its taskbar badge.' },
+        [PSCustomObject]@{ Tab='Taskbar'; Id='windows-copilot'; Text='The Copilot taskbar button is on the Windows features tab, as part of Windows Copilot and taskbar icon, because that card turns off Copilot itself as well as the button.' }
+    )
+}
+
+function Get-TweakTabOrder {
+    @('Region & language','Windows features','Microsoft Edge','Windows Update','Taskbar','File Explorer','Start menu','Windows Terminal')
+}
+
 function New-Setting {
     param(
         [string]$Id,
@@ -715,8 +730,8 @@ function New-Setting {
     } else {
         $AlternateState
     }
-    # Cards are grouped by who a setting affects unless it declares its own tab.
-    $tabName = if ([string]::IsNullOrWhiteSpace($Tab)) { $displayScope } else { $Tab }
+    # Cards are grouped by the area they change unless they declare their own tab.
+    $tabName = if ([string]::IsNullOrWhiteSpace($Tab)) { $Category } else { $Tab }
     $sectionName = Get-SettingSection $tabName
     [PSCustomObject]@{
         Selected=$false; Id=$Id; Category=$Category; Name=$Name; Description=$Description
@@ -3204,10 +3219,6 @@ function Get-Settings {
         (New-Entry User $advanced 'ShowTaskViewButton' 0 $script:RemoveValue)
     ) $true))
     [void]$settings.Add((New-Setting 'widgets' 'Taskbar' 'Windows Widgets' 'Remove the Windows Widgets packages from this Windows account. Other user profiles are left unchanged.' 'Removed' $null 'WidgetsPackage' @() $true $true))
-    [void]$settings.Add((New-Setting 'resume' 'Taskbar' 'Cross-device Resume' 'Disable or enable activity hand-off from linked devices.' 'Disabled' 'Enabled' 'Registry' @(
-        (New-Entry User 'Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsResumeAllowed' 0 1),
-        (New-Entry Machine 'SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume' 'value' 1 0)
-    )))
     [void]$settings.Add((New-Setting 'taskbar-combine' 'Taskbar' 'Combine taskbar buttons' 'Choose whether taskbar buttons are combined.' 'Never combine' 'Always combine' 'Registry' @(
         (New-Entry User $advanced 'TaskbarGlomLevel' 2 $script:RemoveValue),
         (New-Entry User $advanced 'MMTaskbarGlomLevel' 2 $script:RemoveValue)
@@ -3231,7 +3242,7 @@ function Get-Settings {
     [void]$settings.Add((New-Setting 'expand-nav' 'File Explorer' 'Expand navigation pane' 'Expand the navigation tree to the current folder.' 'Enabled' 'Disabled' 'Registry' @(
         (New-Entry User $advanced 'NavPaneExpandToCurrentFolder' 1 $script:RemoveValue)
     ) $true))
-    [void]$settings.Add((New-Setting 'long-paths' 'File Explorer' 'Win32 long paths' 'Allow long-path-aware applications to exceed MAX_PATH.' 'Enabled' 'Disabled/default' 'Registry' @(
+    [void]$settings.Add((New-Setting 'long-paths' 'Windows features' 'Win32 long paths' 'Allow long-path-aware applications to exceed MAX_PATH.' 'Enabled' 'Disabled/default' 'Registry' @(
         (New-Entry Machine 'SYSTEM\CurrentControlSet\Control\FileSystem' 'LongPathsEnabled' 1 0)
     ) $false $true))
 
@@ -3239,14 +3250,23 @@ function Get-Settings {
         (New-Entry Machine 'SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSyncNGSC' 1 $script:RemoveValue),
         (New-Entry Machine 'SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSync' 1 $script:RemoveValue)
     ) $false $true))
-    [void]$settings.Add((New-Setting 'windows-copilot' 'Windows features' 'Windows Copilot and taskbar icon' 'Disables legacy Windows Copilot integration and removes detectable Copilot taskbar shortcuts. It does not uninstall standalone apps; a packaged-app pin may need to be unpinned manually.' 'Disabled' 'Enabled/default' 'Registry' @(
+    [void]$settings.Add((New-Setting 'windows-copilot' 'Windows features' 'Windows Copilot and taskbar icon' 'Turns off the built-in Windows Copilot by policy, hides the Copilot taskbar button, and removes the Copilot taskbar pins Dingo can find. It does not uninstall the Copilot app; a pin for that app may need to be removed by hand.' 'Disabled' 'Enabled/default' 'Registry' @(
         (New-Entry Machine 'SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1 $script:RemoveValue),
         (New-Entry ElevatedUser 'Software\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1 $script:RemoveValue),
         (New-Entry User $advanced 'ShowCopilotButton' 0 1),
         (New-Entry User 'SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsCopilot' 'AllowCopilotRuntime' 0 1)
     ) $true $true))
 
-    [void]$settings.Add((New-Setting 'windows-update' 'Windows Update' 'Forensic continuity: manual update configuration' 'CAUTION: configures registry policies for manual update maintenance and suppresses update notifications, including restart warnings. Dingo verifies the stored values, not effective restart prevention. Pending restarts, Windows policy prerequisites, and organisation management can affect behavior. Schedule maintenance and independently check restart conditions before processing evidence.' 'Configured; manual maintenance' 'Windows-managed/default' 'Registry' @(
+    # This is the switch under Settings > Apps > Resume, not the badge switch
+    # under Settings > Taskbar. The badge switch writes IsEnabled under
+    # Explorer\Advanced, but Windows 11 25H2 ignores that value when anything
+    # other than Settings writes it, even after a sign-out.
+    [void]$settings.Add((New-Setting 'resume' 'Windows features' 'Cross-device Resume' 'Turn off Resume, which offers to continue on this PC an app or file you were using on a linked phone. This is the switch in Settings > Apps > Resume. The Resume switch in the taskbar settings only hides a badge, and Dingo cannot change it.' 'Disabled' 'Enabled' 'Registry' @(
+        (New-Entry User 'Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsResumeAllowed' 0 1),
+        (New-Entry Machine 'SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume' 'value' 1 0)
+    )))
+
+    [void]$settings.Add((New-Setting 'windows-update' 'Windows Update' 'Automatic updates and restarts' 'Windows installs updates on its own, then restarts the computer to finish them. A restart in the middle of a long job, such as imaging a disk or processing evidence, stops the job and can lose hours of work. This tells Windows not to download or install updates by itself, and not to restart while someone is signed in. You then install updates yourself, from Settings > Windows Update, between jobs. CAUTION: it also hides update messages, including restart warnings, so updates are easy to forget. Works on Pro, Enterprise, and Education editions.' 'Manual (I choose when to update)' 'Automatic (Windows default)' 'Registry' @(
         (New-Entry Machine $windowsUpdateAU 'NoAutoUpdate' 1 $script:RemoveValue),
         (New-Entry Machine $windowsUpdateAU 'NoAutoRebootWithLoggedOnUsers' 1 $script:RemoveValue),
         (New-Entry Machine $windowsUpdate 'SetComplianceDeadlineForQU' 0 $script:RemoveValue),
@@ -5014,12 +5034,12 @@ if ($SelfTest) {
         SetUpdateNotificationLevel=1; UpdateNotificationLevel=2
         NoUpdateNotificationsDuringActiveHours=0
     }
-    if (-not $updateSetting -or $updateSetting.DisplayScope -ne 'System' -or -not $updateSetting.RequiresAdmin) { throw 'The forensic-continuity setting must be a computer-wide policy that requests elevation.' }
-    if (-not @($updateSetting.Requirements.Editions).Count) { throw 'The forensic-continuity setting must declare its supported Windows editions.' }
+    if (-not $updateSetting -or $updateSetting.DisplayScope -ne 'System' -or -not $updateSetting.RequiresAdmin) { throw 'The automatic updates setting must be a computer-wide policy that requests elevation.' }
+    if (-not @($updateSetting.Requirements.Editions).Count) { throw 'The automatic updates setting must declare its supported Windows editions.' }
     foreach ($policyName in $requiredUpdatePolicies.Keys) {
         $entry = $updateSetting.Entries | Where-Object Name -eq $policyName | Select-Object -First 1
         if (-not $entry -or $entry.Scope -ne 'Machine' -or [int]$entry.Preferred -ne [int]$requiredUpdatePolicies[$policyName] -or $entry.Alternate -ne $script:RemoveValue) {
-            throw "The forensic-continuity policy '$policyName' is absent, weakened, or not reversible."
+            throw "The automatic updates policy '$policyName' is absent, weakened, or not reversible."
         }
     }
     $protocolPath = Join-Path $env:TEMP ("Dingo-protocol-test-{0}.json" -f [Guid]::NewGuid().ToString('N'))
@@ -6150,41 +6170,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
             <Button Name="NeededButton" Content="Select only settings that need changing"/>
             <TextBlock Text="These two buttons act on the Tweaks section only." VerticalAlignment="Center" Foreground="#52606D" Margin="12,0,0,0"/>
           </WrapPanel>
-        <TabControl Name="TweakTabs" Grid.Row="1" BorderThickness="0" Margin="0,6,0,0" FontSize="14">
-          <TabItem Header="My account">
-            <Grid>
-              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-              <Border Background="#EAF4FF" Padding="12" Margin="8">
-                <TextBlock Name="UserScopeText" Text="These settings affect only your signed-in Windows account. Most run directly as you; Windows may request administrator approval for a protected policy, but Dingo still targets your account." TextWrapping="Wrap"/>
-              </Border>
-              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <StackPanel Name="UserSettingsPanel" Margin="8,0,8,8"/>
-              </ScrollViewer>
-            </Grid>
-          </TabItem>
-          <TabItem Header="Whole computer">
-            <Grid>
-              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-              <Border Background="#FFF4DF" Padding="12" Margin="8">
-                <TextBlock Text="These settings affect everyone who uses this computer. Windows will ask for an administrator account when you apply them." TextWrapping="Wrap"/>
-              </Border>
-              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <StackPanel Name="SystemSettingsPanel" Margin="8,0,8,8"/>
-              </ScrollViewer>
-            </Grid>
-          </TabItem>
-          <TabItem Header="My account + whole computer">
-            <Grid>
-              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-              <Border Background="#F2EBFF" Padding="12" Margin="8">
-                <TextBlock Name="BothScopeText" Text="These choices have two parts: one for your account and one for the whole computer. Administrator approval is needed for the computer-wide part." TextWrapping="Wrap"/>
-              </Border>
-              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <StackPanel Name="BothSettingsPanel" Margin="8,0,8,8"/>
-              </ScrollViewer>
-            </Grid>
-          </TabItem>
-        </TabControl>
+        <TabControl Name="TweakTabs" Grid.Row="1" BorderThickness="0" Margin="0,6,0,0" FontSize="14"/>
         </Grid>
       </TabItem>
       <TabItem Header="Tools">
@@ -6289,12 +6275,25 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $script:DingoWindow = $window
-foreach ($name in @('TitleText','IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','UserScopeText','BothScopeText','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','ToolFilterTextBox','ToolFilterClearButton','ToolFilterCountText','UserSettingsPanel','SystemSettingsPanel','BothSettingsPanel','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','AllToolsButton','MissingToolsButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
+foreach ($name in @('TitleText','IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','ToolFilterTextBox','ToolFilterClearButton','ToolFilterCountText','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','AllToolsButton','MissingToolsButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
-$desktopIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$UserScopeText.Text = "These settings affect only $desktopIdentity. A gold 'Admin approval required' label identifies a protected per-account policy that needs elevation."
-$BothScopeText.Text = "These choices affect $desktopIdentity and the whole computer. Administrator approval is used only for the computer-wide part."
+# One tab per area of Windows. The pills on each card say who a tweak affects,
+# so the tab does not have to.
+$script:TweakPanels = @{}
+foreach ($tabName in (Get-TweakTabOrder)) {
+    $scroll = New-Object Windows.Controls.ScrollViewer
+    $scroll.VerticalScrollBarVisibility = 'Auto'
+    $scroll.HorizontalScrollBarVisibility = 'Disabled'
+    $panel = New-Object Windows.Controls.StackPanel
+    $panel.Margin = '8,8,8,8'
+    $scroll.Content = $panel
+    $tabItem = New-Object Windows.Controls.TabItem
+    $tabItem.Header = $tabName
+    $tabItem.Content = $scroll
+    [void]$TweakTabs.Items.Add($tabItem)
+    $script:TweakPanels[$tabName] = $panel
+}
 $ToolsScopeText.Text = "Installed leaves an existing tool unchanged and installs it only if missing. Choose Update installed tool explicitly to update it. Dingo never removes a tool. Add more tools with Tools.json beside Dingo.ps1. Shortcuts and command-line access are on the next tab."
 if ($script:ToolCatalogWarning) {
     $ToolsScopeText.Text = "$($script:ToolCatalogWarning) The built-in tool list is being used instead."
@@ -6380,6 +6379,30 @@ function New-CardText {
 function Add-CardColumn($Grid, $Control, [int]$Column) {
     [Windows.Controls.Grid]::SetColumn($Control, $Column)
     [void]$Grid.Children.Add($Control)
+}
+
+# The words and colours of the pill that says who a tweak affects.
+function Get-ScopePill([string]$DisplayScope) {
+    switch ($DisplayScope) {
+        'User' { [PSCustomObject]@{ Text='Account only'; Background='#EAF4FF'; Foreground='#1D4E89'; ToolTip='This setting changes only the Windows account you are signed in with. Other accounts on this computer are left alone.' } }
+        'System' { [PSCustomObject]@{ Text='Whole computer'; Background='#E4E7EB'; Foreground='#323F4B'; ToolTip='This setting changes the whole computer, so it affects every account that signs in to it.' } }
+        'Both' { [PSCustomObject]@{ Text='Account + computer'; Background='#F2EBFF'; Foreground='#5B3A99'; ToolTip='This setting has two parts: one for the account you are signed in with, and one for the whole computer.' } }
+        default { throw "Unknown display scope '$DisplayScope'." }
+    }
+}
+
+function New-CardPill([string]$Text, [string]$Background, [string]$Foreground, [string]$ToolTip) {
+    $pill = New-Object Windows.Controls.Border
+    $pill.Background = $Background
+    $pill.CornerRadius = '9'
+    $pill.Padding = '7,2'
+    $pill.Margin = '0,0,6,0'
+    $pill.HorizontalAlignment = 'Left'
+    $pill.ToolTip = $ToolTip
+    $pillText = New-CardText $Text 10 'SemiBold' $Foreground
+    $pillText.Margin = '0'
+    $pill.Child = $pillText
+    return $pill
 }
 
 function Request-AdministratorStop($Pending) {
@@ -6522,26 +6545,32 @@ function New-SettingCard($Item) {
 
     $about = New-Object Windows.Controls.StackPanel
     [void]$about.Children.Add((New-CardText $Item.Name 15 'SemiBold' '#17212B'))
-    [void]$about.Children.Add((New-CardText $Item.Category 11 'SemiBold' '#627D98'))
-    [void]$about.Children.Add((New-CardText $Item.Description 12 'Normal' '#52606D'))
+    # A tweak's tab already names its area, so its card shows who it affects
+    # instead. A tool card keeps its category, because its tab does not say it.
+    if ($Item.Section -ne 'Tweaks') {
+        [void]$about.Children.Add((New-CardText $Item.Category 11 'SemiBold' '#627D98'))
+    }
+    $descriptionText = New-CardText $Item.Description 12 'Normal' '#52606D'
+    [void]$about.Children.Add($descriptionText)
+    $pills = New-Object Windows.Controls.WrapPanel
+    $pills.Margin = '0,7,0,0'
+    $scopeBadge = $null
+    if ($Item.Section -eq 'Tweaks') {
+        $scopePill = Get-ScopePill $Item.DisplayScope
+        $scopeBadge = New-CardPill $scopePill.Text $scopePill.Background $scopePill.Foreground $scopePill.ToolTip
+        [void]$pills.Children.Add($scopeBadge)
+    }
     $adminBadge = $null
     if ($Item.RequiresAdmin) {
-        $adminBadge = New-Object Windows.Controls.Border
-        $adminBadge.Background = '#FFF4DF'
-        $adminBadge.CornerRadius = '9'
-        $adminBadge.Padding = '7,2'
-        $adminBadge.Margin = '0,7,0,0'
-        $adminBadge.HorizontalAlignment = 'Left'
-        $adminBadge.ToolTip = if ($Item.DisplayScope -eq 'User') {
+        $adminToolTip = if ($Item.DisplayScope -eq 'User') {
             'This setting affects only your account, but Windows protects its policy value and requires administrator approval to change it.'
         } else {
             'This setting includes a computer-wide change and requires administrator approval.'
         }
-        $badgeText = New-CardText 'Admin approval required' 10 'SemiBold' '#8A4B08'
-        $badgeText.Margin = '0'
-        $adminBadge.Child = $badgeText
-        [void]$about.Children.Add($adminBadge)
+        $adminBadge = New-CardPill 'Admin approval required' '#FFF4DF' '#8A4B08' $adminToolTip
+        [void]$pills.Children.Add($adminBadge)
     }
+    if ($pills.Children.Count) { [void]$about.Children.Add($pills) }
     # Show a caveat that applying the setting cannot resolve, so the card never
     # implies a result Windows or the target application will not honour.
     $advisory = Get-SettingAdvisory $Item
@@ -6600,7 +6629,15 @@ function New-SettingCard($Item) {
     } else {
         foreach ($option in $Item.StateOptions) {
             $radio = New-Object Windows.Controls.RadioButton
-            $radio.Content = if ($option -eq $Item.PreferredState) { "$option  (my preference)" } else { [string]$option }
+            # A TextBlock rather than a plain string, so a long choice wraps
+            # inside its column instead of running under the Result column.
+            $label = if ($option -eq $Item.PreferredState) { "$option  (my preference)" } else { [string]$option }
+            $radioText = New-Object Windows.Controls.TextBlock
+            $radioText.Text = $label
+            $radioText.TextWrapping = 'Wrap'
+            $radioText.Margin = '0,0,8,0'
+            $radio.Content = $radioText
+            [Windows.Automation.AutomationProperties]::SetName($radio, $label)
             $radio.GroupName = "choice-$($Item.Id)"
             $radio.IsChecked = ($Item.DesiredState -eq $option)
             $radio.Tag = [PSCustomObject]@{ Setting=$Item; Value=[string]$option; ApplyCheck=$applyCheck }
@@ -6635,6 +6672,8 @@ function New-SettingCard($Item) {
     $Item | Add-Member -NotePropertyName DetailsControl -NotePropertyValue $detailsText -Force
     $Item | Add-Member -NotePropertyName ChoiceControls -NotePropertyValue $choiceControls -Force
     $Item | Add-Member -NotePropertyName AdminBadgeControl -NotePropertyValue $adminBadge -Force
+    $Item | Add-Member -NotePropertyName ScopeBadgeControl -NotePropertyValue $scopeBadge -Force
+    $Item | Add-Member -NotePropertyName DescriptionControl -NotePropertyValue $descriptionText -Force
     $Item | Add-Member -NotePropertyName AdvisoryControl -NotePropertyValue $advisoryText -Force
     Update-CardAdvisory $Item
     return $border
@@ -6660,15 +6699,53 @@ function Get-CardDisplayOrder($Items) {
 foreach ($item in (Get-CardDisplayOrder $script:Settings)) {
     $card = New-SettingCard $item
     $item | Add-Member -NotePropertyName CardControl -NotePropertyValue $card -Force
+    if ($item.Section -eq 'Tweaks') {
+        if (-not $script:TweakPanels.ContainsKey($item.Tab)) { throw "Setting '$($item.Id)' asks for unknown tab '$($item.Tab)'." }
+        [void]$script:TweakPanels[$item.Tab].Children.Add($card)
+        continue
+    }
     switch ($item.Tab) {
-        'User' { [void]$UserSettingsPanel.Children.Add($card) }
-        'System' { [void]$SystemSettingsPanel.Children.Add($card) }
-        'Both' { [void]$BothSettingsPanel.Children.Add($card) }
         'Install tools' { [void]$ToolSettingsPanel.Children.Add($card) }
         'Tool shortcuts' { [void]$ShortcutSettingsPanel.Children.Add($card) }
         'File associations' { [void]$AssociationSettingsPanel.Children.Add($card) }
         default { throw "Setting '$($item.Id)' asks for unknown tab '$($item.Tab)'." }
     }
+}
+
+# A signpost is not a setting. It has no switch, and its button only takes you
+# to the tab where the real card is.
+$script:SignpostControls = New-Object System.Collections.ArrayList
+foreach ($signpost in (Get-TweakSignposts)) {
+    $target = $script:Settings | Where-Object Id -eq $signpost.Id | Select-Object -First 1
+    if (-not $target) { throw "Signpost on '$($signpost.Tab)' points at unknown setting '$($signpost.Id)'." }
+    if ($target.Tab -eq $signpost.Tab) { throw "Signpost for '$($signpost.Id)' sits on the tab that already holds its card." }
+    $border = New-Object Windows.Controls.Border
+    $border.Background = '#F5F7FA'
+    $border.BorderBrush = '#CBD2D9'
+    $border.BorderThickness = '1'
+    $border.CornerRadius = '4'
+    $border.Padding = '12'
+    $border.Margin = '0,0,0,8'
+    $row = New-Object Windows.Controls.DockPanel
+    $button = New-Object Windows.Controls.Button
+    $button.Content = "Go to $($target.Tab)"
+    $button.VerticalAlignment = 'Center'
+    $button.Tag = $target
+    $button.Add_Click({
+        param($sender, $eventArgs)
+        $card = $sender.Tag
+        $TweakTabs.SelectedItem = @($TweakTabs.Items | Where-Object { $_.Header -eq $card.Tab })[0]
+        $card.CardControl.BringIntoView()
+    })
+    [Windows.Controls.DockPanel]::SetDock($button, 'Right')
+    [void]$row.Children.Add($button)
+    $words = New-Object Windows.Controls.StackPanel
+    [void]$words.Children.Add((New-CardText $target.Name 15 'SemiBold' '#52606D'))
+    [void]$words.Children.Add((New-CardText $signpost.Text 12 'Normal' '#52606D'))
+    [void]$row.Children.Add($words)
+    $border.Child = $row
+    [void]$script:TweakPanels[$signpost.Tab].Children.Add($border)
+    [void]$script:SignpostControls.Add([PSCustomObject]@{ Signpost=$signpost; Control=$border; Button=$button })
 }
 
 # The search box hides cards, it does not unselect them. A tool you already
@@ -6736,6 +6813,17 @@ if ($UiSelfTest) {
     if ($TweakTabs.Items.Count -ne @($script:Settings | Where-Object { $_.Section -eq 'Tweaks' } | Group-Object Tab).Count) {
         throw 'The Tweaks section does not hold exactly the tweak tabs.'
     }
+    $tweakHeaders = @($TweakTabs.Items | ForEach-Object { [string]$_.Header })
+    if (($tweakHeaders -join '|') -ne ((Get-TweakTabOrder) -join '|')) { throw "The Tweaks tabs are out of order: $($tweakHeaders -join ', ')" }
+    if (@($script:Settings | Where-Object { $_.Section -eq 'Tweaks' -and -not $_.ScopeBadgeControl }).Count) { throw 'Every tweak card must show who it affects.' }
+    if (@($script:Settings | Where-Object { -not $_.DescriptionControl -or $_.DescriptionControl.Text -ne $_.Description }).Count) { throw 'Every card must show its description.' }
+    foreach ($shown in $script:SignpostControls) {
+        if (-not $script:TweakPanels[$shown.Signpost.Tab].Children.Contains($shown.Control)) { throw "The signpost for '$($shown.Signpost.Id)' is not on the $($shown.Signpost.Tab) tab." }
+        $shown.Button.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+        $wanted = ($script:Settings | Where-Object Id -eq $shown.Signpost.Id).Tab
+        if ([string]$TweakTabs.SelectedItem.Header -ne $wanted) { throw "The signpost for '$($shown.Signpost.Id)' did not open the $wanted tab." }
+    }
+    $TweakTabs.SelectedIndex = 0
     if ($ToolTabs.Items.Count -ne @($script:Settings | Where-Object { $_.Section -eq 'Tools' } | Group-Object Tab).Count) {
         throw 'The Tools section does not hold exactly the tool tabs.'
     }

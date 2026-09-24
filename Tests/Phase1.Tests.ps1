@@ -518,9 +518,21 @@ try {
             Assert ($SummaryText.TextWrapping -eq [Windows.TextWrapping]::Wrap) 'Completion guidance cannot wrap within its own row.'
             function Get-SettingAdvisory { '' }
             $script:Settings = Get-Settings
-            $panels = @{ User='UserSettingsPanel'; System='SystemSettingsPanel'; Both='BothSettingsPanel'; 'Install tools'='ToolSettingsPanel'; 'Tool shortcuts'='ShortcutSettingsPanel'; 'File associations'='AssociationSettingsPanel' }
+            # The tweak tabs are built in code, so tweak cards go on a spare panel here.
+            $panels = @{ 'Install tools'='ToolSettingsPanel'; 'Tool shortcuts'='ShortcutSettingsPanel'; 'File associations'='AssociationSettingsPanel' }
+            $tweakPanel = New-Object Windows.Controls.StackPanel
             foreach ($item in $script:Settings) {
-                [void]$window.FindName($panels[$item.Tab]).Children.Add((New-SettingCard $item))
+                $panel = if ($item.Section -eq 'Tweaks') { $tweakPanel } else { $window.FindName($panels[$item.Tab]) }
+                [void]$panel.Children.Add((New-SettingCard $item))
+            }
+            foreach ($item in @($script:Settings | Where-Object Section -eq 'Tweaks')) {
+                Assert ([bool]$item.ScopeBadgeControl) "Tweak '$($item.Id)' shows no pill saying who it affects."
+            }
+            foreach ($item in $script:Settings) {
+                Assert ($item.DescriptionControl -and $item.DescriptionControl.Text -eq $item.Description -and $item.DescriptionControl.Parent) "Card '$($item.Id)' does not show its description."
+                foreach ($radio in @($item.ChoiceControls | Where-Object { $_ -is [Windows.Controls.RadioButton] })) {
+                    Assert ($radio.Content -is [Windows.Controls.TextBlock] -and $radio.Content.TextWrapping -eq 'Wrap') "A choice on '$($item.Id)' cannot wrap, so a long one runs under the Result column."
+                }
             }
             $script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$UncheckButton,$RefreshButton)
             Set-ActionButtonsEnabled $false
@@ -577,6 +589,37 @@ try {
         }
         Assert (@($script:Settings | Where-Object { $_.Section -eq 'Tweaks' }).Count -gt 0) 'No tweaks.'
         Assert (@($script:Settings | Where-Object { $_.Section -eq 'Tools' }).Count -gt 0) 'No tools.'
+    }
+    Test-Case 'Tweaks sit on one tab per area of Windows and say who they affect' {
+        $tweaks = @($script:Settings | Where-Object Section -eq 'Tweaks')
+        foreach ($item in $tweaks) {
+            Assert ($item.Tab -eq $item.Category) "'$($item.Id)' is on tab '$($item.Tab)', not its area '$($item.Category)'."
+            Assert ($item.Tab -in (Get-TweakTabOrder)) "'$($item.Id)' asks for tab '$($item.Tab)', which the window does not build."
+        }
+        foreach ($tabName in (Get-TweakTabOrder)) {
+            Assert (@($tweaks | Where-Object Tab -eq $tabName).Count) "The '$tabName' tab would be empty."
+        }
+        Assert ((Get-ScopePill 'User').Text -eq 'Account only') 'The account pill has the wrong words.'
+        Assert ((Get-ScopePill 'System').Text -eq 'Whole computer') 'The computer pill has the wrong words.'
+        Assert ((Get-ScopePill 'Both').Text -eq 'Account + computer') 'The two-part pill has the wrong words.'
+        Assert (($script:Settings | Where-Object Id -eq 'long-paths').Tab -eq 'Windows features') 'Win32 long paths is not with the Windows features.'
+        Assert (($script:Settings | Where-Object Id -eq 'resume').Tab -eq 'Windows features') 'Cross-device Resume is not with the Windows features.'
+        # A tweak people may look for on the Taskbar leaves a signpost there.
+        foreach ($signpost in (Get-TweakSignposts)) {
+            $target = $script:Settings | Where-Object Id -eq $signpost.Id
+            Assert ([bool]$target) "The signpost for '$($signpost.Id)' points at nothing."
+            Assert ($signpost.Tab -in (Get-TweakTabOrder) -and $signpost.Tab -ne $target.Tab) "The signpost for '$($signpost.Id)' is not on another tweak tab."
+        }
+        Assert (@(Get-TweakSignposts | Where-Object { $_.Tab -eq 'Taskbar' }).Id -join ',' -eq 'resume,windows-copilot') 'The Taskbar tab does not point to Resume and Copilot.'
+    }
+    Test-Case 'Resume stays the feature switch, not the taskbar badge Windows ignores' {
+        $card = $script:Settings | Where-Object Id -eq 'resume'
+        $names = @($card.Entries | ForEach-Object { $_.Name }) -join ','
+        Assert ($names -eq 'IsResumeAllowed,value') "Resume writes $names."
+        # Windows 11 25H2 ignores TaskbarAl and the badge's IsEnabled unless
+        # Settings writes them, so a card for either would report a change
+        # that never shows. See the comment on the Resume card.
+        Assert (-not @($script:Settings | Where-Object Id -eq 'taskbar-alignment').Count) 'A Taskbar alignment card is back, but Windows ignores TaskbarAl.'
     }
     Test-Case 'Section words stand for every ID in that section' {
         foreach ($sectionName in @('Tweaks','Tools')) {
