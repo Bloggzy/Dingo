@@ -200,7 +200,7 @@ Each card offers a list to choose from.
 | `windows-copilot` | Windows Copilot | yes | Disabled |
 | `long-paths` | Win32 long paths | yes | Enabled |
 | `resume` | Cross-device Resume | yes | Disabled |
-| `windows-update` | Manual update configuration | yes | Configured |
+| `windows-update` | Automatic updates and restarts | yes | Manual (you choose when to update) |
 
 ### Microsoft Edge
 

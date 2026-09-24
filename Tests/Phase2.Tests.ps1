@@ -302,8 +302,8 @@ try {
         function Test-EntryValue { $true }
         $setting=$script:Settings | Where-Object Id -eq 'windows-update'
         $state=Get-SettingState $setting
-        Assert ($state.Status -eq 'Preferred' -and $state.DisplayText -eq 'Configured; manual maintenance') 'Old protected claim remains.'
-        Assert ($state.VerificationBasis -match 'not verified' -and $state.Details -match 'automatic-restart prevention is not verified') 'Verification limit missing.'
+        Assert ($state.Status -eq 'Preferred' -and $state.DisplayText -eq 'Configured: Manual (I choose when to update)') 'Old protected claim remains.'
+        Assert ($state.VerificationBasis -match 'not verified' -and $state.Details -match 'Whether Windows obeys them is not verified') 'Verification limit missing.'
         Assert ($setting.Description -notmatch 'Prevents automatic|blocks update restarts') 'Description promises protection.'
     }
     Test-Case 'Successful registry result names its verification basis' {

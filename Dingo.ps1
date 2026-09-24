@@ -325,7 +325,7 @@ function Get-SettingAdvisory($Setting) {
         return "This computer has no display pack for $($Setting.DesiredState), so Windows must download one from Windows Update. That one step usually takes about ten minutes, and can hold up the whole run. Dingo waits fifteen minutes at most, stops sooner if nothing is moving, and every other selected change still runs."
     }
     if ($Setting.Id -eq 'windows-update') {
-        return 'Registry configuration only: automatic-restart prevention is not verified. This does not cancel pending or user-scheduled restarts, establish effective management policy, or guarantee an uninterrupted processing window. Update notifications, including restart warnings, are suppressed by this selection.'
+        return 'Dingo checks that the policy values are written. Whether Windows obeys them is not verified. A restart that is already pending, or that someone has scheduled, still happens, and an organisation''s management tools can override these policies. Before a long job, check Settings > Windows Update for a pending restart.'
     }
     # A caveat that Dingo cannot fix by writing the setting. Dingo still applies
     # the value, because it takes effect if the VM is later joined to a domain
@@ -3266,7 +3266,7 @@ function Get-Settings {
         (New-Entry Machine 'SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume' 'value' 1 0)
     )))
 
-    [void]$settings.Add((New-Setting 'windows-update' 'Windows Update' 'Forensic continuity: manual update configuration' 'CAUTION: configures registry policies for manual update maintenance and suppresses update notifications, including restart warnings. Dingo verifies the stored values, not effective restart prevention. Pending restarts, Windows policy prerequisites, and organisation management can affect behavior. Schedule maintenance and independently check restart conditions before processing evidence.' 'Configured; manual maintenance' 'Windows-managed/default' 'Registry' @(
+    [void]$settings.Add((New-Setting 'windows-update' 'Windows Update' 'Automatic updates and restarts' 'Windows installs updates on its own, then restarts the computer to finish them. A restart in the middle of a long job, such as imaging a disk or processing evidence, stops the job and can lose hours of work. This tells Windows not to download or install updates by itself, and not to restart while someone is signed in. You then install updates yourself, from Settings > Windows Update, between jobs. CAUTION: it also hides update messages, including restart warnings, so updates are easy to forget. Works on Pro, Enterprise, and Education editions.' 'Manual (I choose when to update)' 'Automatic (Windows default)' 'Registry' @(
         (New-Entry Machine $windowsUpdateAU 'NoAutoUpdate' 1 $script:RemoveValue),
         (New-Entry Machine $windowsUpdateAU 'NoAutoRebootWithLoggedOnUsers' 1 $script:RemoveValue),
         (New-Entry Machine $windowsUpdate 'SetComplianceDeadlineForQU' 0 $script:RemoveValue),
@@ -5034,12 +5034,12 @@ if ($SelfTest) {
         SetUpdateNotificationLevel=1; UpdateNotificationLevel=2
         NoUpdateNotificationsDuringActiveHours=0
     }
-    if (-not $updateSetting -or $updateSetting.DisplayScope -ne 'System' -or -not $updateSetting.RequiresAdmin) { throw 'The forensic-continuity setting must be a computer-wide policy that requests elevation.' }
-    if (-not @($updateSetting.Requirements.Editions).Count) { throw 'The forensic-continuity setting must declare its supported Windows editions.' }
+    if (-not $updateSetting -or $updateSetting.DisplayScope -ne 'System' -or -not $updateSetting.RequiresAdmin) { throw 'The automatic updates setting must be a computer-wide policy that requests elevation.' }
+    if (-not @($updateSetting.Requirements.Editions).Count) { throw 'The automatic updates setting must declare its supported Windows editions.' }
     foreach ($policyName in $requiredUpdatePolicies.Keys) {
         $entry = $updateSetting.Entries | Where-Object Name -eq $policyName | Select-Object -First 1
         if (-not $entry -or $entry.Scope -ne 'Machine' -or [int]$entry.Preferred -ne [int]$requiredUpdatePolicies[$policyName] -or $entry.Alternate -ne $script:RemoveValue) {
-            throw "The forensic-continuity policy '$policyName' is absent, weakened, or not reversible."
+            throw "The automatic updates policy '$policyName' is absent, weakened, or not reversible."
         }
     }
     $protocolPath = Join-Path $env:TEMP ("Dingo-protocol-test-{0}.json" -f [Guid]::NewGuid().ToString('N'))
