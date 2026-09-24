@@ -528,6 +528,12 @@ try {
             foreach ($item in @($script:Settings | Where-Object Section -eq 'Tweaks')) {
                 Assert ([bool]$item.ScopeBadgeControl) "Tweak '$($item.Id)' shows no pill saying who it affects."
             }
+            foreach ($item in $script:Settings) {
+                Assert ($item.DescriptionControl -and $item.DescriptionControl.Text -eq $item.Description -and $item.DescriptionControl.Parent) "Card '$($item.Id)' does not show its description."
+                foreach ($radio in @($item.ChoiceControls | Where-Object { $_ -is [Windows.Controls.RadioButton] })) {
+                    Assert ($radio.Content -is [Windows.Controls.TextBlock] -and $radio.Content.TextWrapping -eq 'Wrap') "A choice on '$($item.Id)' cannot wrap, so a long one runs under the Result column."
+                }
+            }
             $script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$UncheckButton,$RefreshButton)
             Set-ActionButtonsEnabled $false
             Assert ($SectionTabs.IsEnabled) 'The real sections are locked during apply, so the cards cannot be watched.'

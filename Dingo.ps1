@@ -6550,6 +6550,8 @@ function New-SettingCard($Item) {
     if ($Item.Section -ne 'Tweaks') {
         [void]$about.Children.Add((New-CardText $Item.Category 11 'SemiBold' '#627D98'))
     }
+    $descriptionText = New-CardText $Item.Description 12 'Normal' '#52606D'
+    [void]$about.Children.Add($descriptionText)
     $pills = New-Object Windows.Controls.WrapPanel
     $pills.Margin = '0,7,0,0'
     $scopeBadge = $null
@@ -6627,7 +6629,15 @@ function New-SettingCard($Item) {
     } else {
         foreach ($option in $Item.StateOptions) {
             $radio = New-Object Windows.Controls.RadioButton
-            $radio.Content = if ($option -eq $Item.PreferredState) { "$option  (my preference)" } else { [string]$option }
+            # A TextBlock rather than a plain string, so a long choice wraps
+            # inside its column instead of running under the Result column.
+            $label = if ($option -eq $Item.PreferredState) { "$option  (my preference)" } else { [string]$option }
+            $radioText = New-Object Windows.Controls.TextBlock
+            $radioText.Text = $label
+            $radioText.TextWrapping = 'Wrap'
+            $radioText.Margin = '0,0,8,0'
+            $radio.Content = $radioText
+            [Windows.Automation.AutomationProperties]::SetName($radio, $label)
             $radio.GroupName = "choice-$($Item.Id)"
             $radio.IsChecked = ($Item.DesiredState -eq $option)
             $radio.Tag = [PSCustomObject]@{ Setting=$Item; Value=[string]$option; ApplyCheck=$applyCheck }
@@ -6663,6 +6673,7 @@ function New-SettingCard($Item) {
     $Item | Add-Member -NotePropertyName ChoiceControls -NotePropertyValue $choiceControls -Force
     $Item | Add-Member -NotePropertyName AdminBadgeControl -NotePropertyValue $adminBadge -Force
     $Item | Add-Member -NotePropertyName ScopeBadgeControl -NotePropertyValue $scopeBadge -Force
+    $Item | Add-Member -NotePropertyName DescriptionControl -NotePropertyValue $descriptionText -Force
     $Item | Add-Member -NotePropertyName AdvisoryControl -NotePropertyValue $advisoryText -Force
     Update-CardAdvisory $Item
     return $border
@@ -6805,6 +6816,7 @@ if ($UiSelfTest) {
     $tweakHeaders = @($TweakTabs.Items | ForEach-Object { [string]$_.Header })
     if (($tweakHeaders -join '|') -ne ((Get-TweakTabOrder) -join '|')) { throw "The Tweaks tabs are out of order: $($tweakHeaders -join ', ')" }
     if (@($script:Settings | Where-Object { $_.Section -eq 'Tweaks' -and -not $_.ScopeBadgeControl }).Count) { throw 'Every tweak card must show who it affects.' }
+    if (@($script:Settings | Where-Object { -not $_.DescriptionControl -or $_.DescriptionControl.Text -ne $_.Description }).Count) { throw 'Every card must show its description.' }
     foreach ($shown in $script:SignpostControls) {
         if (-not $script:TweakPanels[$shown.Signpost.Tab].Children.Contains($shown.Control)) { throw "The signpost for '$($shown.Signpost.Id)' is not on the $($shown.Signpost.Tab) tab." }
         $shown.Button.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
