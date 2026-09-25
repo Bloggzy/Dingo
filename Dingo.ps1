@@ -4291,9 +4291,11 @@ function Get-LanguageKindState($Setting) {
     if (-not $check.DisplayPack) { [void]$parts.Add("no display pack installed for $(@($wanted.Packs) -join ' or ')") }
     if ($systemPreferred -notin $accepted -and $override -ne $wanted.Tag) { [void]$parts.Add("system UI is $systemPreferred") }
     if ($systemLocale -ne $wanted.Tag) {
-        # Signing out does not change the system locale; only a restart does.
-        # Say so, or the person signs out, sees no change, and thinks it failed.
-        if (Test-SystemLocaleAccepted $wanted.Tag) { [void]$parts.Add("system locale changes from $systemLocale to $($wanted.Tag) when Windows restarts (signing out is not enough)") }
+        # Windows has already recorded the new system locale and is not using it
+        # yet. Say so, so the person knows nothing more needs to be applied.
+        # Microsoft documents a restart for this change, but on a VDI image it
+        # also came into use without one, so the card does not say which.
+        if (Test-SystemLocaleAccepted $wanted.Tag) { [void]$parts.Add("system locale $($wanted.Tag) is set but not in use yet (Windows still uses $systemLocale)") }
         else { [void]$parts.Add("system locale is $systemLocale") }
     }
     if (-not $check.UserReady) { [void]$parts.Add("user languages: $(if ($tags) { $tags -join ', ' } else { 'none' })") }
