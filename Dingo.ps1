@@ -105,6 +105,7 @@ $script:WorkerCancelPath = ''
 $script:WorkerStep = $null
 $script:RemoveValue = '__REMOVE_VALUE__'
 $script:LanguageChangePending = $false
+$script:RegionChangedThisRun = $false
 $script:InstanceMutex = $null
 $script:PendingApply = $null
 $script:ApplyInProgress = $false
@@ -573,16 +574,17 @@ function Get-LanguageChoiceTable {
     if (-not (Get-Variable -Name LanguageChoices -Scope Script -ErrorAction SilentlyContinue)) { $script:LanguageChoices = [ordered]@{
     # Tag is what Windows is asked for. Packs is the display-language download
     # the tag needs, best first. Windows localises some English variants only
-    # through a parent pack, so those name the parent as a fallback and Dingo
-    # installs the first pack Windows actually offers.
-    'Australian English (en-AU)'   = @{ Tag='en-AU'; Packs=@('en-AU','en-GB') }
+    # through a parent pack. The parent comes first for those: it carries the
+    # whole interface, and on a managed VDI image the en-AU request ran past
+    # fifteen minutes twice while en-GB finished in under two.
+    'Australian English (en-AU)'   = @{ Tag='en-AU'; Packs=@('en-GB','en-AU') }
     'British English (en-GB)'      = @{ Tag='en-GB'; Packs=@('en-GB') }
     'American English (en-US)'     = @{ Tag='en-US'; Packs=@('en-US') }
     'Canadian English (en-CA)'     = @{ Tag='en-CA'; Packs=@('en-CA','en-US','en-GB') }
-    'New Zealand English (en-NZ)'  = @{ Tag='en-NZ'; Packs=@('en-NZ','en-GB') }
-    'Irish English (en-IE)'        = @{ Tag='en-IE'; Packs=@('en-IE','en-GB') }
-    'Indian English (en-IN)'       = @{ Tag='en-IN'; Packs=@('en-IN','en-GB') }
-    'South African English (en-ZA)'= @{ Tag='en-ZA'; Packs=@('en-ZA','en-GB') }
+    'New Zealand English (en-NZ)'  = @{ Tag='en-NZ'; Packs=@('en-GB','en-NZ') }
+    'Irish English (en-IE)'        = @{ Tag='en-IE'; Packs=@('en-GB','en-IE') }
+    'Indian English (en-IN)'       = @{ Tag='en-IN'; Packs=@('en-GB','en-IN') }
+    'South African English (en-ZA)'= @{ Tag='en-ZA'; Packs=@('en-GB','en-ZA') }
     'German (de-DE)'               = @{ Tag='de-DE'; Packs=@('de-DE') }
     'French (fr-FR)'               = @{ Tag='fr-FR'; Packs=@('fr-FR') }
     'Spanish (es-ES)'              = @{ Tag='es-ES'; Packs=@('es-ES') }
@@ -1351,8 +1353,26 @@ function Get-ToolCatalog {
 function Get-WingetPath {
     $command = Get-Command 'winget.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($command) { return $command.Source }
-    # The winget alias lives in the signed-in user's WindowsApps folder, so an
-    # elevated worker may not see it. Fall back to the installed package.
+    # The winget alias lives in each account's own WindowsApps folder, and only
+    # for an account App Installer is registered to. When the administrator
+    # worker runs as a different account, as it does on many managed VDI
+    # images, that account has no alias, and Windows refuses to start the
+    # packaged winget.exe for it with "Access is denied". Registering the
+    # package the computer already holds gives this account its own alias.
+    $alias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+    if ((Test-IsAdministrator) -and -not (Get-RunScopedFlag 'WingetRegisterAttempted')) {
+        Set-RunScopedFlag 'WingetRegisterAttempted' $true
+        try {
+            Add-AppxPackage -RegisterByFamilyName -MainPackage 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe' -ErrorAction Stop
+            Write-Log 'INFO' "Registered App Installer for $env:USERNAME, so this account has its own winget."
+        } catch {
+            Write-Log 'WARN' "Could not register App Installer for $env:USERNAME : $($_.Exception.Message)"
+        }
+    }
+    if (Test-Path -LiteralPath $alias) { return $alias }
+    # Last resort: the installed package itself. Windows starts it only for an
+    # account the package is registered to, and a launch that is refused
+    # sends Dingo to its winget repair.
     $pattern = Join-Path ${env:ProgramFiles} 'WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe'
     $candidate = @(Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1)
     if ($candidate.Count) { return $candidate[0].FullName }
@@ -1372,7 +1392,13 @@ function Get-WingetVersion([string]$WingetPath = '') {
     $winget = if ($WingetPath) { $WingetPath } else { Get-WingetPath }
     if (-not $winget) { return $null }
     try { $run = Invoke-ChildProcess $winget @('--version') 30 'The winget version check' }
-    catch { Write-Log 'WARN' "Could not read the winget version: $($_.Exception.Message)"; return $null }
+    catch {
+        # A winget that Windows will not start is not a winget with an odd
+        # version string. It can install nothing, so it must go to the repair.
+        if ($_.Exception.Message -match 'Access is denied') { Set-RunScopedFlag 'WingetLaunchDenied' $true }
+        Write-Log 'WARN' "Could not read the winget version: $($_.Exception.Message)"
+        return $null
+    }
     if ($run.ExitCode -ne 0) {
         Write-Log 'WARN' "winget --version exited with code $($run.ExitCode). $(Get-OutputTail $run.Output)"
         return $null
@@ -1390,9 +1416,11 @@ function Get-WingetVersion([string]$WingetPath = '') {
 function Test-WingetVersionSupported([string]$WingetPath = '') {
     # A version Dingo cannot read counts as supported. A changed version string
     # must never stop an install that would otherwise have worked.
+    Set-RunScopedFlag 'WingetLaunchDenied' $false
     $version = Get-WingetVersion $WingetPath
     $minimum = Get-MinimumWingetVersion
-    [PSCustomObject]@{ Supported = (-not $version -or $version -ge $minimum); Version = $version; Minimum = $minimum }
+    $denied = Get-RunScopedFlag 'WingetLaunchDenied'
+    [PSCustomObject]@{ Supported = (-not $denied -and (-not $version -or $version -ge $minimum)); Version = $version; Minimum = $minimum; Denied = $denied }
 }
 
 function Test-EndpointReachable([string]$Url, [int]$TimeoutSeconds = 20) {
@@ -1599,6 +1627,9 @@ function Complete-WingetRepair([string]$Action) {
     $repaired = Get-WingetPath
     if (-not $repaired) { throw "The winget $Action reported success, but winget is still not on this computer. Install App Installer from https://aka.ms/getwinget, then try again." }
     $after = Test-WingetVersionSupported $repaired
+    if ($after.Denied) {
+        throw "The winget $Action finished, but Windows still will not start winget for $env:USERNAME. Sign in once as $env:USERNAME so Windows sets up App Installer for that account, then try again."
+    }
     if (-not $after.Supported) {
         throw "The winget $Action finished, but winget still reports version $($after.Version), below $($after.Minimum). Install the latest App Installer from https://aka.ms/getwinget, then try again."
     }
@@ -1633,6 +1664,18 @@ function Resolve-UsableWinget([string]$WingetPath) {
         if ($check.Version) { Write-Log 'INFO' "winget reports version $($check.Version)." }
         Set-RunScopedFlag 'WingetVersionVerified' $true
         return $WingetPath
+    }
+    if ($check.Denied) {
+        Write-Log 'WARN' "Windows would not start winget for $env:USERNAME (Access is denied), so Dingo repairs it for every account."
+        if (Get-RunScopedFlag 'WingetRepairAttempted') {
+            throw "Windows will not start winget for $env:USERNAME, and the repair earlier in this run did not fix it. Sign in once as $env:USERNAME so Windows sets up App Installer for that account, or install App Installer from https://aka.ms/getwinget, then try again."
+        }
+        Set-RunScopedFlag 'WingetRepairAttempted' $true
+        if (-not (Test-IsAdministrator)) {
+            throw "Windows will not start winget for $env:USERNAME. Run Dingo as an administrator so it can repair winget, or install App Installer from https://aka.ms/getwinget yourself."
+        }
+        Repair-WingetClient
+        return (Complete-WingetRepair 'repair')
     }
     Write-Log 'WARN' "winget $($check.Version) is older than $($check.Minimum), so it cannot read the current package source."
     if (Get-RunScopedFlag 'WingetRepairAttempted') {
@@ -3219,6 +3262,7 @@ function Get-Settings {
         (New-Entry User $advanced 'ShowTaskViewButton' 0 $script:RemoveValue)
     ) $true))
     [void]$settings.Add((New-Setting 'widgets' 'Taskbar' 'Windows Widgets' 'Remove the Windows Widgets packages from this Windows account. Other user profiles are left unchanged.' 'Removed' $null 'WidgetsPackage' @() $true $true))
+    [void]$settings.Add((New-Setting 'm365-copilot' 'Taskbar' 'Microsoft 365 Copilot app' 'Remove the Microsoft 365 Copilot app from this Windows account. This takes its taskbar pin away, which Windows gives no other way to remove. Other user profiles are left unchanged, and an organisation that manages this computer can install the app again.' 'Removed' $null 'M365CopilotPackage' @() $true))
     [void]$settings.Add((New-Setting 'taskbar-combine' 'Taskbar' 'Combine taskbar buttons' 'Choose whether taskbar buttons are combined.' 'Never combine' 'Always combine' 'Registry' @(
         (New-Entry User $advanced 'TaskbarGlomLevel' 2 $script:RemoveValue),
         (New-Entry User $advanced 'MMTaskbarGlomLevel' 2 $script:RemoveValue)
@@ -3242,6 +3286,7 @@ function Get-Settings {
     [void]$settings.Add((New-Setting 'expand-nav' 'File Explorer' 'Expand navigation pane' 'Expand the navigation tree to the current folder.' 'Enabled' 'Disabled' 'Registry' @(
         (New-Entry User $advanced 'NavPaneExpandToCurrentFolder' 1 $script:RemoveValue)
     ) $true))
+    [void]$settings.Add((New-Setting 'folder-view' 'File Explorer' 'Default folder view' 'Open every folder in Details view, with name, date, type, and size columns. This also resets the view saved for each folder already opened in this account, and clears the ShellBags that record those folders.' 'Details for every folder' 'Windows default' 'FolderView' @() $true))
     [void]$settings.Add((New-Setting 'long-paths' 'Windows features' 'Win32 long paths' 'Allow long-path-aware applications to exceed MAX_PATH.' 'Enabled' 'Disabled/default' 'Registry' @(
         (New-Entry Machine 'SYSTEM\CurrentControlSet\Control\FileSystem' 'LongPathsEnabled' 1 0)
     ) $false $true))
@@ -3643,6 +3688,80 @@ function Remove-WidgetsPackages {
     Write-Log 'DEBUG' 'Verified that Windows Widgets packages are removed for the current account.'
 }
 
+# Explorer picks a folder's view from the template for its folder type. The
+# account copy of the templates overrides the computer copy, so Dingo copies
+# the computer set into the account and sets every view in it to Details. A
+# folder that was already opened keeps the view saved in its shell bag, so the
+# bags are cleared too. Explorer rewrites them when it closes, and Dingo
+# restarts Explorer after this card for that reason.
+function Get-FolderViewPaths {
+    [PSCustomObject]@{
+        MachineTypes = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FolderTypes'
+        UserTypes = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FolderTypes'
+        Bags = @(
+            'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\Bags',
+            'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\BagMRU',
+            'HKCU:\Software\Microsoft\Windows\Shell\Bags',
+            'HKCU:\Software\Microsoft\Windows\Shell\BagMRU'
+        )
+    }
+}
+
+function Get-FolderViewState {
+    $paths = Get-FolderViewPaths
+    if (-not (Test-Path -LiteralPath $paths.UserTypes)) { return 'Windows default' }
+    $views = @(Get-ChildItem -LiteralPath $paths.UserTypes -Recurse -ErrorAction Stop | Where-Object { (Split-Path $_.PSParentPath -Leaf) -eq 'TopViews' })
+    if (-not $views.Count) { return 'Custom folder views' }
+    foreach ($view in $views) {
+        $values = Get-ItemProperty -LiteralPath $view.PSPath -ErrorAction Stop
+        if ($values.LogicalViewMode -ne 1 -or $values.Mode -ne 4) { return 'Custom folder views' }
+    }
+    return 'Details for every folder'
+}
+
+function Set-FolderViewState([string]$DesiredState) {
+    $paths = Get-FolderViewPaths
+    if (Test-Path -LiteralPath $paths.UserTypes) { Remove-Item -LiteralPath $paths.UserTypes -Recurse -Force -ErrorAction Stop }
+    if ($DesiredState -eq 'Details for every folder') {
+        Copy-Item -LiteralPath $paths.MachineTypes -Destination (Split-Path $paths.UserTypes) -Recurse -Force -ErrorAction Stop
+        foreach ($view in @(Get-ChildItem -LiteralPath $paths.UserTypes -Recurse -ErrorAction Stop | Where-Object { (Split-Path $_.PSParentPath -Leaf) -eq 'TopViews' })) {
+            # LogicalViewMode 1 and Mode 4 are both Details.
+            Set-ItemProperty -LiteralPath $view.PSPath -Name LogicalViewMode -Value 1 -Type DWord -ErrorAction Stop
+            Set-ItemProperty -LiteralPath $view.PSPath -Name Mode -Value 4 -Type DWord -ErrorAction Stop
+        }
+    }
+    foreach ($bag in $paths.Bags) {
+        if (Test-Path -LiteralPath $bag) { Remove-Item -LiteralPath $bag -Recurse -Force -ErrorAction Stop }
+    }
+    Write-Log 'DEBUG' "Folder view templates set to '$DesiredState' and saved folder views cleared for this account."
+    if ((Get-FolderViewState) -ne $DesiredState) { throw 'Folder view verification failed.' }
+}
+
+# The Microsoft 365 Copilot app (once the Office hub) is a Store app that
+# Windows pins to the taskbar for new accounts. A Store app pin is not a .lnk
+# file, and Windows 11 gives scripts no way to unpin one, so removing the app
+# for this account is the only thing that takes the pin away.
+function Get-CurrentUserM365CopilotPackages {
+    try { return @(Get-AppxPackage -Name 'Microsoft.MicrosoftOfficeHub' -ErrorAction Stop) }
+    catch { throw "Could not inspect the Microsoft 365 Copilot app for the current Windows account. $($_.Exception.Message)" }
+}
+
+function Get-M365CopilotPackageState {
+    if (@(Get-CurrentUserM365CopilotPackages).Count) { return 'Installed for this account' }
+    return 'Removed'
+}
+
+function Remove-M365CopilotPackages {
+    foreach ($package in @(Get-CurrentUserM365CopilotPackages)) {
+        Write-Log 'DEBUG' "Removing Microsoft 365 Copilot package $($package.PackageFullName)"
+        Remove-AppxPackage -Package $package.PackageFullName -ErrorAction Stop
+    }
+    if (@(Get-CurrentUserM365CopilotPackages).Count) {
+        throw 'The Microsoft 365 Copilot app is still installed for this account. Your organisation may manage it.'
+    }
+    Write-Log 'DEBUG' 'Verified that the Microsoft 365 Copilot app is removed for the current account.'
+}
+
 function Test-CopilotTaskbarPinned {
     $pinFolder = Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
     if (-not (Test-Path -LiteralPath $pinFolder -PathType Container)) { return $false }
@@ -3867,7 +3986,7 @@ function Install-DisplayLanguagePack([string]$Language, [int]$TimeoutSeconds = 9
         while (-not $completed -and $timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
             $completed = Wait-Job -Job $job -Timeout 5
             if (-not $completed -and (Test-WorkerCancelled)) {
-                Stop-Job -Job $job -ErrorAction SilentlyContinue
+                Stop-PackJob $job $Language
                 throw "Stopped at your request while Windows was installing the $Language display pack. Windows may finish the download on its own in the background."
             }
             $report = Get-JobProgressReport $job
@@ -3910,13 +4029,13 @@ function Install-DisplayLanguagePack([string]$Language, [int]$TimeoutSeconds = 9
             # Sitting out a full timeout while nothing moves helps nobody, so a
             # stall ends the step early and the rest of the plan carries on.
             if (-not $completed -and $seenProgress -and $StallSeconds -gt 0 -and $stalled.TotalSeconds -ge $StallSeconds) {
-                Stop-Job -Job $job -ErrorAction SilentlyContinue
+                Stop-PackJob $job $Language
                 $stuckAt = if ($report.Count) { "It sat at $($report.Percent)%" } else { 'Neither Windows Update nor the servicing logs changed' }
                 throw "Windows Update stopped making progress on the $Language display pack. $stuckAt for $([math]::Floor($stalled.TotalMinutes))m $($stalled.Seconds)s, so Dingo gave up rather than wait out the full $([math]::Round($TimeoutSeconds / 60))-minute limit. Check Windows Update connectivity and try again."
             }
         }
         if (-not $completed) {
-            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Stop-PackJob $job $Language
             $where = if ($report -and $report.Count) { " It reached $($report.Percent)%." } else { ' Windows reports no percentage for a language pack, so Dingo cannot say how far it got.' }
             throw "Windows did not finish installing the $Language display pack within $([math]::Round($TimeoutSeconds / 60)) minutes.$where Check Windows Update connectivity and try again."
         }
@@ -3926,7 +4045,7 @@ function Install-DisplayLanguagePack([string]$Language, [int]$TimeoutSeconds = 9
             throw "Windows failed to install the $Language display pack: $reason"
         }
     } finally {
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch { }
     }
 }
 
@@ -3986,7 +4105,7 @@ function Stop-PrestartedPackJobs {
     if (-not (Get-Variable -Name PackJobs -Scope Script -ErrorAction SilentlyContinue)) { return }
     foreach ($key in @($script:PackJobs.Keys)) {
         try {
-            Stop-Job -Job $script:PackJobs[$key] -ErrorAction SilentlyContinue
+            Stop-PackJob $script:PackJobs[$key] $key
             Remove-Job -Job $script:PackJobs[$key] -Force -ErrorAction SilentlyContinue
             Write-Log 'WARN' "Dropped the unused $key display-language download."
         } catch { }
@@ -4030,9 +4149,27 @@ function Install-RequiredDisplayLanguagePack([string[]]$Candidates) {
         } catch {
             [void]$failures.Add("$candidate : $($_.Exception.Message)")
         }
+        # Windows installs one language pack at a time. A pack it is still
+        # working on would only make the next one wait in line and look stuck.
+        if ((Get-RunScopedFlag 'PackStillRunning')) {
+            throw "Windows is still installing the $candidate display pack in the background, so Dingo did not start another one. $($failures -join '; ') Wait for it to finish, then sign out and back in, or run Dingo again."
+        }
         Write-Log 'WARN' "The $candidate Windows display pack did not install; trying the next pack for this language."
     }
     throw "No Windows display pack could be installed for this language: $($failures -join '; ')."
+}
+
+function Stop-PackJob($Job, [string]$Language) {
+    # Install-Language returns a job that cannot always be stopped. Stop-Job
+    # then throws "The method or operation is not implemented", which is a
+    # terminating error, so SilentlyContinue does not hold it back. Left
+    # alone it replaced the real reason (a timeout or a stall) in the result.
+    try {
+        Stop-Job -Job $Job -ErrorAction Stop
+    } catch {
+        Set-RunScopedFlag 'PackStillRunning' $true
+        Write-Log 'WARN' "Windows would not stop the $Language display-pack install, so it carries on in the background: $($_.Exception.Message)"
+    }
 }
 
 function Get-RegistryKindState($Setting) {
@@ -4114,6 +4251,8 @@ function Get-TerminalKindState($Setting) {
 }
 
 function Get-WidgetsKindState($Setting) { New-StateResultForSetting $Setting (Get-WidgetsPackageState) }
+function Get-M365CopilotKindState($Setting) { New-StateResultForSetting $Setting (Get-M365CopilotPackageState) }
+function Get-FolderViewKindState($Setting) { New-StateResultForSetting $Setting (Get-FolderViewState) }
 
 function Set-RegistryKindPart($Setting, [string]$DesiredState, [string]$Scope, $EntryResults = $null) {
     $failure = ''
@@ -4143,7 +4282,10 @@ function Set-RegistryKindPart($Setting, [string]$DesiredState, [string]$Scope, $
         Send-InternationalSettingChange
         $override = try { (Get-WinUILanguageOverride).Name } catch { '' }
         $uiLanguage = try { (Get-UICulture).Name } catch { '' }
-        if ($script:LanguageChangePending -or ($override -and $override -ne $uiLanguage)) { Register-InternationalSettingsFinalizer $DesiredState }
+        # A region change in the same run can put the region's own formats back
+        # after these were written and checked. On a managed VDI image that happened
+        # within ten minutes, so the formats are written once more at sign-in.
+        if ($script:LanguageChangePending -or $script:RegionChangedThisRun -or ($override -and $override -ne $uiLanguage)) { Register-InternationalSettingsFinalizer $DesiredState }
     }
     if ($Scope -eq 'User' -and $Setting.Id -eq 'windows-copilot' -and $DesiredState -eq $Setting.PreferredState) { Unpin-CopilotFromTaskbar }
 }
@@ -4159,6 +4301,7 @@ function Set-RegionKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     Set-WinHomeLocation -GeoId ([int]$choice.GeoId)
     $locale = (Get-ItemProperty -LiteralPath 'HKCU:\Control Panel\International' -Name LocaleName).LocaleName
     if ($locale -ne $choice.Culture -or [int](Get-WinHomeLocation).GeoId -ne [int]$choice.GeoId) { throw 'Region verification failed.' }
+    $script:RegionChangedThisRun = $true
 }
 
 function Set-LanguageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
@@ -4199,6 +4342,8 @@ function Set-LanguageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
 
 function Set-TerminalKindPart($Setting, [string]$DesiredState, [string]$Scope) { Set-TerminalState $DesiredState }
 function Set-WidgetsKindPart($Setting, [string]$DesiredState, [string]$Scope) { Remove-WidgetsPackages }
+function Set-M365CopilotKindPart($Setting, [string]$DesiredState, [string]$Scope) { Remove-M365CopilotPackages }
+function Set-FolderViewKindPart($Setting, [string]$DesiredState, [string]$Scope) { Set-FolderViewState $DesiredState }
 
 function Get-SettingState($Setting) {
     try {
@@ -4788,6 +4933,8 @@ function Initialize-SettingHandlers {
     Register-SettingHandler 'Association' { param($entries) @('User') } 'Get-AssociationKindState' 'Set-AssociationKindPart'
     Register-SettingHandler 'Terminal' { param($entries) @('User') } 'Get-TerminalKindState' 'Set-TerminalKindPart'
     Register-SettingHandler 'WidgetsPackage' { param($entries) @('User') } 'Get-WidgetsKindState' 'Set-WidgetsKindPart' @{ User=@('Get-AppxPackage','Remove-AppxPackage') }
+    Register-SettingHandler 'M365CopilotPackage' { param($entries) @('User') } 'Get-M365CopilotKindState' 'Set-M365CopilotKindPart' @{ User=@('Get-AppxPackage','Remove-AppxPackage') }
+    Register-SettingHandler 'FolderView'{ param($entries) @('User') } 'Get-FolderViewKindState' 'Set-FolderViewKindPart'
 }
 
 function Test-SettingPreflight($Setting) {
@@ -4950,7 +5097,7 @@ if ($FinalizeInternationalSettings) {
 
 if ($SelfTest) {
     # Tools.json may add tools, so the total is the fixed settings plus the catalog.
-    $expectedSettingCount = 30 + @(Get-ToolCatalog).Count + @(Get-ToolCatalog | Where-Object { @($_.Associations).Count }).Count
+    $expectedSettingCount = 32 + @(Get-ToolCatalog).Count + @(Get-ToolCatalog | Where-Object { @($_.Associations).Count }).Count
     if ($script:Settings.Count -ne $expectedSettingCount) { throw "Expected $expectedSettingCount settings, found $($script:Settings.Count)." }
     foreach ($workerHelper in @('Test-DisplayLanguagePackInstalled','Install-DisplayLanguagePack','Write-Utf8FileAtomically','New-ApplyResult','New-OperationComponent')) {
         if (-not (Get-Command $workerHelper -CommandType Function -ErrorAction SilentlyContinue)) { throw "Elevated-worker helper is unavailable: $workerHelper" }
@@ -4976,7 +5123,7 @@ if ($SelfTest) {
     if ($launcherAst.Extent.Text -notmatch '-ElevationBroker' -or $launcherAst.Extent.Text -match '-Verb\s+RunAs') { throw 'The WPF launcher must delegate UAC to the non-WPF elevation broker.' }
     $duplicates = $script:Settings | Group-Object Id | Where-Object Count -gt 1
     if ($duplicates) { throw "Duplicate IDs: $($duplicates.Name -join ', ')" }
-    if ($script:SettingHandlers.Count -ne 10) { throw "Expected 10 setting handlers, found $($script:SettingHandlers.Count)." }
+    if ($script:SettingHandlers.Count -ne 12) { throw "Expected 12 setting handlers, found $($script:SettingHandlers.Count)." }
     foreach ($setting in $script:Settings) { [void](Get-SettingHandler $setting.Kind) }
     foreach ($dispatcherName in @('Get-SettingState','Set-SettingPart')) {
         $dispatcherAst = $selfTestAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $dispatcherName },$true)

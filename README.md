@@ -179,6 +179,7 @@ Each card offers a list to choose from.
 | `taskbar-search` | Search box | no | Hidden |
 | `task-view` | Task View button | no | Hidden |
 | `widgets` | Windows Widgets | no | Removed for this account |
+| `m365-copilot` | Microsoft 365 Copilot app | no | Removed for this account |
 | `taskbar-combine` | Combine taskbar buttons | no | Never combine |
 | `end-task` | End task on right-click | no | Enabled |
 
@@ -191,6 +192,7 @@ Each card offers a list to choose from.
 | `file-extensions` | File-name extensions | no | Shown |
 | `protected-files` | Protected system files | no | Shown (caution) |
 | `expand-nav` | Expand navigation pane | no | Enabled |
+| `folder-view` | Default folder view | no | Details for every folder |
 
 ### Windows features and updates
 

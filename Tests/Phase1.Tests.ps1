@@ -293,6 +293,31 @@ try {
         Assert-Throws { Resolve-UsableWinget 'old-winget.exe' } 'did not fix it'
         Assert ($repairs.Count -eq 1) "Repair ran $($repairs.Count) times instead of once."
     }
+    Test-Case 'A winget that Windows will not start is repaired, not treated as supported' {
+        # On a VDI image the administrator worker can be a different account
+        # that App Installer was never registered to. Windows then refuses to
+        # start winget.exe, and the version check must not wave that through.
+        Set-RunScopedFlag 'WingetVersionVerified' $false
+        Set-RunScopedFlag 'WingetRepairAttempted' $false
+        $repairs = New-Object Collections.ArrayList
+        $state = @{ Denied = $true }
+        function Test-IsAdministrator { $true }
+        function Invoke-ChildProcess { if ($state.Denied) { throw 'Exception calling "Start" with "1" argument(s): "Access is denied"' } [pscustomobject]@{ExitCode=0;Output='v1.11.400'} }
+        function Get-WingetPath { 'registered-winget.exe' }
+        function Repair-WingetClient { [void]$repairs.Add(1); $state.Denied = $false }
+        Assert (-not (Test-WingetVersionSupported 'denied-winget.exe').Supported) 'A winget Windows refuses to start was called supported.'
+        Assert ((Resolve-UsableWinget 'denied-winget.exe') -eq 'registered-winget.exe') 'The repaired client was not picked up.'
+        Assert ($repairs.Count -eq 1) "Repair ran $($repairs.Count) times instead of once."
+    }
+    Test-Case 'A winget that stays refused after repair says to sign in as that account' {
+        Set-RunScopedFlag 'WingetVersionVerified' $false
+        Set-RunScopedFlag 'WingetRepairAttempted' $false
+        function Test-IsAdministrator { $true }
+        function Invoke-ChildProcess { throw 'Exception calling "Start" with "1" argument(s): "Access is denied"' }
+        function Get-WingetPath { 'denied-winget.exe' }
+        function Repair-WingetClient { }
+        Assert-Throws { Resolve-UsableWinget 'denied-winget.exe' } 'Sign in once as'
+    }
     Test-Case 'An old winget without administrator rights explains what to do instead' {
         Set-RunScopedFlag 'WingetVersionVerified' $false
         Set-RunScopedFlag 'WingetRepairAttempted' $false
@@ -686,9 +711,9 @@ try {
         }
         Assert (($script:Settings | Where-Object Id -eq 'display-language').PreferredState -eq 'Australian English (en-AU)') 'The preferred display language is not Australian English.'
         # Australian English has no interface of its own. Windows supplies it
-        # through the British pack, so that fallback must stay in the chain.
+        # through the British pack, so that pack is tried first.
         $auPacks = @((Get-LanguageChoiceTable)['Australian English (en-AU)'].Packs)
-        Assert ($auPacks[0] -eq 'en-AU' -and $auPacks -contains 'en-GB') "Australian English must fall back to the British pack; the chain is $($auPacks -join ',')."
+        Assert ($auPacks[0] -eq 'en-GB' -and $auPacks -contains 'en-AU') "Australian English must try the British pack first; the chain is $($auPacks -join ',')."
         Assert ((Get-LanguageChoiceTable)['Australian English (en-AU)'].Tag -eq 'en-AU') 'Australian English must ask Windows for en-AU.'
         Assert (($script:Settings | Where-Object Id -eq 'region').PreferredState -eq 'Australia (en-AU)') 'The preferred region is not Australia.'
         Assert (($script:Settings | Where-Object Id -eq 'time-zone').PreferredState -eq 'UTC') 'The preferred time zone is not UTC.'
@@ -724,7 +749,11 @@ try {
             Assert ($choice.Tag -match '^[a-z]{2}-[A-Z]{2}$') "'$label' has a malformed language tag '$($choice.Tag)'."
             Assert (@($choice.Packs).Count -ge 1) "'$label' names no display pack."
             foreach ($pack in @($choice.Packs)) { Assert ($pack -match '^[a-z]{2}-[A-Z]{2}$') "'$label' names a malformed pack '$pack'." }
-            Assert (@($choice.Packs)[0] -eq $choice.Tag) "'$label' does not try its own pack first."
+            # A variant Windows serves through the British pack tries that pack
+            # first. Every other language tries its own pack first.
+            $firstPack = if (@($choice.Packs) -contains 'en-GB' -and $choice.Tag -ne 'en-CA') { 'en-GB' } else { $choice.Tag }
+            Assert (@($choice.Packs)[0] -eq $firstPack) "'$label' tries '$(@($choice.Packs)[0])' first, not '$firstPack'."
+            Assert (@($choice.Packs) -contains $choice.Tag) "'$label' never tries its own pack."
             $unique = @(@($choice.Packs) | Select-Object -Unique)
             Assert ($unique.Count -eq @($choice.Packs).Count) "'$label' repeats a pack in its chain."
         }
@@ -775,6 +804,36 @@ try {
         Assert-Throws { Install-RequiredDisplayLanguagePack @('de-DE') } 'does not list its pack'
         # A pack named for no language at all is a programming error.
         Assert-Throws { Install-RequiredDisplayLanguagePack @() } 'No display-language pack was named'
+    }
+    Test-Case 'A pack install Windows will not stop keeps its real reason and blocks the next pack' {
+        # On a VDI image Stop-Job threw "not implemented" for the Install-Language
+        # job. That replaced the timeout message, and the next pack then queued
+        # behind the one still running and looked stuck.
+        Set-RunScopedFlag 'PackStillRunning' $false
+        function Stop-Job { throw (New-Object NotImplementedException 'The method or operation is not implemented.') }
+        Stop-PackJob ([pscustomobject]@{}) 'en-GB'
+        Assert (Get-RunScopedFlag 'PackStillRunning') 'A pack install that could not be stopped was not recorded.'
+        $script:Installed = New-Object Collections.ArrayList
+        function Get-AvailableDisplayLanguagePacks { @('en-GB','en-AU') }
+        function Get-DisplayLanguagePackSource { param([string]$Language) '' }
+        function Install-DisplayLanguagePack { param([string]$Language) [void]$script:Installed.Add($Language); throw "Windows did not finish installing the $Language display pack within 15 minutes." }
+        Assert-Throws { Install-RequiredDisplayLanguagePack @('en-GB','en-AU') } 'still installing the en-GB display pack in the background'
+        Assert (($script:Installed -join ',') -eq 'en-GB') "Dingo started $($script:Installed -join ', ') while a pack was still installing."
+        Set-RunScopedFlag 'PackStillRunning' $false
+    }
+    Test-Case 'The Microsoft 365 Copilot card reads and removes the app for this account only' {
+        $script:M365 = @([pscustomobject]@{ Name='Microsoft.MicrosoftOfficeHub'; PackageFullName='Microsoft.MicrosoftOfficeHub_1_x64__8wekyb3d8bbwe' })
+        function Get-AppxPackage { param($Name, $ErrorAction) @($script:M365 | Where-Object Name -eq $Name) }
+        function Remove-AppxPackage { param($Package, $ErrorAction) $script:M365 = @($script:M365 | Where-Object PackageFullName -ne $Package) }
+        $card = $script:Settings | Where-Object Id -eq 'm365-copilot'
+        Assert ($card.Tab -eq 'Taskbar') 'The Microsoft 365 Copilot card is not on the Taskbar tab.'
+        Assert ((Get-SettingState $card).Status -eq 'Partial') 'An installed app was not reported as not yet removed.'
+        Set-SettingPart $card 'Removed' User
+        Assert ((Get-SettingState $card).Status -eq 'Preferred') 'The app was not reported removed.'
+        # A managed app that will not go must fail, not report success.
+        $script:M365 = @([pscustomobject]@{ Name='Microsoft.MicrosoftOfficeHub'; PackageFullName='kept' })
+        function Remove-AppxPackage { param($Package, $ErrorAction) }
+        Assert-Throws { Set-SettingPart $card 'Removed' User } 'still installed'
     }
     Test-Case 'The window reports what the administrator step is doing, card by card' {
         $dir = Join-Path ([IO.Path]::GetTempPath()) ('dingo-progress-' + [Guid]::NewGuid().ToString('N'))
