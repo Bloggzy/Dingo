@@ -12,7 +12,7 @@ Nothing is applied until you select it. Every change is shown on a card first, a
 
 ![Dingo main window: the Tweaks section open on the Region & language tab, showing the Time zone, Region and formats and Display language cards with their scope and admin approval pills, and the area tabs across the top](Assets/Dingo-main-screen.png)
 
-Current version: **0.8.7**.
+Current version: **0.8.8**.
 
 ## Use the window
 
