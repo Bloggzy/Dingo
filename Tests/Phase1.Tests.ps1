@@ -1374,6 +1374,20 @@ try {
         & (& $handlerOf 'UncheckButton')
         Assert (@($script:Settings | Where-Object Selected).Count -eq 0) 'Clear all selections left something selected.'
     }
+    Test-Case 'Policy card says Configured only when a policy value exists' {
+        $card = $script:Settings | Where-Object Id -eq 'onedrive'
+        function Get-RegistrySettingState { New-StateResult 'Alternate' 'Enabled/default' }
+        $present = @{}
+        function Get-EntryValue($Entry) {
+            if ($present.ContainsKey($Entry.Name)) { return [pscustomobject]@{Status='Present';Exists=$true;Value=0;ValueType='DWord';ErrorMessage=''} }
+            [pscustomobject]@{Status='Missing';Exists=$false;Value=$null;ValueType='';ErrorMessage=''}
+        }
+        $state = Get-RegistryKindState $card
+        Assert ($state.Status -eq 'Alternate' -and $state.DisplayText -eq 'Enabled/default') "Absent policy values still said '$($state.DisplayText)'."
+        $present['DisableFileSync'] = $true
+        $state = Get-RegistryKindState $card
+        Assert ($state.Status -eq 'Alternate' -and $state.DisplayText -eq 'Configured: Enabled/default') "Present policy value said '$($state.DisplayText)'."
+    }
     "Passed $script:Passed phase 1 tests on PowerShell $($PSVersionTable.PSVersion)."
 } finally {
     $resolvedScratch = [IO.Path]::GetFullPath($scratch)
