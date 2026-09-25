@@ -865,6 +865,151 @@ try {
         function Remove-AppxPackage { param($Package, $ErrorAction) }
         Assert-Throws { Set-SettingPart $card 'Removed' User } 'still installed'
     }
+    Test-Case 'Diagnostic data goes off only on the editions that obey it' {
+        # 0 is honoured only on Enterprise, Education and Server. Every other
+        # edition treats it as 1, so 1 is what the card writes there.
+        $script:Edition = ''
+        function Get-ItemProperty { param($LiteralPath, $Name, $ErrorAction) if (-not $script:Edition) { throw 'No such value.' } [pscustomobject]@{ EditionID = $script:Edition } }
+        foreach ($edition in @('Enterprise','EnterpriseN','EnterpriseS','Education','EducationN','IoTEnterprise','ServerRdsh','ServerDatacenter')) {
+            $script:Edition = $edition
+            Assert ((Get-LowestDiagnosticDataLevel) -eq 0) "$edition does not turn diagnostic data off."
+        }
+        foreach ($edition in @('Professional','ProfessionalN','ProfessionalEducation','ProfessionalWorkstation','Core','CoreN','')) {
+            $script:Edition = $edition
+            Assert ((Get-LowestDiagnosticDataLevel) -eq 1) "'$edition' does not keep required diagnostic data."
+        }
+    }
+    Test-Case 'The Privacy cards write the diagnostic data level this edition allows and say who they affect' {
+        $cards = @($script:Settings | Where-Object Tab -eq 'Privacy')
+        Assert ((@($cards | ForEach-Object Id) -join ',') -eq 'diagnostic-data,telemetry-service,defender-samples') "The Privacy tab holds $(@($cards | ForEach-Object Id) -join ', ')."
+        $data = $cards | Where-Object Id -eq 'diagnostic-data'
+        Assert ($data.DisplayScope -eq 'Both' -and $data.RequiresAdmin) 'Diagnostic data does not touch both the account and the computer.'
+        $telemetry = $data.Entries | Where-Object Name -eq 'AllowTelemetry'
+        $level = Get-LowestDiagnosticDataLevel
+        Assert ($telemetry.Scope -eq 'Machine' -and $telemetry.Path -eq 'SOFTWARE\Policies\Microsoft\Windows\DataCollection' -and $telemetry.Preferred -eq $level) "AllowTelemetry is not $level in the policy key."
+        $wording = if ($level -eq 0) { 'Turns diagnostic data off' } else { 'cannot turn diagnostic data off' }
+        Assert ($data.Description -match $wording) 'The card does not say what this edition allows.'
+        $optOut = $data.Entries | Where-Object Name -eq 'POWERSHELL_TELEMETRY_OPTOUT'
+        Assert ($optOut.Path -eq 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -and $optOut.Type -eq 'String') 'The PowerShell 7 opt-out is not a machine environment variable.'
+        Assert (-not @($data.Entries | Where-Object { $_.Scope -eq 'ElevatedUser' }).Count) 'An account value would be written by the administrator account.'
+        foreach ($id in @('telemetry-service','defender-samples')) {
+            $card = $cards | Where-Object Id -eq $id
+            Assert ($card.DisplayScope -eq 'System' -and $card.RequiresAdmin) "'$id' does not need administrator approval for the whole computer."
+        }
+    }
+    Test-Case 'The telemetry service card reads, disables, and restores the startup type' {
+        $script:Svc = [pscustomobject]@{ Name='DiagTrack'; StartType='Automatic'; Status='Running' }
+        $script:Stopped = $false
+        function Get-Service { param($Name, $ErrorAction) if ($Name -eq $script:Svc.Name) { $script:Svc } elseif ($ErrorAction -eq 'Stop') { throw "No service $Name" } }
+        function Set-Service { param($Name, $StartupType, $ErrorAction) $script:Svc.StartType = $StartupType }
+        function Stop-Service { param($Name, [switch]$Force, $ErrorAction) $script:Stopped = $true; $script:Svc.Status = 'Stopped' }
+        function Start-Service { param($Name, $ErrorAction) $script:Svc.Status = 'Running' }
+        function Test-IsAdministrator { $true }
+        $card = $script:Settings | Where-Object Id -eq 'telemetry-service'
+        Assert ((Get-SettingState $card).Status -eq 'Alternate') 'A service that starts automatically is not read as the Windows default.'
+        Set-SettingPart $card 'Disabled' Machine
+        Assert ($script:Svc.StartType -eq 'Disabled' -and $script:Stopped) 'The service was not disabled and stopped.'
+        Assert ((Get-SettingState $card).Status -eq 'Preferred') 'A disabled service is not read as preferred.'
+        $script:Svc.StartType = 'Manual'
+        Assert ((Get-SettingState $card).Status -eq 'Partial') 'A service set to Manual is not reported as neither choice.'
+        Set-SettingPart $card 'Automatic' Machine
+        Assert ($script:Svc.StartType -eq 'Automatic' -and $script:Svc.Status -eq 'Running') 'The service was not restored.'
+        # A service Windows refuses to change must fail, not report success.
+        function Set-Service { param($Name, $StartupType, $ErrorAction) }
+        Assert-Throws { Set-SettingPart $card 'Disabled' Machine } 'still starts as Automatic'
+        $script:Svc = [pscustomobject]@{ Name='Other'; StartType='Automatic'; Status='Running' }
+        Assert ((Get-SettingState $card).Status -eq 'Unavailable') 'A missing service is not reported as unavailable.'
+    }
+    Test-Case 'Background services start only when needed, and a service Windows lacks is skipped' {
+        # The start types a clean Windows 11 Pro 25H2 install had.
+        $script:Services = @{
+            MapsBroker=[pscustomobject]@{ Name='MapsBroker'; StartType='Automatic'; Status='Stopped' }
+            StorSvc=[pscustomobject]@{ Name='StorSvc'; StartType='Automatic'; Status='Running' }
+            InventorySvc=[pscustomobject]@{ Name='InventorySvc'; StartType='Automatic'; Status='Running' }
+            WSAIFabricSvc=[pscustomobject]@{ Name='WSAIFabricSvc'; StartType='Automatic'; Status='Running' }
+            whesvc=[pscustomobject]@{ Name='whesvc'; StartType='Automatic'; Status='Running' }
+            wuqisvc=[pscustomobject]@{ Name='wuqisvc'; StartType='Manual'; Status='Stopped' }
+        }
+        $script:Stopped = New-Object Collections.ArrayList
+        function Get-Service { param($Name, $ErrorAction) if ($script:Services.ContainsKey($Name)) { $script:Services[$Name] } elseif ($ErrorAction -eq 'Stop') { throw "No service $Name" } }
+        function Set-Service { param($Name, $StartupType, $ErrorAction) $script:Services[$Name].StartType = $StartupType }
+        function Stop-Service { param($Name, [switch]$Force, $ErrorAction) [void]$script:Stopped.Add($Name); $script:Services[$Name].Status = 'Stopped' }
+        function Start-Service { param($Name, $ErrorAction) $script:Services[$Name].Status = 'Running' }
+        function Test-IsAdministrator { $true }
+        $card = $script:Settings | Where-Object Id -eq 'background-services'
+        Assert ($card.Tab -eq 'Windows features' -and $card.DisplayScope -eq 'System') 'Background services is not a whole-computer card on the Windows features tab.'
+        Assert ((Get-SettingState $card).Status -eq 'Alternate') 'A clean install is not read as the Windows default.'
+        Set-SettingPart $card 'Start only when needed' Machine
+        $types = ($script:Services.Keys | Sort-Object | ForEach-Object { "$($_)=$($script:Services[$_].StartType)" }) -join ','
+        Assert ($types -eq 'InventorySvc=Manual,MapsBroker=Manual,StorSvc=Manual,whesvc=Manual,WSAIFabricSvc=Manual,wuqisvc=Disabled') "The services are now $types."
+        # A Manual service may be in use, so only the disabled one is stopped.
+        Assert (($script:Stopped -join ',') -eq '') "Dingo stopped $($script:Stopped -join ', '), which were not running or are only set to Manual."
+        Assert ((Get-SettingState $card).Status -eq 'Preferred') 'The applied choice is not read as preferred.'
+        Set-SettingPart $card 'Windows default' Machine
+        Assert ((Get-SettingState $card).Status -eq 'Alternate') 'Switching back did not restore the clean-install start types.'
+        # An older Windows without the newest services still gets the rest.
+        $script:Services.Remove('whesvc'); $script:Services.Remove('WSAIFabricSvc')
+        Set-SettingPart $card 'Start only when needed' Machine
+        $state = Get-SettingState $card
+        Assert ($state.Status -eq 'Preferred' -and $state.Details -match 'no WSAIFabricSvc, whesvc service') "A missing service was not skipped and named: $($state.Status) $($state.Details)"
+        $script:Services = @{}
+        Assert ((Get-SettingState $card).Status -eq 'Unavailable') 'A computer with none of the services is not reported as unavailable.'
+    }
+    Test-Case 'Diagnostic data reads a clean install as the Windows default and leaves setup choices alone' {
+        # What a clean Windows 11 Pro 25H2 install held after setup. Advertising
+        # ID and tailored experiences are setup choices; 2 is what that install had.
+        $script:Values = @{
+            Enabled_AdvertisingInfo=0; TailoredExperiencesWithDiagnosticDataEnabled=2
+            RestrictImplicitInkCollection=0; RestrictImplicitTextCollection=0; HarvestContacts=1; AcceptedPrivacyPolicy=1
+        }
+        function Get-EntryValue {
+            param($Entry)
+            $key = if ($Entry.Name -eq 'Enabled') { "Enabled_$(Split-Path $Entry.Path -Leaf)" } else { $Entry.Name }
+            if ($script:Values.ContainsKey($key)) { return [pscustomobject]@{ Status='Present'; Exists=$true; Value=$script:Values[$key]; ValueType=$Entry.Type; ErrorMessage='' } }
+            [pscustomobject]@{ Status='Missing'; Exists=$false; Value=$null; ValueType=''; ErrorMessage='' }
+        }
+        $card = $script:Settings | Where-Object Id -eq 'diagnostic-data'
+        $state = Get-RegistrySettingState $card
+        Assert ($state.Status -eq 'Alternate') "A clean install reads as '$($state.DisplayText)'."
+        # A switch turned on in Settings is still the Windows default.
+        $script:Values['Start_TrackProgs'] = 1
+        $script:Values['Enabled_TIPC'] = 1
+        Assert ((Get-RegistrySettingState $card).Status -eq 'Alternate') 'A switch turned on in Settings reads as a custom setup.'
+        # A value the card does not know about is still custom.
+        $script:Values['HarvestContacts'] = 7
+        Assert ((Get-RegistrySettingState $card).Status -eq 'Partial') 'An unknown value reads as the Windows default.'
+        # Switching back never writes a setup choice.
+        function New-ItemProperty { throw 'A setup choice was written.' }
+        function Remove-ItemProperty { throw 'A setup choice was removed.' }
+        foreach ($leaf in @('AdvertisingInfo','Privacy')) {
+            $entry = @($card.Entries | Where-Object { (Split-Path $_.Path -Leaf) -eq $leaf })
+            Assert ($entry.Count -eq 1) "Found $($entry.Count) setup-choice entries under $leaf."
+            Set-EntryValue $entry[0] 'Windows default' $card
+        }
+    }
+    Test-Case 'The Defender card reads back sample submission and names a policy that overrides it' {
+        $script:Consent = 1
+        $script:Policy = $null
+        function Get-MpPreference { param($ErrorAction) [pscustomobject]@{ SubmitSamplesConsent = [byte]$script:Consent } }
+        function Set-MpPreference { param($SubmitSamplesConsent, $ErrorAction) $script:Consent = $SubmitSamplesConsent }
+        function Get-DefenderSamplePolicyValue { $script:Policy }
+        function Test-IsAdministrator { $true }
+        $card = $script:Settings | Where-Object Id -eq 'defender-samples'
+        $state = Get-SettingState $card
+        Assert ($state.Status -eq 'Alternate' -and $state.DisplayText -eq 'Send safe samples') "Windows' default read as '$($state.DisplayText)'."
+        Set-SettingPart $card 'Never send' Machine
+        Assert ($script:Consent -eq 2) "Never send wrote $script:Consent, not 2."
+        Assert ((Get-SettingState $card).Status -eq 'Preferred') 'Never send is not read as preferred.'
+        $script:Consent = 3
+        Assert ((Get-SettingState $card).DisplayText -eq 'Send all samples') 'A value the card does not offer is not named.'
+        $script:Policy = 1
+        Assert ((Get-SettingState $card).Details -match 'policy sets this to Send safe samples') 'A policy value is not named on the card.'
+        # Microsoft says a blocked change can look as if it worked.
+        function Set-MpPreference { param($SubmitSamplesConsent, $ErrorAction) }
+        Assert-Throws { Set-SettingPart $card 'Never send' Machine } 'Tamper Protection may have blocked'
+        function Get-MpPreference { param($ErrorAction) throw 'The service is not running.' }
+        Assert ((Get-SettingState $card).Status -eq 'Unavailable') 'A Defender that does not answer is not reported as unavailable.'
+    }
     Test-Case 'The window reports what the administrator step is doing, card by card' {
         $dir = Join-Path ([IO.Path]::GetTempPath()) ('dingo-progress-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Force $dir | Out-Null
