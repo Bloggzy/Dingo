@@ -19,7 +19,7 @@ Current version: **0.8.8**.
 1. Copy the whole Dingo folder to the machine.
 2. Double-click `Start-Dingo.cmd`. Do **not** use *Run as administrator*. Dingo asks for administrator rights later, only when it needs them.
 3. Pick a section:
-   - **Tweaks** - Windows settings, with one tab per area: Region & language, Windows features, Microsoft Edge, Windows Update, Taskbar, File Explorer, Start menu, and Windows Terminal. A pill on each card says who it affects: **Account only**, **Whole computer**, or **Account + computer**. A gold pill marks a tweak that needs admin approval.
+   - **Tweaks** - Windows settings, with one tab per area: Region & language, Windows features, Privacy, Microsoft Edge, Windows Update, Taskbar, File Explorer, Start menu, and Windows Terminal. A pill on each card says who it affects: **Account only**, **Whole computer**, or **Account + computer**. A gold pill marks a tweak that needs admin approval.
    - **Tools** - Install tools, Tool shortcuts, File associations.
    - **Options** - Dingo's own choices, such as the log folder and where tools are installed.
 4. Turn on the switch on each card you want. Or press **Choose all my preferred settings** in Tweaks, and **Choose all tools** in Tools.
@@ -157,7 +157,7 @@ Do not apply changes from an elevated console. Dingo must stay in your signed-in
 
 ## What it changes
 
-Forty-three cards. The ID is what `-Include` and `-Exclude` accept. **Admin** means Windows asks for approval.
+Forty-seven cards. The ID is what `-Include` and `-Exclude` accept. **Admin** means Windows asks for approval.
 
 An ID names the setting, never a value it can hold. `time-zone`, not `timezone-utc`: UTC is one choice of many, and an ID that names it goes stale the day a second choice appears. A test holds this for every card that offers a list.
 
@@ -202,7 +202,22 @@ Each card offers a list to choose from.
 | `windows-copilot` | Windows Copilot | yes | Disabled |
 | `long-paths` | Win32 long paths | yes | Enabled |
 | `resume` | Cross-device Resume | yes | Disabled |
+| `background-services` | Background services | yes | Start only when needed |
 | `windows-update` | Automatic updates and restarts | yes | Manual (you choose when to update) |
+
+`background-services` sets five services that start with Windows to start only when needed: Downloaded Maps Manager, Storage Service, Inventory and Compatibility Appraisal, Windows AI Components Host, and Windows Health and Optimized Experiences. It also disables Microsoft Usage and Quality Insights. A Windows version that lacks one of these services is skipped for that service. Switching back puts back the start types of a clean Windows 11 install.
+
+### Privacy
+
+| ID | Setting | Admin | Preferred |
+| --- | --- | --- | --- |
+| `diagnostic-data` | Diagnostic data and activity tracking | yes | Reduced (diagnostic data off, or required where off is not allowed) |
+| `telemetry-service` | Telemetry service (DiagTrack) | yes | Disabled |
+| `defender-samples` | Defender automatic sample submission | yes | Never send |
+
+`diagnostic-data` turns diagnostic data **Off** on Enterprise, Education, and Server editions. Microsoft allows **Off** only on those editions, so on Pro and Home the card sets **Required**, the lowest level they allow. The card reads the edition when Dingo starts and says which level it will set. Switching back puts back the values a clean Windows install has. It leaves the advertising ID and tailored experiences alone, because you choose them during Windows setup.
+
+`defender-samples` stops Defender from uploading suspicious files, which can be case evidence. **Caution:** this also turns off Block at first sight. A Group Policy or Intune setting wins over this card, and the card says so when one is set.
 
 ### Microsoft Edge
 
