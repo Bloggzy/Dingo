@@ -4417,8 +4417,12 @@ function Get-RegistryKindState($Setting) {
     if ($Setting.Id -eq 'windows-copilot' -and $state.Status -eq 'Preferred' -and (Test-CopilotTaskbarPinned)) {
         return New-StateResult 'Partial' "$($state.DisplayText); Copilot app pinned to taskbar"
     }
-    if (@($Setting.Entries | Where-Object { $_.Path -match '(^SOFTWARE\\Policies\\|PolicyManager\\)' }).Count -and $state.Status -in @('Preferred','Alternate') -and $state.DisplayText -notlike 'Configured*') {
-        $state.DisplayText = "Configured: $($state.DisplayText)"
+    if ($state.Status -in @('Preferred','Alternate') -and $state.DisplayText -notlike 'Configured*') {
+        # Only say "Configured" when a policy value is really there. With no policy values, the card shows the Windows default.
+        $policyEntries = @($Setting.Entries | Where-Object { $_.Path -match '(^SOFTWARE\\Policies\\|PolicyManager\\)' })
+        if (@($policyEntries | Where-Object { (Get-EntryValue $_).Exists }).Count) {
+            $state.DisplayText = "Configured: $($state.DisplayText)"
+        }
     }
     return $state
 }
