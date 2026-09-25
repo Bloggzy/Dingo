@@ -647,7 +647,8 @@ function New-Entry {
         $Preferred,
         $Alternate = '__REMOVE_VALUE__',
         [ValidateSet('DWord','QWord','String')][string]$Type = 'DWord',
-        [hashtable]$States = $null
+        [hashtable]$States = $null,
+        [array]$AlsoAccept = @()
     )
     # States gives one value per named choice. A card that offers only a pair
     # leaves it empty and keeps using Preferred and Alternate.
@@ -656,7 +657,23 @@ function New-Entry {
         $stateMap = @{}
         foreach ($key in $States.Keys) { $stateMap[[string]$key] = $States[$key] }
     }
-    [PSCustomObject]@{ Scope=$Scope; Path=$Path; Name=$Name; Preferred=$Preferred; Alternate=$Alternate; Type=$Type; States=$stateMap }
+    # AlsoAccept lists other values that still read as the alternate choice,
+    # such as a switch someone turned on in Settings. Only Alternate is written.
+    [PSCustomObject]@{ Scope=$Scope; Path=$Path; Name=$Name; Preferred=$Preferred; Alternate=$Alternate; Type=$Type; States=$stateMap; AlsoAccept=@($AlsoAccept) }
+}
+
+# An alternate value that tells Dingo to leave the registry value as it is, and
+# to accept whatever it holds. It is for a choice the person made in Windows
+# setup, which Dingo has no record of and so cannot put back.
+function Get-LeaveValue { '__LEAVE_VALUE__' }
+
+function Test-EntryInState($Entry, [string]$State, $Setting) {
+    if (Test-EntryValue $Entry (Get-EntryWantedValue $Entry $State $Setting)) { return $true }
+    if ($State -eq $Setting.PreferredState -or -not $Entry.PSObject.Properties['AlsoAccept']) { return $false }
+    foreach ($value in @($Entry.AlsoAccept)) {
+        if (Test-EntryValue $Entry $value) { return $true }
+    }
+    return $false
 }
 
 function Get-EntryWantedValue($Entry, [string]$DesiredState, $Setting) {
@@ -686,7 +703,7 @@ function Get-TweakSignposts {
 }
 
 function Get-TweakTabOrder {
-    @('Region & language','Windows features','Microsoft Edge','Windows Update','Taskbar','File Explorer','Start menu','Windows Terminal')
+    @('Region & language','Windows features','Privacy','Microsoft Edge','Windows Update','Taskbar','File Explorer','Start menu','Windows Terminal')
 }
 
 function New-Setting {
@@ -3373,6 +3390,53 @@ function Get-Settings {
         (New-Entry Machine $windowsUpdate 'NoUpdateNotificationsDuringActiveHours' 0 $script:RemoveValue)
     ) -Requirements @{ Editions=@('Professional','ProfessionalN','ProfessionalEducation','ProfessionalWorkstation','Enterprise','EnterpriseN','EnterpriseS','Education','EducationN','IoTEnterprise') }))
 
+    # Each edition gets the lowest diagnostic data level it obeys. See
+    # Get-LowestDiagnosticDataLevel.
+    $dataCollection = 'SOFTWARE\Policies\Microsoft\Windows\DataCollection'
+    $inputPersonalization = 'Software\Microsoft\InputPersonalization'
+    $diagnosticLevel = Get-LowestDiagnosticDataLevel
+    $diagnosticText = if ($diagnosticLevel -eq 0) {
+        'Turns diagnostic data off, so Windows sends none to Microsoft. This edition of Windows allows that. Microsoft then gets no report when an update fails.'
+    } else {
+        'Sends Microsoft only the required diagnostic data. This edition of Windows cannot turn diagnostic data off; only Enterprise, Education and Server can.'
+    }
+    [void]$settings.Add((New-Setting 'diagnostic-data' 'Privacy' 'Diagnostic data and activity tracking' "$diagnosticText Turns off feedback requests and activity history for the computer. For this account, turns off the advertising ID, tailored experiences, online speech recognition, inking and typing data, and app-launch tracking for Start. Also opts PowerShell 7 out of its telemetry. Switching back puts back the values a clean Windows install has. It leaves the advertising ID and tailored experiences as they are, because you choose those during Windows setup." 'Reduced' 'Windows default' 'Registry' @(
+        (New-Entry Machine $dataCollection 'AllowTelemetry' $diagnosticLevel $script:RemoveValue),
+        (New-Entry Machine $dataCollection 'DoNotShowFeedbackNotifications' 1 $script:RemoveValue),
+        (New-Entry Machine 'SOFTWARE\Policies\Microsoft\Windows\System' 'PublishUserActivities' 0 $script:RemoveValue),
+        (New-Entry Machine 'SOFTWARE\Policies\Microsoft\Windows\System' 'UploadUserActivities' 0 $script:RemoveValue),
+        (New-Entry Machine 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment' 'POWERSHELL_TELEMETRY_OPTOUT' '1' $script:RemoveValue String),
+        # The Windows default values are what a clean Windows 11 Pro 25H2
+        # install held after setup (2026-09-25). A value that install did not
+        # have is removed; a switch turned on in Settings still reads as default.
+        (New-Entry User 'Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0 (Get-LeaveValue)),
+        (New-Entry User 'Software\Microsoft\Windows\CurrentVersion\Privacy' 'TailoredExperiencesWithDiagnosticDataEnabled' 0 (Get-LeaveValue)),
+        (New-Entry User 'Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy' 'HasAccepted' 0 $script:RemoveValue -AlsoAccept @(1)),
+        (New-Entry User 'Software\Microsoft\Input\TIPC' 'Enabled' 0 $script:RemoveValue -AlsoAccept @(1)),
+        (New-Entry User $inputPersonalization 'RestrictImplicitInkCollection' 1 0 -AlsoAccept @($script:RemoveValue)),
+        (New-Entry User $inputPersonalization 'RestrictImplicitTextCollection' 1 0 -AlsoAccept @($script:RemoveValue)),
+        (New-Entry User "$inputPersonalization\TrainedDataStore" 'HarvestContacts' 0 1 -AlsoAccept @($script:RemoveValue)),
+        (New-Entry User 'Software\Microsoft\Personalization\Settings' 'AcceptedPrivacyPolicy' 0 1 -AlsoAccept @($script:RemoveValue)),
+        (New-Entry User $advanced 'Start_TrackProgs' 0 $script:RemoveValue -AlsoAccept @(1))
+    ) $true))
+    # The Windows default start types are what a clean Windows 11 Pro 25H2
+    # install had (2026-09-25). Several of them start with a delay; Set-Service
+    # does not touch that flag, so switching back keeps the delay. Services
+    # left on Manual keep running until the next restart, because an app may be
+    # using one now.
+    [void]$settings.Add((New-Setting 'background-services' 'Windows features' 'Background services' 'Stops five Windows services from starting with Windows: Downloaded Maps Manager, Storage Service, Inventory and Compatibility Appraisal, Windows AI Components Host, and Windows Health and Optimized Experiences. They change from Automatic to Manual, so they still start when an app or a Windows feature asks for them. Also disables Microsoft Usage and Quality Insights, which Windows says produces facts for self-healing and optional workflows such as Personalized offers. The change takes full effect at the next restart. Switching back puts back the start types of a clean Windows install.' 'Start only when needed' 'Windows default' 'Service' @(
+        (New-ServiceEntry 'MapsBroker' 'Manual' 'Automatic'),
+        (New-ServiceEntry 'StorSvc' 'Manual' 'Automatic'),
+        (New-ServiceEntry 'InventorySvc' 'Manual' 'Automatic'),
+        (New-ServiceEntry 'WSAIFabricSvc' 'Manual' 'Automatic'),
+        (New-ServiceEntry 'whesvc' 'Manual' 'Automatic'),
+        (New-ServiceEntry 'wuqisvc' 'Disabled' 'Manual')
+    )))
+    [void]$settings.Add((New-Setting 'telemetry-service' 'Privacy' 'Telemetry service (DiagTrack)' 'Stops and disables the Connected User Experiences and Telemetry service. This is the Windows service that sends diagnostic data to Microsoft. Windows Error Reporting is a separate service and still runs, so crash reports can still be sent. Switching back makes the service start automatically again.' 'Disabled' 'Automatic' 'Service' @(
+        (New-ServiceEntry 'DiagTrack' 'Disabled' 'Automatic')
+    )))
+    [void]$settings.Add((New-Setting 'defender-samples' 'Privacy' 'Defender automatic sample submission' 'Stops Microsoft Defender from uploading suspicious files to Microsoft. On an analysis machine, those files can be case evidence. This is the Automatic sample submission switch in Windows Security. Dingo does not change cloud-delivered protection. CAUTION: Never send also turns off Block at first sight, which blocks new malware within seconds.' 'Never send' 'Send safe samples' 'DefenderSample'))
+
     [void]$settings.Add((New-Setting 'edge-first-run' 'Microsoft Edge' 'First-run and import extras' 'Suppress or restore default Edge first-run, import, and recommendation policies.' 'Suppressed' 'Allowed/default' 'Registry' @(
         (New-Entry Machine $edge 'HideFirstRunExperience' 1 $script:RemoveValue),
         (New-Entry Machine $edge 'AutoImportAtFirstRun' 4 $script:RemoveValue),
@@ -3521,6 +3585,7 @@ function Get-EntryValue($Entry) {
 }
 
 function Test-EntryValue($Entry, $Expected) {
+    if ($Expected -eq (Get-LeaveValue)) { return $true }
     $actual = Get-EntryValue $Entry
     if ($actual.Status -eq 'Error') {
         throw "Could not read $(Get-EntryPath $Entry)\$($Entry.Name): $($actual.ErrorMessage)"
@@ -3533,6 +3598,10 @@ function Set-EntryValue($Entry, $DesiredState, $Setting) {
     if ($Entry.Scope -in @('Machine','ElevatedUser') -and -not (Test-IsAdministrator)) { throw 'This registry setting requires elevation.' }
     $wanted = Get-EntryWantedValue $Entry $DesiredState $Setting
     $path = Get-EntryPath $Entry
+    if ($wanted -eq (Get-LeaveValue)) {
+        Write-Log 'DEBUG' "Left $path\$($Entry.Name) as it is"
+        return
+    }
     if ($wanted -eq $script:RemoveValue) {
         $current = Get-EntryValue $Entry
         if ($current.Status -eq 'Error') { throw "Could not read $path\$($Entry.Name) before removing it: $($current.ErrorMessage)" }
@@ -3831,11 +3900,130 @@ function Unpin-CopilotFromTaskbar {
     Write-Log 'DEBUG' 'Verified that no Copilot shortcut remains in the standard taskbar pin folder.'
 }
 
+# Microsoft honours diagnostic data off (0) only on Enterprise, Education and
+# Server editions, and treats it as required (1) on every other edition. So
+# Dingo writes 0 where Windows obeys it, and 1 elsewhere, so the card reads
+# back what Windows really does. ServerRdsh is Enterprise multi-session, the
+# edition of many managed VDI images. Pro Education is a Pro edition.
+function Get-LowestDiagnosticDataLevel {
+    try { $edition = [string](Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name EditionID -ErrorAction Stop).EditionID }
+    catch { return 1 }
+    if ($edition -match '^(Enterprise|Education|IoTEnterprise|Server)') { return 0 }
+    return 1
+}
+
+# A service card names each service with the startup type it wants for each
+# choice. The Service Control Manager is told through Set-Service rather than
+# by writing the Start value, because a registry write waits for a restart.
+function New-ServiceEntry([string]$Name, [string]$Preferred, [string]$Alternate) {
+    [PSCustomObject]@{ Scope='Machine'; Name=$Name; Preferred=$Preferred; Alternate=$Alternate }
+}
+
+function Get-ServiceStartType([string]$Name) {
+    $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $service) { return $null }
+    return [string]$service.StartType
+}
+
+function Get-ServiceKindState($Setting) {
+    $readings = @(foreach ($entry in @($Setting.Entries)) {
+        [PSCustomObject]@{ Entry=$entry; StartType=(Get-ServiceStartType $entry.Name) }
+    })
+    # Newer services are missing from older builds of Windows. The card still
+    # works for the services this computer has, and says which it skips.
+    $missing = @($readings | Where-Object { -not $_.StartType } | ForEach-Object { $_.Entry.Name })
+    $present = @($readings | Where-Object { $_.StartType })
+    if (-not $present.Count) { return New-StateResult 'Unavailable' 'Service not on this computer' "Windows has no service named $($missing -join ', ')." }
+    $details = if ($missing.Count) { "This version of Windows has no $($missing -join ', ') service, so Dingo skips it." } else { '' }
+    if (-not @($present | Where-Object { $_.StartType -ne $_.Entry.Preferred }).Count) { return New-StateResultForSetting $Setting $Setting.PreferredState $details }
+    if (-not @($present | Where-Object { $_.StartType -ne $_.Entry.Alternate }).Count) { return New-StateResultForSetting $Setting $Setting.AlternateState $details }
+    New-StateResult 'Partial' (($present | ForEach-Object { "$($_.Entry.Name): $($_.StartType)" }) -join ', ') $details
+}
+
+function Set-ServiceKindPart($Setting, [string]$DesiredState, [string]$Scope) {
+    if (-not (Test-IsAdministrator)) { throw 'Changing a Windows service requires elevation.' }
+    foreach ($entry in @($Setting.Entries)) {
+        $wanted = if ($DesiredState -eq $Setting.PreferredState) { $entry.Preferred } else { $entry.Alternate }
+        $service = Get-Service -Name $entry.Name -ErrorAction SilentlyContinue
+        if (-not $service) {
+            Write-Log 'INFO' "Skipped the $($entry.Name) service, which this version of Windows does not have."
+            continue
+        }
+        $before = [string]$service.StartType
+        Set-Service -Name $entry.Name -StartupType $wanted -ErrorAction Stop
+        # The startup type is the setting. A service that will not stop or start
+        # now still takes the new type at the next restart, so that is a warning.
+        try {
+            if ($wanted -eq 'Disabled' -and $service.Status -ne 'Stopped') { Stop-Service -Name $entry.Name -Force -ErrorAction Stop }
+            elseif ($wanted -eq 'Automatic' -and $service.Status -eq 'Stopped') { Start-Service -Name $entry.Name -ErrorAction Stop }
+        } catch {
+            Write-Log 'WARN' "The $($entry.Name) service is now $wanted, but Windows did not $(if ($wanted -eq 'Disabled') { 'stop' } else { 'start' }) it. The change takes effect at the next restart. $($_.Exception.Message)"
+        }
+        $after = Get-ServiceStartType $entry.Name
+        if ($after -ne $wanted) { throw "The $($entry.Name) service still starts as $after, not $wanted." }
+        Write-Log 'INFO' "Verified service $($entry.Name) startup type: $before => $after"
+    }
+}
+
+# Defender's own names for its sample submission values, from the
+# Set-MpPreference reference. The card offers only the first two.
+function Get-DefenderSampleChoices {
+    $choices = [ordered]@{}
+    $choices['Never send'] = 2
+    $choices['Send safe samples'] = 1
+    $choices['Always prompt'] = 0
+    $choices['Send all samples'] = 3
+    return $choices
+}
+
+function Get-DefenderSampleLabel([int]$Value) {
+    $choices = Get-DefenderSampleChoices
+    foreach ($label in @($choices.Keys)) { if ($choices[$label] -eq $Value) { return $label } }
+    return "Unknown value $Value"
+}
+
+function Get-DefenderSamplePolicyValue {
+    try {
+        $value = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet' -Name SubmitSamplesConsent -ErrorAction Stop).SubmitSamplesConsent
+        return [int]$value
+    } catch { return $null }
+}
+
+function Get-DefenderSampleConsent {
+    try { return [int](Get-MpPreference -ErrorAction Stop).SubmitSamplesConsent }
+    catch { throw "Microsoft Defender Antivirus did not answer. Another antivirus product may have replaced it. $($_.Exception.Message)" }
+}
+
+function Get-DefenderSampleKindState($Setting) {
+    try { $value = Get-DefenderSampleConsent }
+    catch { return New-StateResult 'Unavailable' 'Microsoft Defender is not available' $_.Exception.Message }
+    $details = ''
+    $policy = Get-DefenderSamplePolicyValue
+    if ($null -ne $policy) { $details = "A policy sets this to $(Get-DefenderSampleLabel $policy). A policy wins over a change Dingo makes." }
+    New-StateResultForSetting $Setting (Get-DefenderSampleLabel $value) $details
+}
+
+function Set-DefenderSampleKindPart($Setting, [string]$DesiredState, [string]$Scope) {
+    if (-not (Test-IsAdministrator)) { throw 'Changing Microsoft Defender requires elevation.' }
+    $choices = Get-DefenderSampleChoices
+    if (-not $choices.Contains($DesiredState)) { throw "Defender has no sample submission choice named '$DesiredState'." }
+    $wanted = [int]$choices[$DesiredState]
+    $before = Get-DefenderSampleConsent
+    Set-MpPreference -SubmitSamplesConsent $wanted -ErrorAction Stop
+    # Microsoft says a blocked change can look as if it worked, so the value is
+    # read back from Defender rather than trusted.
+    $after = Get-DefenderSampleConsent
+    if ($after -ne $wanted) {
+        throw "Defender still reports '$(Get-DefenderSampleLabel $after)'. A policy or Tamper Protection may have blocked the change."
+    }
+    Write-Log 'INFO' "Verified Defender sample submission: $(Get-DefenderSampleLabel $before) => $(Get-DefenderSampleLabel $after)"
+}
+
 function Get-RegistrySettingState($Setting) {
     # Each offered choice is tried in turn, so a card with a list of choices
     # reports the one that is actually in place rather than only a pair.
     foreach ($state in @($Setting.StateOptions)) {
-        $mismatched = @($Setting.Entries | Where-Object { -not (Test-EntryValue $_ (Get-EntryWantedValue $_ $state $Setting)) }).Count
+        $mismatched = @($Setting.Entries | Where-Object { -not (Test-EntryInState $_ $state $Setting) }).Count
         if ($mismatched -eq 0) { return New-StateResultForSetting $Setting $state }
     }
     if ($Setting.Id -eq 'date-time-format') {
@@ -4330,9 +4518,10 @@ function Set-RegistryKindPart($Setting, [string]$DesiredState, [string]$Scope, $
             }
         }
         $after = Get-EntryValue $entry
-        $component = New-ChangeComponent $target $Scope $outcome $message $before $after ([PSCustomObject]@{
+        $requested = if ($wanted -eq (Get-LeaveValue)) { $before } else { [PSCustomObject]@{
             Exists=($wanted -ne $script:RemoveValue); Value=$(if ($wanted -ne $script:RemoveValue) { $wanted } else { $null }); ValueType=$entry.Type
-        })
+        } }
+        $component = New-ChangeComponent $target $Scope $outcome $message $before $after $requested
         if ($null -ne $EntryResults) { [void]$EntryResults.Add($component) }
         Write-Log 'INFO' ("ENTRY " + (ConvertTo-Json -InputObject $component -Depth 8 -Compress))
     }
@@ -4347,6 +4536,9 @@ function Set-RegistryKindPart($Setting, [string]$DesiredState, [string]$Scope, $
         if ($script:LanguageChangePending -or $script:RegionChangedThisRun -or ($override -and $override -ne $uiLanguage)) { Register-InternationalSettingsFinalizer $DesiredState }
     }
     if ($Scope -eq 'User' -and $Setting.Id -eq 'windows-copilot' -and $DesiredState -eq $Setting.PreferredState) { Unpin-CopilotFromTaskbar }
+    # The PowerShell 7 opt-out is a machine environment variable. Programs that
+    # Explorer starts from now on see it only after this broadcast.
+    if ($Scope -eq 'Machine' -and $Setting.Id -eq 'diagnostic-data') { Send-EnvironmentChange }
 }
 
 function Set-TimeZoneKindPart($Setting, [string]$DesiredState, [string]$Scope) {
@@ -4994,6 +5186,8 @@ function Initialize-SettingHandlers {
     Register-SettingHandler 'WidgetsPackage' { param($entries) @('User') } 'Get-WidgetsKindState' 'Set-WidgetsKindPart' @{ User=@('Get-AppxPackage','Remove-AppxPackage') }
     Register-SettingHandler 'M365CopilotPackage' { param($entries) @('User') } 'Get-M365CopilotKindState' 'Set-M365CopilotKindPart' @{ User=@('Get-AppxPackage','Remove-AppxPackage') }
     Register-SettingHandler 'FolderView'{ param($entries) @('User') } 'Get-FolderViewKindState' 'Set-FolderViewKindPart'
+    Register-SettingHandler 'Service' { param($entries) @('Machine') } 'Get-ServiceKindState' 'Set-ServiceKindPart' @{ Machine=@('Get-Service','Set-Service') }
+    Register-SettingHandler 'DefenderSample' { param($entries) @('Machine') } 'Get-DefenderSampleKindState' 'Set-DefenderSampleKindPart' @{ Machine=@('Get-MpPreference','Set-MpPreference') }
 }
 
 function Test-SettingPreflight($Setting) {
@@ -5156,7 +5350,7 @@ if ($FinalizeInternationalSettings) {
 
 if ($SelfTest) {
     # Tools.json may add tools, so the total is the fixed settings plus the catalog.
-    $expectedSettingCount = 32 + @(Get-ToolCatalog).Count + @(Get-ToolCatalog | Where-Object { @($_.Associations).Count }).Count
+    $expectedSettingCount = 36 + @(Get-ToolCatalog).Count + @(Get-ToolCatalog | Where-Object { @($_.Associations).Count }).Count
     if ($script:Settings.Count -ne $expectedSettingCount) { throw "Expected $expectedSettingCount settings, found $($script:Settings.Count)." }
     foreach ($workerHelper in @('Test-DisplayLanguagePackInstalled','Install-DisplayLanguagePack','Write-Utf8FileAtomically','New-ApplyResult','New-OperationComponent')) {
         if (-not (Get-Command $workerHelper -CommandType Function -ErrorAction SilentlyContinue)) { throw "Elevated-worker helper is unavailable: $workerHelper" }
@@ -5182,7 +5376,7 @@ if ($SelfTest) {
     if ($launcherAst.Extent.Text -notmatch '-ElevationBroker' -or $launcherAst.Extent.Text -match '-Verb\s+RunAs') { throw 'The WPF launcher must delegate UAC to the non-WPF elevation broker.' }
     $duplicates = $script:Settings | Group-Object Id | Where-Object Count -gt 1
     if ($duplicates) { throw "Duplicate IDs: $($duplicates.Name -join ', ')" }
-    if ($script:SettingHandlers.Count -ne 12) { throw "Expected 12 setting handlers, found $($script:SettingHandlers.Count)." }
+    if ($script:SettingHandlers.Count -ne 14) { throw "Expected 14 setting handlers, found $($script:SettingHandlers.Count)." }
     foreach ($setting in $script:Settings) { [void](Get-SettingHandler $setting.Kind) }
     foreach ($dispatcherName in @('Get-SettingState','Set-SettingPart')) {
         $dispatcherAst = $selfTestAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $dispatcherName },$true)
