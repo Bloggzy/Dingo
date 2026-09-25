@@ -1841,6 +1841,19 @@ function Install-WingetPackage($Tool, [bool]$AllowUpgrade = $false) {
     $run = Invoke-ChildProcess $winget $arguments $TimeoutSeconds "The winget install of $($Tool.Package)" (New-Object Text.UTF8Encoding $false)
     $output = Remove-ProgressNoise $run.Output
     Write-Log 'DEBUG' "winget exit code $($run.ExitCode) for $($Tool.Package): $output"
+    # SOURCE_DATA_MISSING (0x8A15000F) straight after App Installer was first
+    # registered for this account: the client is there, but the package
+    # source it reads is a package of its own that this account never got.
+    # Mend the source once per run, then try this install one more time.
+    if ($run.ExitCode -eq -1978335217 -and -not (Get-RunScopedFlag 'WingetSourceRepairAttempted')) {
+        Set-RunScopedFlag 'WingetSourceRepairAttempted' $true
+        if (Repair-WingetSource $winget) {
+            Write-Log 'INFO' "Trying the $($Tool.Name) install again now that the winget source is mended."
+            $run = Invoke-ChildProcess $winget $arguments $TimeoutSeconds "The winget install of $($Tool.Package)" (New-Object Text.UTF8Encoding $false)
+            $output = Remove-ProgressNoise $run.Output
+            Write-Log 'DEBUG' "winget exit code $($run.ExitCode) for $($Tool.Package): $output"
+        }
+    }
     # UPDATE_NOT_APPLICABLE (0x8A15002B), or PACKAGE_ALREADY_INSTALLED
     # (0x8A150061) when --no-upgrade prevented an implicit upgrade. The shared
     # executor still verifies installation using the catalog's detection rules.
@@ -1857,6 +1870,45 @@ function Install-WingetPackage($Tool, [bool]$AllowUpgrade = $false) {
         } else { '' }
         throw "winget exited with code $($run.ExitCode) for $($Tool.Package). $(Get-OutputTail $output)$hint"
     }
+}
+
+function Get-WingetSourcePackageUrl { 'https://cdn.winget.microsoft.com/cache/source.msix' }
+
+function Test-WingetSourceReadable([string]$Winget) {
+    # A search that names no real package still has to open the source first,
+    # so its exit code says whether the source can be read at all.
+    $run = Invoke-ChildProcess $Winget @('search','--id','Microsoft.PowerShell','--exact','--source','winget','--accept-source-agreements','--disable-interactivity') 120 'The winget source check' (New-Object Text.UTF8Encoding $false)
+    return ($run.ExitCode -ne -1978335217)
+}
+
+function Repair-WingetSource([string]$Winget) {
+    # Returns $true when the winget source can be read afterwards. First the
+    # command winget itself suggests; then, if that is not enough, the source
+    # package installed straight from Microsoft's winget address.
+    Write-Log 'WARN' "winget could not open its package source for $env:USERNAME. Dingo resets the source and tries again."
+    try {
+        $reset = Invoke-ChildProcess $Winget @('source','reset','--force','--disable-interactivity') 180 'The winget source reset' (New-Object Text.UTF8Encoding $false)
+        Write-Log 'DEBUG' "winget source reset exit code $($reset.ExitCode). $(Get-OutputTail (Remove-ProgressNoise $reset.Output))"
+        if (Test-WingetSourceReadable $Winget) { Write-Log 'INFO' 'The winget source reset worked.'; return $true }
+    } catch { Write-Log 'WARN' "The winget source reset failed: $($_.Exception.Message)" }
+    $url = Get-WingetSourcePackageUrl
+    $path = Join-Path ([IO.Path]::GetTempPath()) ("dingo-winget-source-{0}.msix" -f [Guid]::NewGuid().ToString('N'))
+    try {
+        Initialize-DingoWebSession
+        try {
+            Invoke-WithDownloadRetry { Invoke-WebRequest -Uri $url -OutFile $path -UseBasicParsing -TimeoutSec 300 -ErrorAction Stop } 'The winget source download'
+        } catch { throw (New-DownloadFailure 'The winget package source' $url $_) }
+        # Add-AppxPackage checks the Microsoft signature on the package itself.
+        Add-AppxPackage -Path $path -ErrorAction Stop
+        Write-Log 'INFO' "Installed the winget package source for $env:USERNAME from $url."
+        if (Test-WingetSourceReadable $Winget) { return $true }
+        Write-Log 'WARN' 'winget still cannot open its package source after the source package was installed.'
+    } catch {
+        Write-Log 'WARN' "Could not install the winget package source: $($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+    return $false
 }
 
 function ConvertTo-NativeArgument([AllowEmptyString()][string]$Value) {
@@ -4238,7 +4290,12 @@ function Get-LanguageKindState($Setting) {
     $parts = New-Object System.Collections.ArrayList
     if (-not $check.DisplayPack) { [void]$parts.Add("no display pack installed for $(@($wanted.Packs) -join ' or ')") }
     if ($systemPreferred -notin $accepted -and $override -ne $wanted.Tag) { [void]$parts.Add("system UI is $systemPreferred") }
-    if ($systemLocale -ne $wanted.Tag) { [void]$parts.Add("system locale is $systemLocale") }
+    if ($systemLocale -ne $wanted.Tag) {
+        # Signing out does not change the system locale; only a restart does.
+        # Say so, or the person signs out, sees no change, and thinks it failed.
+        if (Test-SystemLocaleAccepted $wanted.Tag) { [void]$parts.Add("system locale changes from $systemLocale to $($wanted.Tag) when Windows restarts (signing out is not enough)") }
+        else { [void]$parts.Add("system locale is $systemLocale") }
+    }
     if (-not $check.UserReady) { [void]$parts.Add("user languages: $(if ($tags) { $tags -join ', ' } else { 'none' })") }
     if ($check.DisplayPack -and $override -ne $wanted.Tag -and $uiLanguage -ne $wanted.Tag) { [void]$parts.Add("user UI is $uiLanguage") }
     New-StateResult 'Partial' ('Partly configured: ' + ($parts -join '; '))

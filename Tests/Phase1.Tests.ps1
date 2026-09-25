@@ -330,8 +330,38 @@ try {
         function Get-WingetPath { 'mock-winget.exe' }
         function Resolve-UsableWinget($WingetPath) { $WingetPath }
         function Invoke-ChildProcess { [pscustomobject]@{ExitCode=-1978335217;Output='Failed when opening source(s)'} }
+        $script:SourceRepairs = 0
+        function Repair-WingetSource { $script:SourceRepairs++; $false }
+        Set-RunScopedFlag 'WingetSourceRepairAttempted' $false
         $tool = ($script:Settings | Where-Object Id -eq 'tool-7zip').Entries[0]
         Assert-Throws { Install-WingetPackage $tool } 'winget source reset --force'
+        Assert-Throws { Install-WingetPackage $tool } 'winget source reset --force'
+        Assert ($script:SourceRepairs -eq 1) "The source repair ran $($script:SourceRepairs) times instead of once per run."
+    }
+    Test-Case 'A package source that is mended lets the same install run again' {
+        # On a VDI image App Installer had just been registered for the
+        # administrator account, and its package source was missing.
+        function Resolve-UsableWinget($WingetPath) { $WingetPath }
+        function Get-WingetPath { 'mock-winget.exe' }
+        $script:Runs = New-Object Collections.ArrayList
+        function Invoke-ChildProcess { param($Path, $Arguments) [void]$script:Runs.Add(($Arguments -join ' ')); if ($script:Runs.Count -eq 1) { [pscustomobject]@{ExitCode=-1978335217;Output='Data required by the source is missing'} } else { [pscustomobject]@{ExitCode=0;Output='Successfully installed'} } }
+        function Repair-WingetSource { $true }
+        Set-RunScopedFlag 'WingetSourceRepairAttempted' $false
+        $tool = ($script:Settings | Where-Object Id -eq 'tool-7zip').Entries[0]
+        Install-WingetPackage $tool
+        Assert ($script:Runs.Count -eq 2) "winget install ran $($script:Runs.Count) times instead of twice."
+        Set-RunScopedFlag 'WingetSourceRepairAttempted' $false
+    }
+    Test-Case 'The winget source repair falls back to the source package and needs no network in tests' {
+        $script:Steps = New-Object Collections.ArrayList
+        function Invoke-ChildProcess { param($Path, $Arguments) [void]$script:Steps.Add($Arguments[0] + ' ' + $Arguments[1]); if ($Arguments[0] -eq 'search' -and $script:Steps -notcontains 'add package') { [pscustomobject]@{ExitCode=-1978335217;Output=''} } else { [pscustomobject]@{ExitCode=0;Output=''} } }
+        function Invoke-WebRequest { param($Uri, $OutFile) Set-Content -LiteralPath $OutFile -Value 'x' }
+        function Add-AppxPackage { param($Path, $ErrorAction) [void]$script:Steps.Add('add package') }
+        Assert (Repair-WingetSource 'mock-winget.exe') 'A source that reads after the package was added was called broken.'
+        Assert (($script:Steps -join ',') -eq 'source reset,search --id,add package,search --id') "The repair steps ran as: $($script:Steps -join ', ')."
+        function Add-AppxPackage { param($Path, $ErrorAction) throw 'Deployment failed' }
+        function Invoke-ChildProcess { [pscustomobject]@{ExitCode=-1978335217;Output=''} }
+        Assert (-not (Repair-WingetSource 'mock-winget.exe')) 'A source that never reads was called mended.'
     }
     Test-Case 'Winget no-upgrade refusal is accepted only for ensure-installed' {
         function Resolve-UsableWinget($WingetPath) { $WingetPath }
