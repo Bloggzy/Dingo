@@ -242,6 +242,30 @@ function Test-IsAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-DesktopUserSid {
+    # The desktop belongs to whoever owns File Explorer in this Windows session.
+    # Returns $null when that cannot be read, for example with no Explorer.
+    try {
+        $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+        foreach ($shell in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe' AND SessionId=$sessionId" -ErrorAction Stop)) {
+            $owner = Invoke-CimMethod -InputObject $shell -MethodName GetOwnerSid -ErrorAction Stop
+            if ($owner.ReturnValue -eq 0 -and $owner.Sid) { return [string]$owner.Sid }
+        }
+    } catch {}
+    return $null
+}
+
+function Test-ElevatedAsOtherAccount {
+    # An elevated start is only a problem when it runs as a different account
+    # from the desktop, such as a separate admin account typed into a UAC
+    # prompt. Then HKCU is the wrong account. An admin who is the only account,
+    # with UAC off or as the built-in Administrator, is the desktop user, so
+    # Dingo can run as normal. When the desktop owner cannot be read, stay safe.
+    $desktopSid = Get-DesktopUserSid
+    if (-not $desktopSid) { return $true }
+    return $desktopSid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+}
+
 function Test-DeviceIsManaged {
     # Microsoft Edge refuses a subset of its policies unless Windows is joined to
     # an Active Directory domain, joined to Entra ID, or enrolled in a real MDM
@@ -6338,8 +6362,8 @@ if ($Apply -or $WhatIf -or $Include -or $Exclude) {
     }
     # A dry run changes nothing, so it stays available where every process is
     # elevated, such as Windows Sandbox. Only real changes are refused.
-    if ((Test-IsAdministrator) -and -not $WhatIf) {
-        Write-CliErrorResponse 'Start Dingo from the signed-in desktop account, not from an elevated PowerShell window. Dingo will request administrator approval only for settings that need it.' 2 'Apply'
+    if ((Test-IsAdministrator) -and -not $WhatIf -and (Test-ElevatedAsOtherAccount)) {
+        Write-CliErrorResponse 'This elevated window is a different account from the signed-in desktop. Start Dingo from the signed-in desktop account. Dingo will request administrator approval only for settings that need it.' 2 'Apply'
         exit 2
     }
     $elevatedDryRun = [bool]((Test-IsAdministrator) -and $WhatIf)
@@ -6498,10 +6522,10 @@ if ($Apply -or $WhatIf -or $Include -or $Exclude) {
 # The UI self-test builds the window, checks it, and closes it without changing
 # anything, so it must stay runnable where every process is elevated, such as
 # Windows Sandbox. The other self-tests already run before this guard.
-if ((Test-IsAdministrator) -and -not $UiSelfTest) {
+if ((Test-IsAdministrator) -and -not $UiSelfTest -and (Test-ElevatedAsOtherAccount)) {
     Add-Type -AssemblyName PresentationFramework
     $message = @(
-        'Dingo was started as an administrator. Close this window and start it normally.',
+        'Dingo was started as an administrator account that is not the signed-in desktop account. Close this window and start it normally.',
         '',
         'Double-click Start-Dingo.cmd. Do not use "Run as administrator".',
         '',
@@ -6512,6 +6536,7 @@ if ((Test-IsAdministrator) -and -not $UiSelfTest) {
 }
 
 Initialize-Log
+if (Test-IsAdministrator) { Write-Log 'INFO' 'Dingo is elevated, and it runs as the signed-in desktop account. Continuing.' }
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 [xml]$xaml = @'

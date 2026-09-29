@@ -235,6 +235,25 @@ try {
         Assert ($source -match 'MinimumVersion') 'The repair accepts any module version.'
         Assert ($source -match "Get-Command Repair-WinGetPackageManager") 'The repair never checks the command exists.'
     }
+    Test-Case 'An elevated start is refused only when it is a different account from the desktop' {
+        $self = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        # The only account on a DFIR VM is an admin with UAC off: same account.
+        function Get-DesktopUserSid { $self }
+        Assert (-not (Test-ElevatedAsOtherAccount)) 'The desktop account was refused.'
+        # A separate admin account typed into a UAC prompt: wrong HKCU.
+        function Get-DesktopUserSid { 'S-1-5-21-1-2-3-9999' }
+        Assert (Test-ElevatedAsOtherAccount) 'A different admin account was let through.'
+        # No Explorer to read: stay safe.
+        function Get-DesktopUserSid { $null }
+        Assert (Test-ElevatedAsOtherAccount) 'An unknown desktop owner was let through.'
+    }
+    Test-Case 'The desktop owner is read from this session' {
+        # A build runner can have no Explorer. Then there is no owner to read.
+        $desktopSid = Get-DesktopUserSid
+        $hasExplorer = [bool](Get-Process explorer -ErrorAction SilentlyContinue | Where-Object SessionId -eq ([Diagnostics.Process]::GetCurrentProcess().SessionId))
+        if ($hasExplorer) { Assert ($desktopSid -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) 'The desktop owner is not this account.' }
+        else { Assert ($null -eq $desktopSid) 'A desktop owner was invented.' }
+    }
     Test-Case 'The gallery is only required when the module is missing or too old' {
         function Get-Module { $null }
         Assert ((Get-WingetRepairEndpoints).Count -eq 2) 'A missing module did not require the gallery.'
