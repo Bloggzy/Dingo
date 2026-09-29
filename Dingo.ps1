@@ -1346,6 +1346,24 @@ function Get-BuiltInToolCatalog {
             )
         },
         [PSCustomObject]@{
+            id='tool-azcopy'; name='AzCopy'; category='Cloud'
+            description='Copies files to and from Azure blob and file storage from the command line, for example to collect a storage container into a case folder. The command-line companion to Azure Storage Explorer. Downloaded from Microsoft''s own GitHub releases and unpacked into the tools folder.'
+            install=[PSCustomObject]@{
+                kind='github-release'; scope='machine'
+                repo='Azure/azure-storage-azcopy'
+                assetPattern='azcopy_windows_amd64_*.zip'
+                dest='%DINGO_TOOL_ROOT%\AzCopy'
+                # The archive wraps azcopy.exe in a folder that carries the
+                # version. Taking it off keeps one steady path, so an update
+                # replaces the program rather than adding a second copy.
+                stripRoot=$true
+            }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/AzCopy'; pattern='azcopy.exe'; recurse=$false }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/AzCopy/azcopy.exe' }
+            )
+        },
+        [PSCustomObject]@{
             id='tool-dissect'; name='Dissect'; category='Forensics'
             description='Fox-IT''s framework that reads disk images, VM disks, and live file systems as one target. Command-line tools such as target-query, target-shell, target-fs, and rdump. Installed with pip into a venv of its own in the tools folder. Needs Python 3.13, which is a card of its own on this tab.'
             install=[PSCustomObject]@{
@@ -2348,7 +2366,7 @@ function Install-GitHubReleasePackage($Tool) {
             New-Item -ItemType Directory -Path $destination -Force -ErrorAction Stop | Out-Null
             Write-Log 'INFO' "Created $destination."
         }
-        $written = Expand-DingoZipArchive $archivePath $destination
+        $written = Expand-DingoZipArchive $archivePath $destination -StripRootFolder:$Tool.StripRoot
         Write-Log 'INFO' "Unpacked $written file(s) of $($Tool.Name) $tag into $destination."
     } finally {
         $ProgressPreference = $progress
@@ -5650,7 +5668,7 @@ if ($SelfTest) {
     # The tools that come straight from a GitHub release. Each one must name a
     # repository rather than an address, must ask for a zip, must unpack inside
     # the tools folder, and must offer its program to the PATH card.
-    foreach ($releaseId in @('tool-memprocfs','tool-volatility3','tool-hayabusa','tool-duckdb')) {
+    foreach ($releaseId in @('tool-memprocfs','tool-volatility3','tool-hayabusa','tool-duckdb','tool-azcopy')) {
         $releaseTool = $builtInTools | Where-Object Id -eq $releaseId | Select-Object -First 1
         if ($releaseTool.InstallKind -ne 'github-release') { throw "'$releaseId' must use the github-release install kind." }
         if ($releaseTool.Url) { throw "'$releaseId' must not name a download address; Dingo builds it from the repository." }
@@ -5664,6 +5682,11 @@ if ($SelfTest) {
         if (-not $releaseSetting.RequiresAdmin) { throw "'$releaseId' must request administrator approval." }
         if ([bool]$releaseSetting.Requirements['WingetRequired']) { throw "A release download must not be blocked by a missing winget." }
     }
+    # AzCopy wraps its program in a versioned folder. Without stripping it, each
+    # update would add a second azcopy.exe beside the first.
+    $azcopyTool = $builtInTools | Where-Object Id -eq 'tool-azcopy' | Select-Object -First 1
+    if (-not $azcopyTool.StripRoot) { throw 'AzCopy must drop the versioned folder, or its launcher breaks on every update.' }
+    if ((Get-Command Install-GitHubReleasePackage).Definition -notmatch 'StripRootFolder:\$Tool\.StripRoot') { throw 'A release download must honour stripRoot.' }
     # Hayabusa stamps its version into the program name, so its launcher is named
     # by hand. Every other tool takes the name from the file.
     $hayabusaTool = $builtInTools | Where-Object Id -eq 'tool-hayabusa' | Select-Object -First 1

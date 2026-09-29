@@ -269,6 +269,7 @@ The cards are shown in name order, and the **Install tools** tab has a search bo
 | `tool-duckdb` | DuckDB | yes |
 | `tool-arsenalimagemounter` | Arsenal Image Mounter | yes |
 | `tool-azurestorageexplorer` | Azure Storage Explorer | yes |
+| `tool-azcopy` | AzCopy | yes |
 | `tool-dissect` | Dissect | yes |
 
 Select .NET 9 as well as Eric Zimmerman's tools. Those tools need it, and a fresh Windows 11 does not have it. Dingo installs it first, so one run installs both in the right order.
@@ -279,7 +280,7 @@ The table above is the order Dingo installs in, not the order the window shows. 
 
 Most tools come from winget, so you need a network connection. Dingo also checks the winget version before it installs anything. A client older than 1.6 cannot read the package list Microsoft publishes today, and every install fails with `0x8a15000f`, "Data required by the source is missing". When Dingo is running as an administrator it repairs winget itself with `Repair-WinGetPackageManager`, then carries on. Otherwise it stops and tells you to install the latest App Installer from <https://aka.ms/getwinget>. Before it repairs anything, Dingo checks it can reach the App Installer download, and the PowerShell Gallery when the repair module is missing or too old. A computer with no route out is told so by name, rather than waiting for a download to time out. Eric Zimmerman's tools are not in winget. Dingo runs the author's own `Get-ZimmermanTools.ps1` over HTTPS and checks its SHA256 before running it. They install to `EZTools` inside the tools folder, `C:\DFIR\Tools` by default, and the download is several hundred megabytes.
 
-MemProcFS, Volatility 3, Hayabusa, and DuckDB are not in winget either. Each one ships a zip on its own GitHub releases page, so Dingo reads the latest release, downloads the Windows file, and unpacks it into its own folder inside the tools folder:
+MemProcFS, Volatility 3, Hayabusa, DuckDB, and AzCopy are not in winget either. Each one ships a zip on its own GitHub releases page, so Dingo reads the latest release, downloads the Windows file, and unpacks it into its own folder inside the tools folder:
 
 | Tool | Folder | Command |
 | --- | --- | --- |
@@ -287,8 +288,9 @@ MemProcFS, Volatility 3, Hayabusa, and DuckDB are not in winget either. Each one
 | Volatility 3 | `Volatility3` | `vol`, `volshell` |
 | Hayabusa | `Hayabusa` | `hayabusa` |
 | DuckDB | `DuckDB` | `duckdb` |
+| AzCopy | `AzCopy` | `azcopy` |
 
-All four are command-line tools, so they get no Start menu or Desktop shortcut. Select **Run tools from anywhere** to type the commands above from any folder. Volatility 3 is the standalone Windows build, so no Python install is needed.
+All five are command-line tools, so they get no Start menu or Desktop shortcut. Select **Run tools from anywhere** to type the commands above from any folder. Volatility 3 is the standalone Windows build, so no Python install is needed.
 
 ### Arsenal Image Mounter
 
@@ -445,7 +447,7 @@ Any path may hold `%DINGO_TOOL_ROOT%`, which Dingo replaces with the tools folde
 | `install.python` | python-venv only | Full path of the `python.exe` that builds the venv, such as `%ProgramFiles%/Python313/python.exe`. Plain `python` is refused |
 | `install.packages` | python-venv only | List of pip package names. Each may carry an extra and one version condition, such as `dissect.target[full]==3.25.1`. Anything that looks like a pip option is refused |
 | `install.linkName` | mega-page only | The product name to look for on the page. Exactly one link must sit next to it, or Dingo stops |
-| `install.stripRoot` | no | mega-page only. `true` takes off a single wrapping folder, for an archive whose top folder carries the version |
+| `install.stripRoot` | no | github-release and mega-page. `true` takes off a single wrapping folder, for an archive whose top folder carries the version |
 | `install.arguments` | no | Extra arguments. `-Dest` is always passed for you |
 | `install.timeoutMinutes` | no | 1 to 240. Default 15 (winget), 30 (github-release, mega-page, and python-venv), or 45 (script) |
 | `install.scope` | no | `machine` (default) or `user` |
