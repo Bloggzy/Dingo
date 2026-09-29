@@ -1333,6 +1333,19 @@ function Get-BuiltInToolCatalog {
             )
         },
         [PSCustomObject]@{
+            # Listed after the .NET 10 card, because the elevated worker applies
+            # the plan in catalog order. From 1.42.0 it needs a .NET 10 runtime.
+            # Its installer can add one, but that copy is not kept up to date.
+            id='tool-azurestorageexplorer'; name='Azure Storage Explorer'; category='Cloud'
+            description='Browses and downloads Azure blob containers, file shares, queues, and tables, for example storage named in a cloud case. Window tool from Microsoft. Needs the .NET 10 Desktop Runtime, which is a card of its own on this tab.'
+            install=[PSCustomObject]@{ kind='winget'; package='Microsoft.Azure.StorageExplorer'; scope='machine' }
+            requires=@('tool-dotnet-desktop-10')
+            detect=@(
+                [PSCustomObject]@{ kind='uninstall-key'; match='Microsoft Azure Storage Explorer*' },
+                [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\Microsoft Azure Storage Explorer\StorageExplorer.exe' }
+            )
+        },
+        [PSCustomObject]@{
             id='tool-dissect'; name='Dissect'; category='Forensics'
             description='Fox-IT''s framework that reads disk images, VM disks, and live file systems as one target. Command-line tools such as target-query, target-shell, target-fs, and rdump. Installed with pip into a venv of its own in the tools folder. Needs Python 3.13, which is a card of its own on this tab.'
             install=[PSCustomObject]@{
@@ -5877,6 +5890,13 @@ if ($SelfTest) {
     if (-not $aimSetting) { throw 'Arsenal Image Mounter produced no card.' }
     if (-not $aimSetting.RequiresAdmin) { throw 'Arsenal Image Mounter must request administrator approval.' }
     if ([bool]$aimSetting.Requirements['WingetRequired']) { throw 'A page download must not be blocked by a missing winget.' }
+    # Storage Explorer 1.42.0 and later will not start without a .NET 10 runtime.
+    $aseTool = $builtInTools | Where-Object Id -eq 'tool-azurestorageexplorer' | Select-Object -First 1
+    if (-not $aseTool) { throw "The catalog is missing 'tool-azurestorageexplorer'." }
+    if ($aseTool.InstallKind -ne 'winget' -or $aseTool.Package -ne 'Microsoft.Azure.StorageExplorer' -or $aseTool.Scope -ne 'machine') { throw 'Azure Storage Explorer must install machine-wide from winget.' }
+    if (@($aseTool.Requires) -notcontains 'tool-dotnet-desktop-10') { throw 'Azure Storage Explorer must declare the .NET 10 runtime it needs.' }
+    $aseIndex = [array]::IndexOf(@($builtInTools | ForEach-Object { $_.Id }), 'tool-azurestorageexplorer')
+    if ($net10Index -gt $aseIndex) { throw 'The .NET 10 runtime must be listed before Azure Storage Explorer.' }
 
     # A mega-page entry that could send the download elsewhere is refused.
     foreach ($badInstall in @(

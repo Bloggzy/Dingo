@@ -268,11 +268,12 @@ The cards are shown in name order, and the **Install tools** tab has a search bo
 | `tool-hayabusa` | Hayabusa | yes |
 | `tool-duckdb` | DuckDB | yes |
 | `tool-arsenalimagemounter` | Arsenal Image Mounter | yes |
+| `tool-azurestorageexplorer` | Azure Storage Explorer | yes |
 | `tool-dissect` | Dissect | yes |
 
 Select .NET 9 as well as Eric Zimmerman's tools. Those tools need it, and a fresh Windows 11 does not have it. Dingo installs it first, so one run installs both in the right order.
 
-.NET 10 is a separate card. Newer analyst tools are built on .NET 10, and a .NET 9 install does not satisfy them. Arsenal Image Mounter is one of them. The two runtimes sit side by side; installing one does not touch or replace the other.
+.NET 10 is a separate card. Newer analyst tools are built on .NET 10, and a .NET 9 install does not satisfy them. Arsenal Image Mounter and Azure Storage Explorer are two of them. The two runtimes sit side by side; installing one does not touch or replace the other.
 
 The table above is the order Dingo installs in, not the order the window shows. The window sorts the cards by name so a growing list stays easy to read. The plan still runs in the order above, so a runtime is always installed before the tools that need it.
 
