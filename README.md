@@ -17,7 +17,7 @@ Current version: **0.8.9**.
 ## Use the window
 
 1. Copy the whole Dingo folder to the machine.
-2. Double-click `Start-Dingo.cmd`. Do **not** use *Run as administrator*. Dingo asks for administrator rights later, only when it needs them.
+2. Double-click `Start-Dingo.cmd`. Do **not** use *Run as administrator*. Dingo asks for administrator rights later, only when it needs them. If the only account on the computer is an administrator, and Windows starts everything elevated, Dingo still opens.
 3. Pick a section:
    - **Tweaks** - Windows settings, with one tab per area: Region & language, Windows features, Privacy, Microsoft Edge, Windows Update, Taskbar, File Explorer, Start menu, and Windows Terminal. A pill on each card says who it affects: **Account only**, **Whole computer**, or **Account + computer**. A gold pill marks a tweak that needs admin approval.
    - **Tools** - Install tools, Tool shortcuts, File associations.
@@ -153,7 +153,7 @@ A folder Dingo cannot use ends the run with exit code `2` and says why. See [Whe
 
 Exit codes: `0` success, `1` a setting failed, `2` bad command line, `3` Dingo already running.
 
-Do not apply changes from an elevated console. Dingo must stay in your signed-in account, so per-user settings land in the right profile.
+Do not apply changes from an elevated console that runs as a different account. Dingo must stay in your signed-in account, so per-user settings land in the right profile. An elevated console that is the signed-in account is allowed.
 
 ## What it changes
 
