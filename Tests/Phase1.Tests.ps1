@@ -169,19 +169,97 @@ try {
         Assert-Throws { Set-ShortcutKindPart $setting Created Machine } 'not created by Dingo'
         Assert (-not (Test-Path -LiteralPath (Join-Path $scratch 'New First Link.lnk'))) 'Earlier shortcut was created before conflict detection.'
     }
-    Test-Case 'Install skips detected tools in both scopes and for both installer kinds' {
+    Test-Case 'Installed leaves detected tools alone in both scopes, in both modes, for every installer kind' {
         function Find-InstalledTool { [pscustomobject]@{Version='old-but-approved'} }
         function Install-WingetPackage { throw 'Unexpected winget install' }
         function Install-ScriptPackage { throw 'Unexpected script install' }
-        foreach ($id in @('tool-7zip','tool-ripgrep','tool-eztools')) {
+        function Install-GitHubReleasePackage { throw 'Unexpected release download' }
+        function Install-PythonVenvPackage { throw 'Unexpected pip install' }
+        # The card says what happens: the Options choice only picks the card's
+        # starting choice, and never turns Installed into an update.
+        foreach ($mode in @('Update','Keep')) {
+            $script:InstalledToolsMode = $mode
+            try {
+                foreach ($id in @('tool-7zip','tool-ripgrep','tool-eztools','tool-hayabusa','tool-dissect')) {
+                    $setting = $script:Settings | Where-Object Id -eq $id
+                    Set-PackageKindPart $setting Installed $setting.Entries[0].Scope
+                }
+            } finally { $script:InstalledToolsMode = 'Update' }
+        }
+    }
+    Test-Case 'Update installed tool updates every kind, and winget only when it offers something newer' {
+        $calls = New-Object Collections.ArrayList
+        function Find-InstalledTool { [pscustomobject]@{Version='1'} }
+        function Get-WingetPath { 'mock-winget.exe' }
+        function Install-WingetPackage($Tool, $AllowUpgrade) { [void]$calls.Add("winget:$AllowUpgrade") }
+        function Install-ScriptPackage { [void]$calls.Add('script') }
+        function Install-GitHubReleasePackage($Tool, $SkipIfCurrent) { [void]$calls.Add("release:$SkipIfCurrent") }
+        function Install-PythonVenvPackage($Tool, $AllowUpgrade) { [void]$calls.Add("pip:$AllowUpgrade") }
+        function Get-ToolUpdateStatus($Tool) { New-ToolUpdateStatus $Tool.Id 'Available' '1' '2' 'winget offers 2.' }
+        foreach ($id in @('tool-7zip','tool-eztools','tool-hayabusa','tool-dissect')) {
             $setting = $script:Settings | Where-Object Id -eq $id
-            Set-PackageKindPart $setting Installed $setting.Entries[0].Scope
+            Set-PackageKindPart $setting 'Update installed tool' $setting.Entries[0].Scope
+        }
+        Assert (($calls -join ',') -eq 'winget:True,script,release:True,pip:True') "Wrong update dispatch: $($calls -join ',')"
+        $sevenZip = $script:Settings | Where-Object Id -eq 'tool-7zip'
+        # Up to date: nothing to do, and nothing handed to winget.
+        function Get-ToolUpdateStatus($Tool) { New-ToolUpdateStatus $Tool.Id 'Current' '2' '2' 'stub' }
+        [void]$calls.Clear()
+        Set-PackageKindPart $sevenZip 'Update installed tool' Machine
+        Assert (-not $calls.Count) 'winget was run for a tool that is up to date.'
+        # Not matched by winget: installing would make a second copy, so it fails and says why.
+        function Get-ToolUpdateStatus($Tool) { New-ToolUpdateStatus $Tool.Id 'NotListed' -Message 'winget does not list it.' }
+        Assert-Throws { Set-PackageKindPart $sevenZip 'Update installed tool' Machine } 'second time\. 7-Zip is still installed\.'
+        Assert (-not $calls.Count) 'winget was run for a tool it does not list.'
+        function Get-ToolUpdateStatus($Tool) { New-ToolUpdateStatus $Tool.Id 'Available' '1' '2' 'winget offers 2.' }
+        function Install-WingetPackage { throw 'winget said no' }
+        Assert-Throws { Set-PackageKindPart $sevenZip 'Update installed tool' Machine } 'update of 7-Zip did not finish: winget said no\. 7-Zip is still installed\.'
+    }
+    Test-Case 'A tool card starts on Update installed tool only when the check found something to fetch' {
+        $card = $script:Settings | Where-Object Id -eq 'tool-7zip'
+        $saved = $card.CurrentState
+        $installedState = New-StateResult 'Partial' 'stub'
+        $installedState | Add-Member NoteProperty Detection ([pscustomobject]@{ Complete=$true })
+        try {
+            $card.CurrentState = $installedState
+            foreach ($case in @(
+                @{ Mode='Update'; Status='Available'; Want='Update installed tool' },
+                @{ Mode='Update'; Status='Unknown'; Want='Update installed tool' },
+                @{ Mode='Update'; Status='SelfManaged'; Want='Update installed tool' },
+                @{ Mode='Update'; Status='Current'; Want='Installed' },
+                @{ Mode='Update'; Status='NotListed'; Want='Installed' },
+                @{ Mode='Update'; Status='Failed'; Want='Installed' },
+                @{ Mode='Keep'; Status='Available'; Want='Installed' }
+            )) {
+                $script:InstalledToolsMode = $case.Mode
+                $script:ToolUpdateInfo = @{ 'tool-7zip' = (New-ToolUpdateStatus 'tool-7zip' $case.Status) }
+                $card.ChoiceSetByHand = $false
+                Set-ToolDefaultChoices @($card)
+                Assert ($card.DesiredState -eq $case.Want) "$($case.Mode)/$($case.Status) started on '$($card.DesiredState)', not '$($case.Want)'."
+            }
+            # A choice made by hand is never overwritten by a later check.
+            $script:InstalledToolsMode = 'Update'
+            $card.ChoiceSetByHand = $true
+            $card.DesiredState = 'Installed'
+            $script:ToolUpdateInfo = @{ 'tool-7zip' = (New-ToolUpdateStatus 'tool-7zip' 'Available') }
+            Set-ToolDefaultChoices @($card)
+            Assert ($card.DesiredState -eq 'Installed') 'A version check overwrote a choice made by hand.'
+            # A tool that is not installed always starts on Installed.
+            $card.ChoiceSetByHand = $false
+            $card.CurrentState = New-StateResult 'Partial' 'Not installed'
+            Set-ToolDefaultChoices @($card)
+            Assert ($card.DesiredState -eq 'Installed') 'A missing tool started on Update installed tool.'
+        } finally {
+            $script:InstalledToolsMode = 'Update'; $script:ToolUpdateInfo = @{}
+            $card.CurrentState = $saved; $card.DesiredState = 'Installed'; $card.ChoiceSetByHand = $false
         }
     }
     Test-Case 'Missing tools install; explicit updates run only for installed tools' {
         $calls = New-Object Collections.ArrayList
         $present = $false
         function Find-InstalledTool { if ($present) { [pscustomobject]@{Version='1'} } }
+        function Get-WingetPath { 'mock-winget.exe' }
+        function Get-ToolUpdateStatus($Tool) { New-ToolUpdateStatus $Tool.Id 'Available' '1' '2' 'stub' }
         function Install-WingetPackage($Tool, $AllowUpgrade) { [void]$calls.Add("winget:$AllowUpgrade") }
         function Install-ScriptPackage { [void]$calls.Add('script') }
         $winget = $script:Settings | Where-Object Id -eq 'tool-7zip'
@@ -648,6 +726,14 @@ try {
             $captured = @(New-ApplyPlan @($tool))
             $tool.ChoiceControls[0].IsChecked = $true
             Assert ($captured[0].DesiredState -eq 'Update installed tool' -and $tool.DesiredState -eq 'Installed') 'Card changes leaked into plan.'
+            Assert ($tool.ChoiceSetByHand) 'A choice clicked on the card was not marked as made by hand.'
+            # Dingo moving a card to its default choice, as Refresh-UI does, is
+            # not the person choosing: the card must not switch itself on.
+            $tool.Selected = $false; $tool.ApplyControl.IsChecked = $false; $tool.ChoiceSetByHand = $false
+            $script:SyncingChoices = $true
+            try { $update.IsChecked = $true } finally { $script:SyncingChoices = $false }
+            Assert (-not $tool.Selected -and -not $tool.ApplyControl.IsChecked -and -not $tool.ChoiceSetByHand) 'Moving a card to its default choice selected it.'
+            Assert ($null -eq ($update.Content.Text | Select-String -SimpleMatch 'my preference')) 'A tool card marks one choice as the preference.'
         } finally {
             $window.Close()
             $reader.Close()

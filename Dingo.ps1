@@ -87,6 +87,10 @@ param(
     [string]$CancelPath,
     [string]$TargetUserSid,
     [string]$ToolRoot,
+    # What to do with a tool that is already installed. Empty means the saved
+    # option, which is Update unless the Options tab says otherwise.
+    [ValidateSet('Update','Keep')][string]$InstalledTools,
+    [switch]$UpdateCheck,
     [Parameter(ValueFromRemainingArguments=$true)]
     [object[]]$UnexpectedArguments
 )
@@ -128,6 +132,12 @@ $script:ActiveToolRoot = $script:DefaultToolRoot
 $script:ToolRootWarning = ''
 $script:ToolRootRejected = $false
 $script:ToolRootRejectMessage = ''
+# Update: a tool that is already installed is updated when a newer version is
+# out. Keep: it is left as it is. Initialize-DingoInstalledToolsMode fills it in.
+$script:InstalledToolsMode = 'Update'
+# What the background version check found, by tool id. Only the window fills it.
+$script:ToolUpdateInfo = @{}
+$script:ToolUpdateCheck = $null
 # A folder inside the tools folder, so moving the tools folder moves this too.
 $script:ShimDirectory = Join-Path $script:DefaultToolRoot 'bin'
 # Only files carrying this marker are ever deleted, so a launcher someone wrote
@@ -208,7 +218,7 @@ function Exit-DingoSingleInstance {
 # Keep the launcher separate from the WPF host so a failed GUI process cannot
 # strand the command shell, and hold the per-user mutex for the host's lifetime.
 # Avoid persistent user-wide shell workarounds; the host process only owns the UI.
-if (-not ($SelfTest -or $StateSelfTest -or $UiSelfTest -or $Apply -or $WhatIf -or $ListSettings -or $RecoveryReport -or $Help -or $Version -or $Include -or $Exclude -or $script:UnexpectedArguments.Count -or $MachineWorker -or $ElevationBroker -or $FinalizeInternationalSettings -or $WpfHost)) {
+if (-not ($SelfTest -or $StateSelfTest -or $UiSelfTest -or $Apply -or $WhatIf -or $ListSettings -or $RecoveryReport -or $Help -or $Version -or $Include -or $Exclude -or $script:UnexpectedArguments.Count -or $MachineWorker -or $ElevationBroker -or $FinalizeInternationalSettings -or $WpfHost -or $UpdateCheck)) {
     if (-not (Enter-DingoSingleInstance)) {
         Add-Type -AssemblyName PresentationFramework
         [System.Windows.MessageBox]::Show('Dingo is already running for this Windows account.', 'Dingo is already running', 'OK', 'Information') | Out-Null
@@ -223,6 +233,7 @@ if (-not ($SelfTest -or $StateSelfTest -or $UiSelfTest -or $Apply -or $WhatIf -o
         # is handed to the window rather than saved. The window checks it and says
         # on the Options tab if it cannot be used.
         if ($ToolRoot) { $hostArguments += ' -ToolRoot "{0}"' -f $ToolRoot }
+        if ($InstalledTools) { $hostArguments += ' -InstalledTools {0}' -f $InstalledTools }
         $hostProcess = Start-Process -FilePath (Get-PowerShellHostPath) -ArgumentList $hostArguments -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
         # Bring the console back for a failure, so the launcher's pause prompt and
         # any error text are on a window the person can actually see.
@@ -783,6 +794,9 @@ function New-Setting {
         StateOptions=$options; CanChoose=($options.Count -gt 1); CurrentState=(New-StateResult 'Unknown' 'Reading...')
         Status='Ready'; Details=''; LastApplyResult=$null; Kind=$Kind; Entries=$Entries; RequiresAdmin=$needsElevation
         RestartExplorer=$RestartExplorer; RestartRequired=$RestartRequired; Requirements=$requirementCopy
+        # Set when the person picks a choice on the card. A tool card's default
+        # follows the version check, and must never overwrite a hand-made choice.
+        ChoiceSetByHand=$false
     }
 }
 
@@ -887,16 +901,68 @@ function Read-DingoToolRootPreference([string]$Path = '') {
     }
 }
 
-function Save-DingoToolRootPreference([string]$Value, [string]$Path = '') {
-    $resolved = Resolve-ToolRootValue $Value
+function Save-DingoConfigValue([string]$Name, $Value, [string]$Path = '') {
+    # The options file holds more than one choice, so saving one keeps the
+    # others. A file that cannot be read is replaced rather than blocking the save.
     $path = if ($Path) { $Path } else { Get-DingoConfigPath }
     $directory = [IO.Path]::GetDirectoryName($path)
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
         New-Item -ItemType Directory -Path $directory -Force -ErrorAction Stop | Out-Null
     }
-    Write-Utf8FileAtomically $path (ConvertTo-Json -InputObject ([PSCustomObject]@{ toolRoot = $resolved }) -Depth 3)
+    $values = [ordered]@{}
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        try {
+            $existing = Read-JsonFileTolerantly $path
+            if ($existing -is [PSCustomObject]) {
+                foreach ($property in $existing.PSObject.Properties) { $values[$property.Name] = $property.Value }
+            }
+        } catch {
+            Write-Log 'WARN' "Could not read the options file $path, so it is written again with only '$Name'. $($_.Exception.Message)"
+        }
+    }
+    $values[$Name] = $Value
+    Write-Utf8FileAtomically $path (ConvertTo-Json -InputObject ([PSCustomObject]$values) -Depth 3)
+}
+
+function Save-DingoToolRootPreference([string]$Value, [string]$Path = '') {
+    $resolved = Resolve-ToolRootValue $Value
+    $path = if ($Path) { $Path } else { Get-DingoConfigPath }
+    Save-DingoConfigValue 'toolRoot' $resolved $path
     Write-Log 'INFO' "Saved the tools folder '$resolved' to $path."
     return $resolved
+}
+
+function Read-DingoInstalledToolsPreference([string]$Path = '') {
+    # Update is the default: an analysis VM that is rarely looked after is the
+    # reason to run Dingo again, and old tools are what it has.
+    $path = if ($Path) { $Path } else { Get-DingoConfigPath }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return 'Update' }
+    try { $decoded = Read-JsonFileTolerantly $path } catch { return 'Update' }
+    $value = ([string](Get-JsonField $decoded 'installedTools' '')).Trim()
+    if ($value -eq 'Keep') { return 'Keep' }
+    return 'Update'
+}
+
+function Save-DingoInstalledToolsPreference([string]$Value, [string]$Path = '') {
+    if ($Value -notin @('Update','Keep')) { throw "'$Value' is not a choice for installed tools. Use Update or Keep." }
+    $path = if ($Path) { $Path } else { Get-DingoConfigPath }
+    Save-DingoConfigValue 'installedTools' $Value $path
+    Write-Log 'INFO' "Saved the installed-tools choice '$Value' to $path."
+}
+
+function Initialize-DingoInstalledToolsMode {
+    # The command line wins, for one run only. Only the choice a tool card
+    # starts on depends on it; the plan carries each card's choice to Apply.
+    $script:InstalledToolsMode = if ($InstalledTools) { $InstalledTools } else { Read-DingoInstalledToolsPreference }
+    return $script:InstalledToolsMode
+}
+
+function Get-InstalledToolsMode {
+    # Read with Get-Variable: the test suites load Dingo one function at a time
+    # and never run the assignment at the top of the file.
+    $mode = Get-Variable -Name InstalledToolsMode -Scope Script -ErrorAction SilentlyContinue
+    if ($mode -and $mode.Value -eq 'Keep') { return 'Keep' }
+    return 'Update'
 }
 
 function Initialize-DingoToolRoot {
@@ -1888,6 +1954,143 @@ function Find-InstalledTool($Tool) {
     return $null
 }
 
+function ConvertFrom-WingetListOutput([string]$Output, [string]$PackageId, [string]$Source = 'winget') {
+    # winget has no machine-readable list, so its table is read by the package
+    # id, which never holds a space. After the id come the installed version and,
+    # when there is one, the newer version. A list filtered by --source leaves
+    # the Source column out; an unfiltered one ends each row with it, so a last
+    # word that names the source is dropped. A version winget cannot pin down is
+    # shown as '< 1.2' or '> 1.2', so a lone < or > joins the next word.
+    # The spinner redraws with a bare carriage return, so both line ends split.
+    # One id can hold more than one row, such as the x64 and x86 .NET runtimes.
+    $rows = New-Object Collections.ArrayList
+    foreach ($line in @(([string]$Output) -split '[\r\n]+')) {
+        $words = @($line.Trim() -split '\s+' | Where-Object { $_ })
+        $index = -1
+        for ($i = 0; $i -lt $words.Count; $i++) { if ($words[$i] -ieq $PackageId) { $index = $i; break } }
+        if ($index -lt 0) { continue }
+        $rest = New-Object Collections.ArrayList
+        for ($i = $index + 1; $i -lt $words.Count; $i++) {
+            if ($words[$i] -in @('<','>') -and $i + 1 -lt $words.Count) { [void]$rest.Add("$($words[$i]) $($words[$i + 1])"); $i++ }
+            else { [void]$rest.Add($words[$i]) }
+        }
+        if ($rest.Count -gt 1 -and $Source -and [string]$rest[$rest.Count - 1] -ieq $Source) { $rest.RemoveAt($rest.Count - 1) }
+        if (-not $rest.Count) { continue }
+        $available = if ($rest.Count -ge 2) { [string]$rest[1] } else { '' }
+        [void]$rows.Add([PSCustomObject]@{ Installed=[string]$rest[0]; Available=$available })
+    }
+    if (-not $rows.Count) { return $null }
+    $newer = @($rows | Where-Object { $_.Available }) | Select-Object -First 1
+    if ($newer) { return $newer }
+    return $rows[0]
+}
+
+function Compare-ToolVersion([string]$Left, [string]$Right) {
+    # -1, 0 or 1 when both read as dotted numbers, such as v2.26.0 or 3.13.368.
+    # $null when either one does not, so the caller falls back to 'different'.
+    $parse = {
+        param($text)
+        $clean = ([string]$text).Trim() -replace '^[vV]', ''
+        if ($clean -notmatch '^\d+(\.\d+){0,3}$') { return $null }
+        $parts = @($clean -split '\.')
+        while ($parts.Count -lt 2) { $parts += '0' }
+        return [version]($parts -join '.')
+    }
+    $a = & $parse $Left
+    $b = & $parse $Right
+    if ($null -eq $a -or $null -eq $b) { return $null }
+    return $a.CompareTo($b)
+}
+
+function New-ToolUpdateStatus([string]$Id, [string]$Status, [string]$Installed = '', [string]$Latest = '', [string]$Message = '') {
+    # Current: nothing newer. Available: a newer version is out. Unknown: the
+    # latest is known but what is installed is not, so only an update can make
+    # sure. SelfManaged: the tool's own installer checks each file as it runs.
+    # NotListed: winget does not match the tool to its package, so it can
+    # neither compare nor safely update it. Failed: the check did not finish,
+    # so nothing is claimed either way.
+    [PSCustomObject]@{ Id=$Id; Status=$Status; Installed=$Installed; Latest=$Latest; Message=$Message }
+}
+
+function Get-PipPackageName([string]$Requirement) {
+    # 'dissect[full]>=3.1' is the package 'dissect'.
+    return ([string]$Requirement -replace '\[.*$', '' -replace '(==|>=|<=|~=|!=|<|>).*$', '').Trim()
+}
+
+function Get-ToolUpdateStatus($Tool) {
+    # Only reads. Nothing is downloaded, installed, or repaired here, so it is
+    # safe to run in the background while the window is open.
+    $id = [string]$Tool.Id
+    try {
+        switch ($Tool.InstallKind) {
+            'winget' {
+                $winget = Get-WingetPath
+                if (-not $winget) { return (New-ToolUpdateStatus $id 'Failed' -Message 'winget is not on this computer, so the version could not be checked.') }
+                $arguments = @('list','--id',$Tool.Package,'--exact','--source',$Tool.Source,'--accept-source-agreements','--disable-interactivity')
+                $run = Invoke-ChildProcess $winget $arguments 120 "The winget version check of $($Tool.Package)" (New-Object Text.UTF8Encoding $false) -KeepLines
+                Write-Log 'DEBUG' "winget list exit code $($run.ExitCode) for $($Tool.Package): $(Get-OutputTail (Remove-ProgressNoise $run.Output) 600)"
+                # The table is read from the lines as winget wrote them, because
+                # the noise filter joins them into one.
+                $row = ConvertFrom-WingetListOutput $run.Output $Tool.Package $Tool.Source
+                if (-not $row) {
+                    return (New-ToolUpdateStatus $id 'NotListed' -Message "winget does not list $($Tool.Package) as installed, so it cannot say whether a newer version is out. The tool may have been installed another way.")
+                }
+                if ($row.Available) { return (New-ToolUpdateStatus $id 'Available' $row.Installed $row.Available "winget offers $($row.Available).") }
+                return (New-ToolUpdateStatus $id 'Current' $row.Installed $row.Installed 'winget offers nothing newer.')
+            }
+            'github-release' {
+                $release = Get-GitHubLatestRelease $Tool.Repo 30
+                $tag = [string](Get-JsonField $release 'tag_name' '')
+                if (-not $tag) { return (New-ToolUpdateStatus $id 'Failed' -Message "GitHub named no latest release for $($Tool.Repo).") }
+                $record = Read-ToolReleaseRecord $Tool
+                if (-not $record) { return (New-ToolUpdateStatus $id 'Unknown' '' $tag "The latest release is $tag. Dingo has no record of which release is in the folder, so an update installs $tag and records it.") }
+                if ($record.Version -eq $tag) { return (New-ToolUpdateStatus $id 'Current' $record.Version $tag "$tag is the latest release.") }
+                return (New-ToolUpdateStatus $id 'Available' $record.Version $tag "The latest release is $tag.")
+            }
+            'mega-page' {
+                $offer = Get-MegaPageOffer $Tool
+                $name = [string]$offer.Info.Name
+                $record = Read-ToolReleaseRecord $Tool
+                if (-not $record) { return (New-ToolUpdateStatus $id 'Unknown' '' $name "The vendor offers $name. Dingo has no record of which download is in the folder, so an update installs $name and records it.") }
+                if ($record.Version -eq $name) { return (New-ToolUpdateStatus $id 'Current' $record.Version $name "$name is the latest download.") }
+                return (New-ToolUpdateStatus $id 'Available' $record.Version $name "The vendor offers $name.")
+            }
+            'python-venv' {
+                $venvPython = Join-Path (Expand-ToolRootPath $Tool.Dest) 'Scripts\python.exe'
+                if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) { return (New-ToolUpdateStatus $id 'Failed' -Message "The venv Python $venvPython is not there.") }
+                $several = @($Tool.Packages).Count -gt 1
+                $installedParts = New-Object Collections.ArrayList
+                $latestParts = New-Object Collections.ArrayList
+                $newer = $false
+                foreach ($requirement in @($Tool.Packages)) {
+                    # A pinned package is never moved by an update, so it has nothing to report.
+                    if ($requirement -match '==') { continue }
+                    $name = Get-PipPackageName $requirement
+                    $run = Invoke-ChildProcess $venvPython @('-c','import importlib.metadata,sys; print(importlib.metadata.version(sys.argv[1]))',$name) 60 "Reading the installed $name version"
+                    $have = ([string]$run.Output).Trim()
+                    if ($run.ExitCode -ne 0 -or -not $have) { return (New-ToolUpdateStatus $id 'Failed' -Message "The venv could not name its $name version. $(Get-OutputTail $run.Output)") }
+                    Initialize-DingoWebSession
+                    $pypi = Invoke-RestMethod -Uri "https://pypi.org/pypi/$name/json" -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+                    $latest = [string](Get-JsonField (Get-JsonField $pypi 'info' $null) 'version' '')
+                    if (-not $latest) { return (New-ToolUpdateStatus $id 'Failed' -Message "PyPI named no version for $name.") }
+                    [void]$installedParts.Add($(if ($several) { "$name $have" } else { $have }))
+                    [void]$latestParts.Add($(if ($several) { "$name $latest" } else { $latest }))
+                    $order = Compare-ToolVersion $have $latest
+                    if (($null -eq $order -and $have -ne $latest) -or ($null -ne $order -and $order -lt 0)) { $newer = $true }
+                }
+                if (-not $installedParts.Count) { return (New-ToolUpdateStatus $id 'Current' -Message 'Every package is pinned to a version.') }
+                $status = if ($newer) { 'Available' } else { 'Current' }
+                return (New-ToolUpdateStatus $id $status ($installedParts -join ', ') ($latestParts -join ', ') "PyPI offers $($latestParts -join ', ').")
+            }
+            default {
+                return (New-ToolUpdateStatus $id 'SelfManaged' -Message "The author's install script compares each file with the published one when it runs, and downloads only what changed.")
+            }
+        }
+    } catch {
+        return (New-ToolUpdateStatus $id 'Failed' -Message "The version check did not finish: $($_.Exception.Message)")
+    }
+}
+
 function Get-MissingToolRequirements($Tool) {
     foreach ($id in @($Tool.Requires)) {
         $required = Get-ToolCatalog | Where-Object Id -eq $id | Select-Object -First 1
@@ -2068,7 +2271,7 @@ function Stop-InstallerProcessTree($Process) {
     [void]$Process.WaitForExit(5000)
 }
 
-function Invoke-ChildProcess([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label, [Text.Encoding]$PipeEncoding = $null) {
+function Invoke-ChildProcess([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds, [string]$Label, [Text.Encoding]$PipeEncoding = $null, [switch]$KeepLines) {
     # Start-Process -PassThru does not keep the process handle, so its ExitCode
     # stays empty and a success would look like a failure. Own the handle here.
     $startInfo = New-Object Diagnostics.ProcessStartInfo
@@ -2110,7 +2313,10 @@ function Invoke-ChildProcess([string]$FilePath, [string[]]$Arguments, [int]$Time
             Start-Sleep -Milliseconds 50
         }
         if (-not $standardOutput.Wait(5000) -or -not $standardError.Wait(5000)) { throw "$Label exited but its output pipes stayed open. A descendant may still be running; inspect before retrying." }
-        $output = (([string]$standardOutput.Result + ' ' + [string]$standardError.Result) -replace '\s+',' ').Trim()
+        # Output is squeezed onto one line for the log, unless the caller reads
+        # a table from it and needs the lines as they were.
+        $output = if ($KeepLines) { [string]$standardOutput.Result + "`n" + [string]$standardError.Result }
+            else { (([string]$standardOutput.Result + ' ' + [string]$standardError.Result) -replace '\s+',' ').Trim() }
         return [PSCustomObject]@{ ExitCode = $process.ExitCode; Output = $output }
     } finally {
         $job.Dispose()
@@ -2315,13 +2521,48 @@ function Get-GitHubLatestRelease([string]$Repo, [int]$TimeoutSeconds = 60) {
     }
 }
 
-function Install-GitHubReleasePackage($Tool) {
+function Get-ToolReleaseRecordPath($Tool) {
+    Join-Path (Expand-ToolRootPath $Tool.Dest) '.dingo-release.json'
+}
+
+function Read-ToolReleaseRecord($Tool) {
+    # What Dingo last unpacked into the tool's folder. A tool put there by hand,
+    # or by a Dingo older than 0.8.13, has no record, so its version is unknown.
+    try {
+        $path = Get-ToolReleaseRecordPath $Tool
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+        $record = Read-JsonFileTolerantly $path
+        $version = [string](Get-JsonField $record 'version' '')
+        if (-not $version) { return $null }
+        return [PSCustomObject]@{ Version=$version; Asset=[string](Get-JsonField $record 'asset' '') }
+    } catch {
+        Write-Log 'WARN' "Could not read the release record of $($Tool.Name): $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Write-ToolReleaseRecord($Tool, [string]$Version, [string]$Asset) {
+    $path = Get-ToolReleaseRecordPath $Tool
+    $record = [PSCustomObject]@{ version=$Version; asset=$Asset; installedUtc=[DateTime]::UtcNow.ToString('o') }
+    Write-Utf8FileAtomically $path (ConvertTo-Json -InputObject $record -Depth 3)
+}
+
+function Install-GitHubReleasePackage($Tool, [bool]$SkipIfCurrent = $false) {
     # The catalog names a repository and a file pattern, never an address. Dingo
     # builds the address itself, so a catalog entry cannot send the download
     # somewhere else.
     Write-Log 'INFO' "Reading the latest $($Tool.Name) release from github.com/$($Tool.Repo)."
     $release = Get-GitHubLatestRelease $Tool.Repo
     $tag = [string](Get-JsonField $release 'tag_name' '')
+    if ($SkipIfCurrent) {
+        $record = Read-ToolReleaseRecord $Tool
+        if ($record -and $tag -and $record.Version -eq $tag) {
+            Write-Log 'INFO' "$($Tool.Name) $tag is already the latest release; nothing was downloaded."
+            return
+        }
+        $from = if ($record) { $record.Version } else { 'an unrecorded version' }
+        Write-Log 'INFO' "Updating $($Tool.Name) from $from to $tag."
+    }
     $assets = @(@(Get-JsonField $release 'assets' @()) | Where-Object { ([string](Get-JsonField $_ 'name' '')) -like $Tool.AssetPattern })
     if (-not $assets.Count) { throw "The latest $($Tool.Name) release ($tag) holds no file matching '$($Tool.AssetPattern)'." }
     if ($assets.Count -gt 1) {
@@ -2368,6 +2609,7 @@ function Install-GitHubReleasePackage($Tool) {
         }
         $written = Expand-DingoZipArchive $archivePath $destination -StripRootFolder:$Tool.StripRoot
         Write-Log 'INFO' "Unpacked $written file(s) of $($Tool.Name) $tag into $destination."
+        Write-ToolReleaseRecord $Tool $tag $assetName
     } finally {
         $ProgressPreference = $progress
         Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
@@ -2614,20 +2856,39 @@ function Get-MegaFileInfo($LinkParts, $FileKey, [int]$TimeoutSeconds = 60) {
     return [PSCustomObject]@{ Name = $name; Size = $size; Url = $downloadUrl }
 }
 
-function Install-MegaPagePackage($Tool) {
+function Get-MegaPageOffer($Tool) {
+    # The file the vendor's page offers today. Its name carries the version, such
+    # as Arsenal-Image-Mounter-v3.13.368.zip, so the name is the version.
+    $link = Get-MegaLinkFromPage $Tool.Url $Tool.LinkName
+    $parts = Get-MegaShareLinkParts $link
+    $fileKey = Get-MegaFileKey $parts.KeyText
+    $info = Get-MegaFileInfo $parts $fileKey
+    [PSCustomObject]@{ Link=$link; Parts=$parts; FileKey=$fileKey; Info=$info }
+}
+
+function Install-MegaPagePackage($Tool, [bool]$SkipIfCurrent = $false) {
     # The vendor publishes only through MEGA, and the link changes with every
     # release, so it is read from their download page each time. Three things
     # are checked before anything is unpacked: the link is a MEGA file link, the
     # name MEGA reports matches the pattern in the catalog, and the plaintext
     # matches the MAC carried in the link. The last one is the strong check: it
     # proves the bytes are exactly what the uploader had.
-    $link = Get-MegaLinkFromPage $Tool.Url $Tool.LinkName
-    $parts = Get-MegaShareLinkParts $link
-    $fileKey = Get-MegaFileKey $parts.KeyText
-    $info = Get-MegaFileInfo $parts $fileKey
+    $offer = Get-MegaPageOffer $Tool
+    $link = $offer.Link
+    $fileKey = $offer.FileKey
+    $info = $offer.Info
     Write-Log 'INFO' "MEGA offers $($info.Name) ($(Format-ByteSize $info.Size)) for $($Tool.Name)."
     if ($info.Name -notlike $Tool.AssetPattern) {
         throw "The download page offered '$($info.Name)' for $($Tool.Name), but a file named like '$($Tool.AssetPattern)' was expected. Nothing was downloaded."
+    }
+    if ($SkipIfCurrent) {
+        $record = Read-ToolReleaseRecord $Tool
+        if ($record -and $record.Version -eq $info.Name) {
+            Write-Log 'INFO' "$($Tool.Name) $($info.Name) is already the latest download; nothing was downloaded."
+            return
+        }
+        $from = if ($record) { $record.Version } else { 'an unrecorded version' }
+        Write-Log 'INFO' "Updating $($Tool.Name) from $from to $($info.Name)."
     }
 
     $stem = Join-Path $env:TEMP ("Dingo-mega-{0}" -f [Guid]::NewGuid().ToString('N'))
@@ -2673,6 +2934,7 @@ function Install-MegaPagePackage($Tool) {
         }
         $written = Expand-DingoZipArchive $archivePath $destination -StripRootFolder:$Tool.StripRoot
         Write-Log 'INFO' "Unpacked $written file(s) of $($info.Name) into $destination."
+        Write-ToolReleaseRecord $Tool $info.Name $info.Name
     } finally {
         $ProgressPreference = $progress
         Remove-Item -LiteralPath $encryptedPath -Force -ErrorAction SilentlyContinue
@@ -3334,7 +3596,34 @@ function Get-PackageKindState($Setting) {
     } elseif ($missingRuntime.Count) { 'Detected; prerequisites missing' }
     elseif ($found.Mode -eq 'all') { 'Minimum inventory detected' }
     elseif ($found.Version) { "Installed ($($found.Version))" } else { 'Installed' }
-    $state = New-StateResult $status $text "$detail Detection does not prove tool execution or every upstream download."
+    $detail += ' Detection does not prove tool execution or every upstream download.'
+    # What the background version check found, when the window has run one.
+    $known = Get-Variable -Name ToolUpdateInfo -Scope Script -ErrorAction SilentlyContinue
+    $update = if ($found.Complete -and $known -and $known.Value -is [hashtable] -and $known.Value.ContainsKey($tool.Id)) { $known.Value[$tool.Id] } else { $null }
+    if ($update) {
+        $updating = (Get-InstalledToolsMode) -eq 'Update'
+        $have = if ($update.Installed) { $update.Installed } elseif ($found.Version) { $found.Version } else { '' }
+        switch ([string]$update.Status) {
+            'Available' {
+                $text = if ($have) { "Installed ($have); $($update.Latest) is out" } else { "Installed; $($update.Latest) is out" }
+                # Amber only when the card starts on Update installed tool. With
+                # Keep chosen it still says a newer version is out, in green.
+                if ($updating -and $status -eq 'Preferred') { $status = 'Partial' }
+            }
+            'Unknown' {
+                $text = "Installed; version not recorded, latest is $($update.Latest)"
+                if ($updating -and $status -eq 'Preferred') { $status = 'Partial' }
+            }
+            'Current' {
+                if ($status -eq 'Preferred' -and $have) { $text = "Installed ($have), up to date" }
+            }
+            'SelfManaged' {
+                if ($status -eq 'Preferred') { $text = 'Installed; its own script fetches only changed files' }
+            }
+        }
+        $detail = "Version check: $($update.Message) $detail"
+    }
+    $state = New-StateResult $status $text $detail
     $state | Add-Member NoteProperty Detection $found
     $state | Add-Member NoteProperty MissingPrerequisites $missingRuntime
     return $state
@@ -3346,17 +3635,73 @@ function Set-PackageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     if ($DesiredState -ne $Setting.PreferredState -and -not $update) { throw "Dingo installs or updates $($tool.Name) but never removes it." }
     # Recheck in the executing account immediately before invoking an installer.
     $installed = Find-InstalledTool $tool
+    if ($update -and -not $installed) { throw "$($tool.Name) is not installed. Choose Installed to install it first." }
+    # The card says what happens. Installed installs a missing tool and never
+    # touches one that is there. The Options tab only decides which choice a
+    # card starts on.
     if ($installed -and -not $update) {
         Write-Log 'INFO' "$($tool.Name) is already installed ($($installed.Version)); leaving it unchanged."
         return
     }
-    if ($update -and -not $installed) { throw "$($tool.Name) is not installed. Choose Installed to install it first." }
-    if ($tool.InstallKind -eq 'winget') { Install-WingetPackage $tool $update }
-    elseif ($tool.InstallKind -eq 'script') { Install-ScriptPackage $tool }
-    elseif ($tool.InstallKind -eq 'github-release') { Install-GitHubReleasePackage $tool }
-    elseif ($tool.InstallKind -eq 'mega-page') { Install-MegaPagePackage $tool }
-    elseif ($tool.InstallKind -eq 'python-venv') { Install-PythonVenvPackage $tool $update }
-    else { throw "Install kind '$($tool.InstallKind)' is not supported in this version of Dingo." }
+    if (-not $update) {
+        if ($tool.InstallKind -eq 'winget') { Install-WingetPackage $tool $false }
+        elseif ($tool.InstallKind -eq 'script') { Install-ScriptPackage $tool }
+        elseif ($tool.InstallKind -eq 'github-release') { Install-GitHubReleasePackage $tool $false }
+        elseif ($tool.InstallKind -eq 'mega-page') { Install-MegaPagePackage $tool $false }
+        elseif ($tool.InstallKind -eq 'python-venv') { Install-PythonVenvPackage $tool $false }
+        else { throw "Install kind '$($tool.InstallKind)' is not supported in this version of Dingo." }
+        return
+    }
+    # winget would install a second copy of a tool it does not match to its
+    # package, so it is asked first, and only an offered version is installed.
+    # With no winget at all, the install below repairs winget as it always has.
+    if ($tool.InstallKind -eq 'winget' -and (Get-WingetPath)) {
+        $check = Get-ToolUpdateStatus $tool
+        if ($check.Status -eq 'Current') {
+            Write-Log 'INFO' "$($tool.Name) $($check.Installed) is already the latest version; winget made no change."
+            return
+        }
+        if ($check.Status -eq 'NotListed') { throw "$($check.Message) Dingo did not run winget install, because it would install $($tool.Name) a second time. $($tool.Name) is still installed." }
+    }
+    try {
+        if ($tool.InstallKind -eq 'winget') { Install-WingetPackage $tool $true }
+        elseif ($tool.InstallKind -eq 'script') { Install-ScriptPackage $tool }
+        elseif ($tool.InstallKind -eq 'github-release') { Install-GitHubReleasePackage $tool $true }
+        elseif ($tool.InstallKind -eq 'mega-page') { Install-MegaPagePackage $tool $true }
+        elseif ($tool.InstallKind -eq 'python-venv') { Install-PythonVenvPackage $tool $true }
+        else { throw "Install kind '$($tool.InstallKind)' is not supported in this version of Dingo." }
+    } catch {
+        # Say plainly that the tool is still there, so a failed update is not
+        # read as a failed install.
+        $reason = ([string]$_.Exception.Message).Trim()
+        if ($reason -notmatch '[.!?]$') { $reason += '.' }
+        $still = if (Find-InstalledTool $tool) { " $($tool.Name) is still installed." } else { '' }
+        throw "The update of $($tool.Name) did not finish: $reason$still"
+    }
+}
+
+function Get-ToolDefaultState($Item) {
+    # The choice a tool card starts on. With Update chosen on the Options tab, a
+    # tool that is installed and has something newer to fetch starts on Update
+    # installed tool, so the card says what Apply will do. Everything else
+    # starts on the preferred choice, Installed.
+    if ($Item.Kind -ne 'Package' -or (Get-InstalledToolsMode) -ne 'Update') { return $Item.PreferredState }
+    $state = $Item.CurrentState
+    if (-not $state -or -not $state.PSObject.Properties['Detection'] -or -not $state.Detection.Complete) { return $Item.PreferredState }
+    $known = Get-Variable -Name ToolUpdateInfo -Scope Script -ErrorAction SilentlyContinue
+    $id = [string]@($Item.Entries)[0].Id
+    if (-not $known -or $known.Value -isnot [hashtable] -or -not $known.Value.ContainsKey($id)) { return $Item.PreferredState }
+    if ([string]$known.Value[$id].Status -in @('Available','Unknown','SelfManaged')) { return 'Update installed tool' }
+    return $Item.PreferredState
+}
+
+function Set-ToolDefaultChoices([array]$Items) {
+    # Puts each tool card on its default choice, unless the person picked one.
+    foreach ($item in @($Items)) {
+        if ($item.Kind -ne 'Package') { continue }
+        if ($item.PSObject.Properties['ChoiceSetByHand'] -and $item.ChoiceSetByHand) { continue }
+        $item.DesiredState = Get-ToolDefaultState $item
+    }
 }
 
 function Get-Settings {
@@ -5021,6 +5366,12 @@ function Complete-AdministratorChanges($Operation) {
 
 function Invoke-SettingChange($Item, [hashtable]$AdministratorResults) {
     $components = New-Object System.Collections.ArrayList
+    # A version check from before the install no longer says anything true, and
+    # the check after it is read against what is on disk.
+    if ($Item.Kind -eq 'Package') {
+        $known = Get-Variable -Name ToolUpdateInfo -Scope Script -ErrorAction SilentlyContinue
+        if ($known -and $known.Value -is [hashtable]) { $known.Value.Remove([string]@($Item.Entries)[0].Id) }
+    }
     try {
         if ($Item.RequiresAdmin) {
             $administratorResult = if ($AdministratorResults.ContainsKey($Item.Id)) { $AdministratorResults[$Item.Id] } else { $AdministratorResults['*'] }
@@ -5185,6 +5536,12 @@ Tools:
   the Options tab of the window, or for one run only:
   -ToolRoot "D:\DFIR\Tools"        a full path on a drive of this computer
 
+  A selected tool that is already installed is updated when a newer version is
+  out, and left alone when it is up to date. -WhatIf shows which. To leave
+  installed tools at the version they are, change that on the Options tab, or
+  for one run only:
+  -InstalledTools Keep             or Update, the default
+
 Exit codes: 0 success, 1 partial/failed application, 2 invalid command/environment, 3 already running.
 '@
 }
@@ -5324,6 +5681,7 @@ function Test-PlanPreflight([array]$Selected) {
 # The tools folder has to be known before the cards are built, because a card's
 # text and its state both name folders inside it.
 [void](Initialize-DingoToolRoot)
+[void](Initialize-DingoInstalledToolsMode)
 Initialize-SettingHandlers
 $script:Settings = Get-Settings
 # The GUI shows this on the Tools tab. Command-line runs have no tab, so say it here.
@@ -5370,6 +5728,29 @@ if ($ListSettings) {
     if ($OutputFormat -eq 'Json') { [Console]::Out.WriteLine((ConvertTo-Json -InputObject $catalog -Depth 5)) }
     else { [Console]::Out.WriteLine(($catalog | Format-Table -AutoSize | Out-String -Width 220).TrimEnd()) }
     exit 0
+}
+
+if ($UpdateCheck) {
+    # The window starts this hidden, so looking for newer versions never holds
+    # up the window. It writes what it finds after every tool, so the cards can
+    # change one by one. It only reads: nothing is installed or repaired.
+    $script:LogFile = $WorkerLogPath
+    try {
+        if (-not $ResultPath) { throw 'The version check needs -ResultPath.' }
+        $found = [ordered]@{}
+        foreach ($tool in @(Get-ToolCatalog)) {
+            if (-not (Find-InstalledTool $tool)) { continue }
+            $status = Get-ToolUpdateStatus $tool
+            Write-Log 'INFO' "Version check [$($tool.Id)] $($status.Status): installed '$($status.Installed)', latest '$($status.Latest)'. $($status.Message)"
+            $found[$tool.Id] = $status
+            Write-Utf8FileAtomically $ResultPath (ConvertTo-Json -InputObject ([PSCustomObject]@{ Complete=$false; Tools=[PSCustomObject]$found }) -Depth 5)
+        }
+        Write-Utf8FileAtomically $ResultPath (ConvertTo-Json -InputObject ([PSCustomObject]@{ Complete=$true; Tools=[PSCustomObject]$found }) -Depth 5)
+        exit 0
+    } catch {
+        Write-Log 'ERROR' "The version check stopped: $($_.Exception.Message)"
+        exit 1
+    }
 }
 
 if ($ElevationBroker) {
@@ -6449,6 +6830,16 @@ if ($Apply -or $WhatIf -or $Include -or $Exclude) {
             $item.DesiredState = $item.PreferredState
             $item.CurrentState = Get-SettingState $item
         }
+        # A run with no window checks installed tools here, so a tool gets the
+        # same choice its card would start on. -WhatIf shows that choice.
+        if ((Get-InstalledToolsMode) -eq 'Update') {
+            foreach ($item in @($selected | Where-Object { $_.Kind -eq 'Package' -and $_.CurrentState.PSObject.Properties['Detection'] -and $_.CurrentState.Detection.Complete })) {
+                $tool = @($item.Entries)[0]
+                $script:ToolUpdateInfo[$tool.Id] = Get-ToolUpdateStatus $tool
+                $item.CurrentState = Get-SettingState $item
+                $item.DesiredState = Get-ToolDefaultState $item
+            }
+        }
         $preflight = @(Test-PlanPreflight $selected)
         $blocked = @($preflight | Where-Object { -not $_.Available })
         if ($WhatIf) {
@@ -6458,7 +6849,7 @@ if ($Apply -or $WhatIf -or $Include -or $Exclude) {
                 [PSCustomObject]@{
                     Id=$item.Id; Name=$item.Name; Kind=$item.Kind; Scope=$item.DisplayScope; RequiresAdmin=$item.RequiresAdmin
                     Available=$check.Available; PreflightMessage=$check.Message
-                    CurrentStatus=$item.CurrentState.Status; CurrentState=$item.CurrentState.DisplayText; State=$item.CurrentState; Target=$item.PreferredState
+                    CurrentStatus=$item.CurrentState.Status; CurrentState=$item.CurrentState.DisplayText; State=$item.CurrentState; Target=$item.DesiredState
                     VerificationBasis=(Get-VerificationDescription $item)
                     Advisory=(Get-SettingAdvisory $item)
                 }
@@ -6512,7 +6903,7 @@ if ($Apply -or $WhatIf -or $Include -or $Exclude) {
             $stepNumber = 0
             foreach ($item in $selected) {
                 $stepNumber++
-                Write-CliStatus "  $stepNumber/$planCount [$($item.Id)] Applying $($item.PreferredState)..."
+                Write-CliStatus "  $stepNumber/$planCount [$($item.Id)] Applying $($item.DesiredState)..."
                 $result = Invoke-SettingChange $item $administratorResults
                 [void]$results.Add($result)
                 Write-CliStatus "  $stepNumber/$planCount [$($item.Id)] $($result.Outcome): $($item.CurrentState.DisplayText)"
@@ -6650,7 +7041,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
           <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
           <WrapPanel Grid.Row="0" Margin="8,10,8,0">
             <Button Name="AllToolsButton" Content="Choose all tools" Background="#E5F2FF"/>
-            <Button Name="MissingToolsButton" Content="Select only tools not yet in place"/>
+            <Button Name="MissingToolsButton" Content="Select only tools missing or out of date"/>
             <TextBlock Text="These two buttons act on the Tools section only." VerticalAlignment="Center" Foreground="#52606D" Margin="12,0,0,0"/>
           </WrapPanel>
         <TabControl Name="ToolTabs" Grid.Row="1" BorderThickness="0" Margin="0,6,0,0" FontSize="14">
@@ -6719,6 +7110,11 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
               <Button Name="ToolRootDefaultButton" Content="Use the default folder"/>
             </StackPanel>
             <TextBlock Name="ToolRootStatusText" Text="" TextWrapping="Wrap" Foreground="#52606D" Margin="0,8,0,0"/>
+            <TextBlock Text="Tools that are already installed" FontWeight="SemiBold" Foreground="#17212B" Margin="0,20,0,6"/>
+            <TextBlock Text="When the window opens, Dingo looks for a newer version of each installed tool and says on its card what it found. This choice decides which choice those cards start on. You can still change any card by hand." TextWrapping="Wrap" Foreground="#52606D" Margin="0,0,0,8"/>
+            <RadioButton Name="InstalledToolsUpdateRadio" GroupName="InstalledTools" Content="Start an out-of-date tool on Update installed tool" Margin="0,0,0,4"/>
+            <RadioButton Name="InstalledToolsKeepRadio" GroupName="InstalledTools" Content="Start every tool on Installed, which leaves it at the version it is"/>
+            <TextBlock Name="InstalledToolsStatusText" Text="" TextWrapping="Wrap" Foreground="#52606D" Margin="0,8,0,0"/>
             <TextBlock Text="Logs" FontWeight="SemiBold" Foreground="#17212B" Margin="0,20,0,6"/>
             <TextBlock Text="Dingo writes what it read and what it changed to a log file for this run." TextWrapping="Wrap" Foreground="#52606D" Margin="0,0,0,6"/>
             <TextBlock Name="LogPathText" Text="" TextWrapping="Wrap" Foreground="#52606D" FontFamily="Consolas" Margin="0,0,0,8"/>
@@ -6747,7 +7143,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $script:DingoWindow = $window
-foreach ($name in @('TitleText','IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','ToolFilterTextBox','ToolFilterClearButton','ToolFilterCountText','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','AllToolsButton','MissingToolsButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','ApplyButton')) {
+foreach ($name in @('TitleText','IntroText','VersionText','SectionTabs','TweakTabs','ToolTabs','ToolsScopeText','ShortcutsScopeText','AssociationScopeText','ToolFilterTextBox','ToolFilterClearButton','ToolFilterCountText','ToolSettingsPanel','ShortcutSettingsPanel','AssociationSettingsPanel','AllPreferredButton','NeededButton','AllToolsButton','MissingToolsButton','UncheckButton','RefreshButton','RestartExplorerCheckBox','StopButton','ProgressBar','SummaryText','AdminSummaryText','LogPathText','OpenLogButton','ToolRootTextBox','ToolRootBrowseButton','ToolRootSaveButton','ToolRootDefaultButton','ToolRootStatusText','InstalledToolsUpdateRadio','InstalledToolsKeepRadio','InstalledToolsStatusText','ApplyButton')) {
     Set-Variable -Name $name -Value $window.FindName($name) -Scope Script
 }
 # One tab per area of Windows. The pills on each card say who a tweak affects,
@@ -6766,7 +7162,7 @@ foreach ($tabName in (Get-TweakTabOrder)) {
     [void]$TweakTabs.Items.Add($tabItem)
     $script:TweakPanels[$tabName] = $panel
 }
-$ToolsScopeText.Text = "Installed leaves an existing tool unchanged and installs it only if missing. Choose Update installed tool explicitly to update it. Dingo never removes a tool. Add more tools with Tools.json beside Dingo.ps1. Shortcuts and command-line access are on the next tab."
+$ToolsScopeText.Text = "Installed installs a missing tool and leaves one that is there alone. Update installed tool fetches a newer version. A card with a newer version out starts on Update installed tool; the Options tab can turn that off. Dingo never removes a tool. Add more tools with Tools.json beside Dingo.ps1. Shortcuts and command-line access are on the next tab."
 if ($script:ToolCatalogWarning) {
     $ToolsScopeText.Text = "$($script:ToolCatalogWarning) The built-in tool list is being used instead."
     $ToolsScopeText.Foreground = '#8A2B21'
@@ -6776,7 +7172,7 @@ $LogPathText.Text = [string]$script:LogFile
 $ToolRootTextBox.Text = $script:ActiveToolRoot
 # The tools folder is changed here too, so it is locked while a plan runs.
 $script:ActionButtons = @($ApplyButton,$AllPreferredButton,$NeededButton,$AllToolsButton,$MissingToolsButton,$UncheckButton,$RefreshButton,
-    $ToolRootTextBox,$ToolRootBrowseButton,$ToolRootSaveButton,$ToolRootDefaultButton)
+    $ToolRootTextBox,$ToolRootBrowseButton,$ToolRootSaveButton,$ToolRootDefaultButton,$InstalledToolsUpdateRadio,$InstalledToolsKeepRadio)
 
 function Set-ToolRootStatus([string]$Text, [bool]$IsProblem) {
     $ToolRootStatusText.Text = $Text
@@ -6803,12 +7199,47 @@ function Save-ToolRootChoice([string]$Wanted) {
     # new folder. Nothing on disk is moved or removed.
     Show-ToolRootInUse 'Saved.'
     $saved = $ToolRootStatusText.Text
+    Stop-ToolUpdateCheck
+    $script:ToolUpdateInfo = @{}
     Update-CurrentStates
+    Start-ToolUpdateCheck
     Set-ToolRootStatus $saved $false
 }
 
 # Say straight away where tools go, or why the saved folder was not used.
 if ($script:ToolRootWarning) { Set-ToolRootStatus $script:ToolRootWarning $true } else { Show-ToolRootInUse '' }
+
+function Show-InstalledToolsMode([string]$Prefix = '') {
+    $text = if ((Get-InstalledToolsMode) -eq 'Keep') {
+        'Every tool card starts on Installed. Apply leaves a tool that is already installed at the version it is, unless you choose Update installed tool on its card.'
+    } else {
+        'A tool card with a newer version out starts on Update installed tool. An up-to-date tool starts on Installed, and Apply leaves it alone.'
+    }
+    if ($InstalledTools) { $text += ' The command line chose this for this run only. Pick a choice here to save it for later runs too.' }
+    $InstalledToolsStatusText.Text = ("$Prefix $text").Trim()
+}
+
+function Save-InstalledToolsChoice([string]$Wanted) {
+    if ($Wanted -eq (Get-InstalledToolsMode)) { return }
+    try { Save-DingoInstalledToolsPreference $Wanted }
+    catch {
+        $InstalledToolsStatusText.Text = "The choice was used for this run but not saved. $($_.Exception.Message)"
+        $script:InstalledToolsMode = $Wanted
+        return
+    }
+    $script:InstalledToolsMode = $Wanted
+    # A card's colour says whether Apply would act on it, and that depends on
+    # this choice, so the tool cards are read again. Nothing else changes.
+    $tools = @($script:Settings | Where-Object Kind -eq 'Package')
+    foreach ($item in $tools) { $item.CurrentState = Get-SettingState $item }
+    Set-ToolDefaultChoices $tools
+    Refresh-UI
+    Show-InstalledToolsMode 'Saved.'
+}
+
+$InstalledToolsUpdateRadio.IsChecked = (Get-InstalledToolsMode) -eq 'Update'
+$InstalledToolsKeepRadio.IsChecked = (Get-InstalledToolsMode) -eq 'Keep'
+Show-InstalledToolsMode
 
 
 function Show-StopButton([bool]$Visible) {
@@ -7089,6 +7520,8 @@ function New-SettingCard($Item) {
         $combo.Add_SelectionChanged({
             param($sender,$eventArgs)
             if ($null -eq $sender.SelectedItem) { return }
+            if (Test-SyncingChoices) { return }
+            $sender.Tag.Setting.ChoiceSetByHand = $true
             $sender.Tag.Setting.DesiredState = [string]$sender.SelectedItem
             $sender.Tag.Setting.Selected = $true
             $sender.Tag.ApplyCheck.IsChecked = $true
@@ -7103,7 +7536,9 @@ function New-SettingCard($Item) {
             $radio = New-Object Windows.Controls.RadioButton
             # A TextBlock rather than a plain string, so a long choice wraps
             # inside its column instead of running under the Result column.
-            $label = if ($option -eq $Item.PreferredState) { "$option  (my preference)" } else { [string]$option }
+            # A tool card starts on whichever choice fits the tool, Installed or
+            # Update installed tool, so it marks neither one as the preference.
+            $label = if ($option -eq $Item.PreferredState -and $Item.Kind -ne 'Package') { "$option  (my preference)" } else { [string]$option }
             $radioText = New-Object Windows.Controls.TextBlock
             $radioText.Text = $label
             $radioText.TextWrapping = 'Wrap'
@@ -7115,6 +7550,8 @@ function New-SettingCard($Item) {
             $radio.Tag = [PSCustomObject]@{ Setting=$Item; Value=[string]$option; ApplyCheck=$applyCheck }
             $radio.Add_Checked({
                 param($sender,$eventArgs)
+                if (Test-SyncingChoices) { return }
+                $sender.Tag.Setting.ChoiceSetByHand = $true
                 $sender.Tag.Setting.DesiredState = $sender.Tag.Value
                 $sender.Tag.Setting.Selected = $true
                 $sender.Tag.ApplyCheck.IsChecked = $true
@@ -7372,6 +7809,11 @@ if ($UiSelfTest) {
     exit 0
 }
 
+function Test-SyncingChoices {
+    $syncing = Get-Variable -Name SyncingChoices -Scope Script -ErrorAction SilentlyContinue
+    return [bool]($syncing -and $syncing.Value)
+}
+
 function Refresh-UI {
     foreach ($item in $script:Settings) {
         $item.ApplyControl.IsChecked = $item.Selected
@@ -7396,13 +7838,18 @@ function Refresh-UI {
         # The note follows the drop-down: pick a language whose pack is already
         # here and the download warning goes away by itself.
         Update-CardAdvisory $item
-        foreach ($choice in $item.ChoiceControls) {
-            if ($choice -is [Windows.Controls.ComboBox]) {
-                if ([string]$choice.SelectedItem -ne $item.DesiredState) { $choice.SelectedItem = [string]$item.DesiredState }
-            } else {
-                $choice.IsChecked = ($choice.Tag.Value -eq $item.DesiredState)
+        # Moving a choice to match the card is not the person choosing it, so
+        # the handlers are told to ignore it rather than select the card.
+        $script:SyncingChoices = $true
+        try {
+            foreach ($choice in $item.ChoiceControls) {
+                if ($choice -is [Windows.Controls.ComboBox]) {
+                    if ([string]$choice.SelectedItem -ne $item.DesiredState) { $choice.SelectedItem = [string]$item.DesiredState }
+                } else {
+                    $choice.IsChecked = ($choice.Tag.Value -eq $item.DesiredState)
+                }
             }
-        }
+        } finally { $script:SyncingChoices = $false }
     }
     Update-SelectionSummary
     $window.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background)
@@ -7442,6 +7889,100 @@ function Update-CurrentStates {
         $ProgressBar.Value = 0
         Set-ActionButtonsEnabled $true
     }
+}
+
+function Stop-ToolUpdateCheck {
+    $check = $script:ToolUpdateCheck
+    $script:ToolUpdateCheck = $null
+    if (-not $check) { return }
+    try { $check.Timer.Stop() } catch {}
+    try { if (-not $check.Process.HasExited) { $check.Process.Kill() } } catch {}
+    Remove-Item -LiteralPath $check.ResultPath -Force -ErrorAction SilentlyContinue
+}
+
+function Read-ToolUpdateCheckResult($Check) {
+    # The checker replaces the file whole after every tool, so a read either
+    # sees the last version or the one before it, never half of one.
+    if (-not (Test-Path -LiteralPath $Check.ResultPath -PathType Leaf)) { return $null }
+    try {
+        $text = [IO.File]::ReadAllText($Check.ResultPath)
+        if ($text -eq $Check.LastText) { return $null }
+        $Check.LastText = $text
+        return (ConvertFrom-Json $text -ErrorAction Stop)
+    } catch { return $null }
+}
+
+function Update-ToolCardsFromCheck($Result) {
+    $changed = $false
+    foreach ($property in @($Result.Tools.PSObject.Properties)) {
+        $script:ToolUpdateInfo[$property.Name] = $property.Value
+        # Cards being applied right now are left to the apply, which reads them itself.
+        if ($script:ApplyInProgress) { continue }
+        $item = $script:Settings | Where-Object { $_.Kind -eq 'Package' -and @($_.Entries)[0].Id -eq $property.Name } | Select-Object -First 1
+        if ($item) {
+            $item.CurrentState = Get-SettingState $item
+            Set-ToolDefaultChoices @($item)
+            $changed = $true
+        }
+    }
+    if ($changed) { Refresh-UI }
+}
+
+function Get-ToolUpdateSummary {
+    $values = @($script:ToolUpdateInfo.Values)
+    $newer = @($values | Where-Object Status -eq 'Available').Count
+    $unknown = @($values | Where-Object Status -eq 'Unknown').Count
+    $failed = @($values | Where-Object { $_.Status -in @('Failed','NotListed') }).Count
+    $parts = New-Object Collections.ArrayList
+    if ($newer) { [void]$parts.Add("$newer $(if ($newer -eq 1) { 'has' } else { 'have' }) a newer version out") }
+    if ($unknown) { [void]$parts.Add("$unknown $(if ($unknown -eq 1) { 'has' } else { 'have' }) no recorded version") }
+    if ($failed) { [void]$parts.Add("$failed could not be checked") }
+    if (-not $parts.Count) { return 'Every installed tool that Dingo can check is up to date.' }
+    $text = "Installed tools: $($parts -join ', '). Each card says which."
+    if ($newer -or $unknown) {
+        $text += if ((Get-InstalledToolsMode) -eq 'Keep') { ' The Options tab says to leave installed tools as they are, so those cards stay on Installed.' }
+            else { ' Those cards are set to Update installed tool.' }
+    }
+    return $text
+}
+
+function Start-ToolUpdateCheck {
+    # Looking for newer versions takes a winget call or a web request per tool,
+    # so it runs in a hidden process and the window stays free. Cards change as
+    # each answer comes in.
+    Stop-ToolUpdateCheck
+    $script:ToolUpdateInfo = @{}
+    $token = [Guid]::NewGuid().ToString('N')
+    $resultPath = Join-Path $env:TEMP "Dingo-updatecheck-$token.json"
+    # A log of its own, so two processes never append to one file at once.
+    $logPath = if ($script:LogFile) { [IO.Path]::ChangeExtension($script:LogFile, '.update-check.log') } else { '' }
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -UpdateCheck -ResultPath "{1}" -WorkerLogPath "{2}" -ToolRoot "{3}"' -f $PSCommandPath,$resultPath,$logPath,$script:ActiveToolRoot
+    try {
+        $process = Start-Process -FilePath (Get-PowerShellHostPath) -ArgumentList $arguments -WindowStyle Hidden -PassThru -ErrorAction Stop
+    } catch {
+        Write-Log 'WARN' "The version check could not start: $($_.Exception.Message)"
+        return
+    }
+    Write-Log 'INFO' "Started the version check of installed tools (process $($process.Id)); its log is $logPath."
+    $timer = New-Object Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromSeconds(1)
+    $script:ToolUpdateCheck = [PSCustomObject]@{ Process=$process; ResultPath=$resultPath; Timer=$timer; LastText='' }
+    $timer.Add_Tick({
+        param($sender,$eventArgs)
+        $check = $script:ToolUpdateCheck
+        if (-not $check) { $sender.Stop(); return }
+        $exited = $check.Process.HasExited
+        $result = Read-ToolUpdateCheckResult $check
+        if ($result) { Update-ToolCardsFromCheck $result }
+        if (-not $exited) { return }
+        $sender.Stop()
+        $script:ToolUpdateCheck = $null
+        Remove-Item -LiteralPath $check.ResultPath -Force -ErrorAction SilentlyContinue
+        $summary = Get-ToolUpdateSummary
+        Write-Log 'INFO' "Version check finished. $summary"
+        if (-not $script:ApplyInProgress) { $SummaryText.Text = "$($SummaryText.Text) $summary" }
+    })
+    $timer.Start()
 }
 
 function Complete-ApplyChanges([array]$Selected, [hashtable]$AdministratorResults) {
@@ -7497,6 +8038,9 @@ function Complete-ApplyChanges([array]$Selected, [hashtable]$AdministratorResult
         $SummaryText.Text = "Finished: $success worked; $partial partially applied; $failed failed.$suffix"
         Set-SummaryEmphasis $SummaryText ([bool]$restartMessage)
         $ProgressBar.Value = 100
+        # An applied tool dropped its version check, so it starts on Installed
+        # again rather than offering the update it just had.
+        Set-ToolDefaultChoices @($Selected | Where-Object { -not ($_.PSObject.Properties['ChoiceSetByHand'] -and $_.ChoiceSetByHand) })
         Refresh-UI
         if ($restartMessage) { [void](Show-RestartNotice $restartMessage) }
         return ,@($applyResults)
@@ -7531,26 +8075,32 @@ $NeededButton.Add_Click({
 })
 # The same pair for the Tools half: every tab in it, so the shortcuts, the
 # PATH launchers and the file types come with the tools they point at. A
-# tweak is never touched, and Update installed tool is only ever chosen by hand.
+# tweak is never touched. A tool card goes back to its default choice, which
+# is Update installed tool when the version check found something to fetch.
 function Get-ToolSectionSettings {
     @($script:Settings | Where-Object { $_.Section -eq 'Tools' })
 }
 $AllToolsButton.Add_Click({
-    foreach ($item in (Get-ToolSectionSettings)) { $item.DesiredState = $item.PreferredState; $item.Selected = $true }
+    foreach ($item in (Get-ToolSectionSettings)) { $item.ChoiceSetByHand = $false; $item.DesiredState = $item.PreferredState; $item.Selected = $true }
+    Set-ToolDefaultChoices (Get-ToolSectionSettings)
     Refresh-UI
     $SummaryText.Text = 'Every tool is selected, with its shortcuts, launchers and file types. Tweaks selections were left as they are. Click Apply selected changes when ready.'
 })
 $MissingToolsButton.Add_Click({
     $tools = Get-ToolSectionSettings
     foreach ($item in $tools) {
+        $item.ChoiceSetByHand = $false
         $item.DesiredState = $item.PreferredState
         $item.Selected = ($item.CurrentState.Status -in @('Alternate','Partial'))
     }
+    Set-ToolDefaultChoices $tools
     Refresh-UI
     $chosen = @($tools | Where-Object Selected).Count
     $SummaryText.Text = if ($chosen) {
-        "Only tools, shortcuts, launchers and file types not yet in place are selected: $chosen. Tweaks selections were left as they are."
+        "Only tools, shortcuts, launchers and file types missing or out of date are selected: $chosen. Tweaks selections were left as they are."
     } else { 'Every tool is already in place. Nothing in the Tools section is selected.' }
+    $checking = Get-Variable -Name ToolUpdateCheck -Scope Script -ErrorAction SilentlyContinue
+    if ($checking -and $checking.Value) { $SummaryText.Text += ' The version check is still running, so a tool it has not reached yet may be out of date.' }
     $unknown = @($tools | Where-Object { $_.CurrentState.Status -in @('Error','Unavailable','Unknown') }).Count
     if ($unknown) { $SummaryText.Text += " $unknown unreadable or unavailable card$(if ($unknown -eq 1) { ' was' } else { 's were' }) left unselected." }
 })
@@ -7559,7 +8109,18 @@ $UncheckButton.Add_Click({
     Refresh-UI
     $SummaryText.Text = 'All selections are cleared. No setting will be changed.'
 })
-$RefreshButton.Add_Click({ Update-CurrentStates })
+$RefreshButton.Add_Click({
+    # Old answers are dropped first, so no card shows a version check from
+    # before the reread.
+    Stop-ToolUpdateCheck
+    $script:ToolUpdateInfo = @{}
+    Update-CurrentStates
+    Set-ToolDefaultChoices $script:Settings
+    Refresh-UI
+    Start-ToolUpdateCheck
+})
+$InstalledToolsUpdateRadio.Add_Checked({ Save-InstalledToolsChoice 'Update' })
+$InstalledToolsKeepRadio.Add_Checked({ Save-InstalledToolsChoice 'Keep' })
 $OpenLogButton.Add_Click({ Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $script:LogFile) })
 $ToolRootSaveButton.Add_Click({ Save-ToolRootChoice ([string]$ToolRootTextBox.Text) })
 $ToolRootDefaultButton.Add_Click({ Save-ToolRootChoice $script:DefaultToolRoot })
@@ -7678,7 +8239,7 @@ $StopButton.Add_Click({
     }
 })
 
-$window.Add_ContentRendered({ Update-CurrentStates })
+$window.Add_ContentRendered({ Update-CurrentStates; Start-ToolUpdateCheck })
 $window.Add_Closing({
     param($sender,$eventArgs)
     if (-not $script:ApplyInProgress) { return }
@@ -7703,5 +8264,5 @@ $window.Add_Closing({
         $SummaryText.Text = 'Stopping. Dingo is finishing the setting it is on, then it will show you the results.'
     }
 })
-$window.Add_Closed({ Write-Log 'INFO' 'Application closed.' })
+$window.Add_Closed({ Stop-ToolUpdateCheck; Write-Log 'INFO' 'Application closed.' })
 [void]$window.ShowDialog()

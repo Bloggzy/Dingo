@@ -149,6 +149,12 @@ Add `-ToolRoot` to use a different tools folder for one run, without saving it:
 Start-Dingo.cmd -Apply -Include tools -ToolRoot "D:\DFIR\Tools"
 ```
 
+Add `-InstalledTools Keep` to leave tools that are already installed at the version they are, for one run only. `-InstalledTools Update` does the opposite. See [Tools that are already installed](#tools-that-are-already-installed).
+
+```bat
+Start-Dingo.cmd -Apply -Include tools -InstalledTools Keep
+```
+
 A folder Dingo cannot use ends the run with exit code `2` and says why. See [Where tools are installed](#where-tools-are-installed) for the saved option and the rules.
 
 Exit codes: `0` success, `1` a setting failed, `2` bad command line, `3` Dingo already running.
@@ -241,14 +247,60 @@ Restart Edge after these.
 
 ## Tools
 
-Each tool card has two choices: **Installed** (install it if missing, leave it alone if present) and **Update installed tool**. Neither choice removes a tool.
+Each tool card has two choices. Apply does what the card says:
+
+- **Installed** installs a missing tool, and leaves a tool that is already there alone.
+- **Update installed tool** fetches a newer version of a tool that is already there. If it is up to date, nothing is downloaded.
+
+A card with a newer version out starts on **Update installed tool**. Every other card starts on **Installed**. See [Tools that are already installed](#tools-that-are-already-installed). Neither choice removes a tool.
 
 Two buttons at the top of the Tools section select cards for you. They act on every tab in Tools: the tools, their shortcuts, the **Run tools from anywhere** launchers, and the file types. They never touch a Tweaks card.
 
 - **Choose all tools** selects every card in the Tools section.
-- **Select only tools not yet in place** selects only the cards whose check says they are missing or incomplete. A tool that is already installed is left out. A card Dingo could not read is left out too.
+- **Select only tools missing or out of date** selects only the cards that are amber: missing, incomplete, or, when the Options tab says to update installed tools, older than the latest version. A tool that is up to date is left out. A card Dingo could not read is left out too.
 
-Both buttons pick **Installed**, never **Update installed tool**. To update a tool, choose that on its card.
+Both buttons put each card back on the choice it starts on, even if you changed it by hand.
+
+### Tools that are already installed
+
+When the window opens, Dingo looks for a newer version of every installed tool. This runs in the background, so the window is ready at once, and each card changes when its answer comes in. It takes a few seconds, and needs a network connection. Press **Read settings again** to check again.
+
+A card then says one of these:
+
+- **Installed (1.2); 1.4 is out.** A newer version is out.
+- **Installed (1.4), up to date.** Nothing newer.
+- **Installed; version not recorded, latest is v2.0.** Dingo does not know which version is in the folder. See below.
+
+- **Installed; its own script fetches only changed files.** Eric Zimmerman's tools. See the table below.
+
+If the check cannot finish, for example with no network, the card stays as it was. Hover over the card's state to read why.
+
+A card with a newer version out, or with no recorded version, then moves to **Update installed tool** and turns amber. The card does not switch itself on: select it, or press **Select only tools missing or out of date**. A choice you make by hand on a card is never changed by the check.
+
+The **Options** tab decides which choice those cards start on:
+
+- **Start an out-of-date tool on Update installed tool.** This is the default.
+- **Start every tool on Installed.** The cards still say when a newer version is out, but they stay green and on **Installed**. To update one tool, choose **Update installed tool** on its card.
+
+A command-line run has no cards, so it checks each selected tool that is installed before it starts, and picks the same choice a card would. `-WhatIf` shows the choice in the `Target` column.
+
+The choice is saved in `%LOCALAPPDATA%\Dingo\config.json`, next to the tools folder.
+
+How Dingo knows the version, for each kind of tool:
+
+| Tool comes from | Installed version | Latest version |
+| --- | --- | --- |
+| winget | `winget list` | `winget list`. Dingo runs `winget install` only when winget offers a newer version. |
+| A GitHub release | `.dingo-release.json` in the tool's folder | The latest release on GitHub |
+| Arsenal Image Mounter | `.dingo-release.json` in the tool's folder | The file name on the vendor's download page |
+| Dissect (pip) | The venv's own record | PyPI |
+| Eric Zimmerman's tools | Not needed | The author's script compares each file with the published one, and downloads only the files that changed. |
+
+Dingo writes `.dingo-release.json` each time it unpacks a release, from version 0.8.13 on. A tool put in its folder by hand, or by an older Dingo, has no record, so its version is unknown. Dingo updates it once, then records the version.
+
+Sometimes winget cannot match an installed tool to its package. On the PC this was tested on, that happened to PowerShell 7. Then winget cannot compare versions, and the card says so and starts on **Installed**. If you choose **Update installed tool** on it anyway, the update fails and says why: Dingo does not run `winget install`, because it would treat the tool as missing and install the package again.
+
+An update that fails leaves the card **Failed**, and says whether the tool is still installed. A tool that is open while it is updated can make the update fail. Close it, then apply again.
 
 The cards are shown in name order, and the **Install tools** tab has a search box above the list. Type part of a name, such as `haya`, and only the matching cards stay on screen. Type more than one word and a card must match every word. The search only hides cards; a tool you already selected stays in the plan while it is out of sight. Press **Clear** to show the whole list again.
 
@@ -318,7 +370,7 @@ Use of the tool is governed by the Arsenal Recon licence, which is in that folde
 
 Hayabusa puts its version in the program name, such as `hayabusa-4.1.0-win-x64.exe`. Dingo always names the launcher `hayabusa` and points it at the newest copy in the folder, so the command never changes when you update.
 
-Dingo builds the download address itself from the repository name, so a catalog entry can never send the download to another site. A release file is rebuilt for every version, so no SHA256 can be pinned in advance; Dingo records the hash of what it actually fetched in the log and the journal. Choose **Update installed tool** to fetch the newest release again.
+Dingo builds the download address itself from the repository name, so a catalog entry can never send the download to another site. A release file is rebuilt for every version, so no SHA256 can be pinned in advance; Dingo records the hash of what it actually fetched in the log and the journal. It also writes the release it unpacked to `.dingo-release.json` in the tool's folder, so it can tell later whether a newer one is out.
 
 ### PowerShell 7, Python, and Dissect
 
