@@ -314,6 +314,96 @@ try {
         Assert ($result.Success -and $result.Message -match 'Registry value, type, or absence checked') 'Result lacks concrete verification basis.'
         Assert ($result.Message -notmatch 'Applied and verified') 'Unqualified verification claim remains.'
     }
+    Test-Case 'winget list rows give the installed and the newer version' {
+        $withNewer="Name Id      Version  Available Source`n--------------------------------------`nGit  Git.Git 2.55.0.3 2.55.0.5  winget"
+        $row=ConvertFrom-WingetListOutput $withNewer 'Git.Git'
+        Assert ($row.Installed -eq '2.55.0.3' -and $row.Available -eq '2.55.0.5') 'A newer version was missed.'
+        $current="Name                   Id                  Version Source`n----------------------------------------------------------`nNotepad++ (64-bit x64) Notepad++.Notepad++ 8.9.8.1 winget"
+        $row=ConvertFrom-WingetListOutput $current 'Notepad++.Notepad++'
+        Assert ($row.Installed -eq '8.9.8.1' -and -not $row.Available) 'An up-to-date package read as out of date.'
+        $ranged="Name Id    Version Available Source`n---`nProbe Test.Probe < 1.2 1.4 winget"
+        $row=ConvertFrom-WingetListOutput $ranged 'Test.Probe'
+        Assert ($row.Installed -eq '< 1.2' -and $row.Available -eq '1.4') 'A ranged version was split wrongly.'
+        Assert (-not (ConvertFrom-WingetListOutput 'No installed package found matching input criteria.' 'Git.Git')) 'A missing package must give no row.'
+        # What winget 1.x prints for --source winget: no Source column, and the
+        # spinner frames before the table end in a bare carriage return.
+        $filtered="`r-`r\`r|`r`rName Id Version`r`n---`r`nGit Git.Git 2.55.0.3 2.55.0.5`r`n"
+        $row=ConvertFrom-WingetListOutput $filtered 'Git.Git'
+        Assert ($row.Installed -eq '2.55.0.3' -and $row.Available -eq '2.55.0.5') 'A filtered list with a newer version was misread.'
+        $twoRows="Name Id Version`n---`nMicrosoft Windows Desktop Runtime - 9.0.20 (x64) Microsoft.DotNet.DesktopRuntime.9 9.0.20`nMicrosoft Windows Desktop Runtime - 9.0.20 (x86) Microsoft.DotNet.DesktopRuntime.9 9.0.20"
+        $row=ConvertFrom-WingetListOutput $twoRows 'Microsoft.DotNet.DesktopRuntime.9'
+        Assert ($row.Installed -eq '9.0.20' -and -not $row.Available) 'Two rows for one id were misread.'
+        $row=ConvertFrom-WingetListOutput ($twoRows + ' 9.0.21') 'Microsoft.DotNet.DesktopRuntime.9'
+        Assert ($row.Available -eq '9.0.21') 'A newer version on the second row was missed.'
+    }
+    Test-Case 'Versions compare as numbers, and anything else is not compared' {
+        Assert ((Compare-ToolVersion 'v2.9.0' 'v2.10.0') -eq -1) 'v2.9.0 must be older than v2.10.0.'
+        Assert ((Compare-ToolVersion '4.1' '4.0.9') -eq 1) '4.1 must be newer than 4.0.9.'
+        Assert ((Compare-ToolVersion 'v3.13.368' '3.13.368') -eq 0) 'A leading v must not matter.'
+        Assert ($null -eq (Compare-ToolVersion '2026-07-09' '2026-09-10')) 'A date-shaped version must not be compared as a number.'
+        Assert ((Get-PipPackageName 'dissect[full]>=3.1') -eq 'dissect') 'The pip package name was not read.'
+    }
+    Test-Case 'The options file keeps the tools folder and the installed-tools choice together' {
+        $config=Join-Path $scratch 'config.json'
+        Assert ((Read-DingoInstalledToolsPreference $config) -eq 'Update') 'A missing options file must mean Update.'
+        [void](Save-DingoToolRootPreference 'C:\Dingo-Options-Test' $config)
+        Save-DingoInstalledToolsPreference 'Keep' $config
+        Assert ((Read-DingoToolRootPreference $config) -eq 'C:\Dingo-Options-Test') 'Saving the installed-tools choice lost the tools folder.'
+        Assert ((Read-DingoInstalledToolsPreference $config) -eq 'Keep') 'Keep did not read back.'
+        [void](Save-DingoToolRootPreference 'C:\Dingo-Options-Test2' $config)
+        Assert ((Read-DingoInstalledToolsPreference $config) -eq 'Keep') 'Saving the tools folder lost the installed-tools choice.'
+        Assert-Throws { Save-DingoInstalledToolsPreference 'Sometimes' $config } 'not a choice'
+        [IO.File]::WriteAllText($config,'{ "installedTools": "Sometimes" }')
+        Assert ((Read-DingoInstalledToolsPreference $config) -eq 'Update') 'An unknown saved value must mean Update.'
+        [IO.File]::WriteAllText($config,'not json')
+        Assert ((Read-DingoInstalledToolsPreference $config) -eq 'Update') 'An unreadable options file must mean Update.'
+    }
+    Test-Case 'A release download is skipped when the recorded release is the latest' {
+        $tool=ConvertTo-ToolDefinition ([pscustomobject]@{
+            id='tool-releaseprobe'; name='ReleaseProbe'
+            install=[pscustomobject]@{kind='github-release'; repo='owner/name'; assetPattern='probe-*.zip'; dest=(Join-Path $scratch 'ReleaseProbe')}
+            detect=@([pscustomobject]@{kind='file';path=$probe})
+        })
+        [void](New-Item -ItemType Directory -Path (Join-Path $scratch 'ReleaseProbe'))
+        function Get-GitHubLatestRelease { [pscustomobject]@{ tag_name='v2.0'; assets=@() } }
+        function Invoke-WebRequest { throw 'Unexpected download' }
+        Assert ((Get-ToolUpdateStatus $tool).Status -eq 'Unknown') 'A folder with no record must be Unknown.'
+        # No record: the update goes ahead, and here finds no file to fetch.
+        Assert-Throws { Install-GitHubReleasePackage $tool $true } 'holds no file'
+        Write-ToolReleaseRecord $tool 'v1.0' 'probe-1.0.zip'
+        $status=Get-ToolUpdateStatus $tool
+        Assert ($status.Status -eq 'Available' -and $status.Installed -eq 'v1.0' -and $status.Latest -eq 'v2.0') 'An older record must be Available.'
+        Write-ToolReleaseRecord $tool 'v2.0' 'probe-2.0.zip'
+        Assert ((Get-ToolUpdateStatus $tool).Status -eq 'Current') 'The latest record must be Current.'
+        Install-GitHubReleasePackage $tool $true
+        Assert-Throws { Install-GitHubReleasePackage $tool $false } 'holds no file'
+        function Get-GitHubLatestRelease { throw 'offline' }
+        $status=Get-ToolUpdateStatus $tool
+        Assert ($status.Status -eq 'Failed' -and $status.Message -match 'offline') 'A failed check must say why, and claim nothing.'
+    }
+    Test-Case 'A tool card says when a newer version is out, and is amber only when Apply would update it' {
+        $tool=New-TestTool any @($probe)
+        $script:ToolUpdateInfo=@{ 'tool-probe'=(New-ToolUpdateStatus 'tool-probe' 'Available' '1.0' '2.0' 'winget offers 2.0.') }
+        try {
+            $state=Get-PackageKindState (New-TestPackage $tool)
+            Assert ($state.Status -eq 'Partial' -and $state.DisplayText -eq 'Installed (1.0); 2.0 is out') "Update mode card was '$($state.DisplayText)' ($($state.Status))."
+            $script:InstalledToolsMode='Keep'
+            $state=Get-PackageKindState (New-TestPackage $tool)
+            Assert ($state.Status -eq 'Preferred' -and $state.DisplayText -match '2\.0 is out') 'Keep must still say a newer version is out, in green.'
+            $script:InstalledToolsMode='Update'
+            $script:ToolUpdateInfo['tool-probe']=New-ToolUpdateStatus 'tool-probe' 'Current' '2.0' '2.0' 'winget offers nothing newer.'
+            $state=Get-PackageKindState (New-TestPackage $tool)
+            Assert ($state.Status -eq 'Preferred' -and $state.DisplayText -eq 'Installed (2.0), up to date') 'An up-to-date tool must say so.'
+            $script:ToolUpdateInfo['tool-probe']=New-ToolUpdateStatus 'tool-probe' 'Failed' -Message 'offline'
+            $state=Get-PackageKindState (New-TestPackage $tool)
+            Assert ($state.Status -eq 'Preferred' -and $state.Details -match 'offline') 'A failed check must not change the card, only explain.'
+            # Applying a tool drops its old answer, so verification reads the disk.
+            $script:ToolUpdateInfo['tool-probe']=New-ToolUpdateStatus 'tool-probe' 'Available' '1.0' '2.0' 'x'
+            function Set-SettingPart {}
+            $result=Invoke-SettingChange (New-TestPackage $tool) @{ 'tool-probe'=[pscustomobject]@{ Success=$true; Components=@() } }
+            Assert ($result.Success -and -not $script:ToolUpdateInfo.ContainsKey('tool-probe')) 'An applied tool kept its old version check.'
+        } finally { $script:ToolUpdateInfo=@{}; $script:InstalledToolsMode='Update' }
+    }
     "Passed $script:Passed phase 2 tests on PowerShell $($PSVersionTable.PSVersion)."
 } finally {
     $full=[IO.Path]::GetFullPath($scratch)

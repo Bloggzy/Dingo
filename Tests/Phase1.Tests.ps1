@@ -169,14 +169,51 @@ try {
         Assert-Throws { Set-ShortcutKindPart $setting Created Machine } 'not created by Dingo'
         Assert (-not (Test-Path -LiteralPath (Join-Path $scratch 'New First Link.lnk'))) 'Earlier shortcut was created before conflict detection.'
     }
-    Test-Case 'Install skips detected tools in both scopes and for both installer kinds' {
-        function Find-InstalledTool { [pscustomobject]@{Version='old-but-approved'} }
-        function Install-WingetPackage { throw 'Unexpected winget install' }
-        function Install-ScriptPackage { throw 'Unexpected script install' }
-        foreach ($id in @('tool-7zip','tool-ripgrep','tool-eztools')) {
+    Test-Case 'Keep leaves detected tools alone in both scopes and for every installer kind' {
+        $script:InstalledToolsMode = 'Keep'
+        try {
+            function Find-InstalledTool { [pscustomobject]@{Version='old-but-approved'} }
+            function Install-WingetPackage { throw 'Unexpected winget install' }
+            function Install-ScriptPackage { throw 'Unexpected script install' }
+            function Install-GitHubReleasePackage { throw 'Unexpected release download' }
+            function Install-PythonVenvPackage { throw 'Unexpected pip install' }
+            foreach ($id in @('tool-7zip','tool-ripgrep','tool-eztools','tool-hayabusa','tool-dissect')) {
+                $setting = $script:Settings | Where-Object Id -eq $id
+                Set-PackageKindPart $setting Installed $setting.Entries[0].Scope
+            }
+        } finally { $script:InstalledToolsMode = 'Update' }
+    }
+    Test-Case 'Update, the default, updates detected tools and says a failed update left the tool installed' {
+        $calls = New-Object Collections.ArrayList
+        function Find-InstalledTool { [pscustomobject]@{Version='1'} }
+        function Get-WingetPath { 'mock-winget.exe' }
+        function Install-WingetPackage($Tool, $AllowUpgrade) { [void]$calls.Add("winget:$AllowUpgrade") }
+        function Install-ScriptPackage { [void]$calls.Add('script') }
+        function Install-GitHubReleasePackage($Tool, $SkipIfCurrent) { [void]$calls.Add("release:$SkipIfCurrent") }
+        function Install-PythonVenvPackage($Tool, $AllowUpgrade) { [void]$calls.Add("pip:$AllowUpgrade") }
+        function Get-ToolUpdateStatus($Tool) { New-ToolUpdateStatus $Tool.Id 'Available' '1' '2' 'winget offers 2.' }
+        Assert ((Get-InstalledToolsMode) -eq 'Update') 'Update must be the default for installed tools.'
+        foreach ($id in @('tool-7zip','tool-eztools','tool-hayabusa','tool-dissect')) {
             $setting = $script:Settings | Where-Object Id -eq $id
             Set-PackageKindPart $setting Installed $setting.Entries[0].Scope
         }
+        Assert (($calls -join ',') -eq 'winget:True,script,release:True,pip:True') "Wrong update dispatch: $($calls -join ',')"
+        # winget installs only what it offers. A tool it is up to date on, or does
+        # not list at all, is not handed to winget install.
+        foreach ($answer in @('Current','Failed')) {
+            function Get-ToolUpdateStatus($Tool) { New-ToolUpdateStatus $Tool.Id $answer -Message 'stub' }
+            [void]$calls.Clear()
+            Set-PackageKindPart ($script:Settings | Where-Object Id -eq 'tool-7zip') Installed Machine
+            Assert (-not $calls.Count) "winget was run for a tool whose check said $answer."
+        }
+        function Get-ToolUpdateStatus($Tool) { New-ToolUpdateStatus $Tool.Id 'Available' '1' '2' 'winget offers 2.' }
+        # No winget: an installed tool is left as it is, not a reason to repair winget.
+        function Get-WingetPath { $null }
+        function Install-WingetPackage { throw 'Unexpected winget install' }
+        Set-PackageKindPart ($script:Settings | Where-Object Id -eq 'tool-7zip') Installed Machine
+        function Get-WingetPath { 'mock-winget.exe' }
+        function Install-WingetPackage { throw 'winget said no' }
+        Assert-Throws { Set-PackageKindPart ($script:Settings | Where-Object Id -eq 'tool-7zip') Installed Machine } 'update of 7-Zip did not finish: winget said no\. 7-Zip is still installed\.'
     }
     Test-Case 'Missing tools install; explicit updates run only for installed tools' {
         $calls = New-Object Collections.ArrayList
