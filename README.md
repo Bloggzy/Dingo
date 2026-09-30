@@ -291,12 +291,14 @@ How Dingo knows the version, for each kind of tool:
 | Tool comes from | Installed version | Latest version |
 | --- | --- | --- |
 | winget | `winget list` | `winget list`. Dingo runs `winget install` only when winget offers a newer version. |
-| A GitHub release | `.dingo-release.json` in the tool's folder | The latest release on GitHub |
-| Arsenal Image Mounter | `.dingo-release.json` in the tool's folder | The file name on the vendor's download page |
+| A GitHub release | `.dingo-release.json` in the tool's folder, or the version the program reports | The latest release on GitHub |
+| Arsenal Image Mounter | `.dingo-release.json` in the tool's folder, or the version the program reports | The file name on the vendor's download page |
 | Dissect (pip) | The venv's own record | PyPI |
 | Eric Zimmerman's tools | Not needed | The author's script compares each file with the published one, and downloads only the files that changed. |
 
-Dingo writes `.dingo-release.json` each time it unpacks a release, from version 0.8.13 on. A tool put in its folder by hand, or by an older Dingo, has no record, so its version is unknown. Dingo updates it once, then records the version.
+Dingo writes `.dingo-release.json` each time it unpacks a release, from version 0.8.13 on. It also writes down the version the program reported then. If the program reports another version later, someone has put a different release in the folder by hand, so Dingo stops trusting the record.
+
+With no record to trust, Dingo asks the program itself. A program often reports more parts than its release: MemProcFS 5.14.13.203 is release v5.14, and AzCopy 10.32.8.0 is v10.32.8. So Dingo compares only as many parts as the release has. If the program reports no version, or one that cannot be compared, the card says **version not recorded** or **cannot compare**. Dingo then updates the tool once and records the version.
 
 Sometimes winget cannot match an installed tool to its package. On the PC this was tested on, that happened to PowerShell 7. Then winget cannot compare versions, and the card says so and starts on **Installed**. If you choose **Update installed tool** on it anyway, the update fails and says why: Dingo does not run `winget install`, because it would treat the tool as missing and install the package again.
 

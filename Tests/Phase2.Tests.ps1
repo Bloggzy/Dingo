@@ -372,7 +372,7 @@ try {
         Assert-Throws { Install-GitHubReleasePackage $tool $true } 'holds no file'
         Write-ToolReleaseRecord $tool 'v1.0' 'probe-1.0.zip'
         $status=Get-ToolUpdateStatus $tool
-        Assert ($status.Status -eq 'Available' -and $status.Installed -eq 'v1.0' -and $status.Latest -eq 'v2.0') 'An older record must be Available.'
+        Assert ($status.Status -eq 'Available' -and $status.Installed -eq '1.0' -and $status.Latest -eq 'v2.0') 'An older record must be Available.'
         Write-ToolReleaseRecord $tool 'v2.0' 'probe-2.0.zip'
         Assert ((Get-ToolUpdateStatus $tool).Status -eq 'Current') 'The latest record must be Current.'
         Install-GitHubReleasePackage $tool $true
@@ -380,6 +380,44 @@ try {
         function Get-GitHubLatestRelease { throw 'offline' }
         $status=Get-ToolUpdateStatus $tool
         Assert ($status.Status -eq 'Failed' -and $status.Message -match 'offline') 'A failed check must say why, and claim nothing.'
+    }
+    Test-Case 'With no record to trust, the program''s own version is compared with the release' {
+        $tool=ConvertTo-ToolDefinition ([pscustomobject]@{
+            id='tool-fileprobe'; name='FileProbe'
+            install=[pscustomobject]@{kind='github-release'; repo='owner/name'; assetPattern='probe-*.zip'; dest=(Join-Path $scratch 'FileProbe')}
+            detect=@([pscustomobject]@{kind='file';path=$probe})
+        })
+        [void](New-Item -ItemType Directory -Path (Join-Path $scratch 'FileProbe'))
+        $script:onDisk='5.14.13.203'
+        function Get-ToolDetection { [pscustomobject]@{ Complete=$true; Version=$script:onDisk } }
+        function Get-GitHubLatestRelease { [pscustomobject]@{ tag_name='v5.18'; assets=@() } }
+        function Invoke-WebRequest { throw 'Unexpected download' }
+        # What the VM showed: 5.14 unpacked by hand, no record.
+        $status=Get-ToolUpdateStatus $tool
+        Assert ($status.Status -eq 'Available' -and $status.Installed -eq '5.14.13.203' -and $status.Latest -eq 'v5.18') "A hand-installed 5.14 read as $($status.Status) '$($status.Installed)'."
+        # A program that reports more parts than the tag is still the same release.
+        $script:onDisk='5.18.0.7'
+        Assert ((Get-ToolUpdateStatus $tool).Status -eq 'Current') '5.18.0.7 must count as release v5.18.'
+        Install-GitHubReleasePackage $tool $true
+        # A program with no dotted number cannot be compared.
+        $script:onDisk=''
+        Assert ((Get-ToolUpdateStatus $tool).Status -eq 'Unknown') 'No version to compare must be Unknown.'
+        # Dingo wrote a record for v5.18, then someone unpacked 5.14 over it by hand.
+        $script:onDisk='5.18.0.7'
+        Write-ToolReleaseRecord $tool 'v5.18' 'probe-5.18.zip'
+        Assert ((Read-ToolReleaseRecord $tool).DetectedVersion -eq '5.18.0.7') 'The record did not keep what the program reported.'
+        Assert ((Get-ToolUpdateStatus $tool).Status -eq 'Current') 'A record the program agrees with must be Current.'
+        $script:onDisk='5.14.13.203'
+        $status=Get-ToolUpdateStatus $tool
+        Assert ($status.Status -eq 'Available' -and $status.Message -match 'record is out of date') 'A record the program no longer agrees with was trusted.'
+        Assert-Throws { Install-GitHubReleasePackage $tool $true } 'holds no file'
+        # A record from 0.8.13 has no detectedVersion; an older program still wins over it.
+        $path=Get-ToolReleaseRecordPath $tool
+        [IO.File]::WriteAllText($path,'{ "version": "v5.18", "asset": "probe-5.18.zip" }')
+        Assert ((Get-ToolUpdateStatus $tool).Status -eq 'Available') 'A 0.8.13 record hid an older program.'
+        Assert ((Compare-ToolVersionPrefix '10.32.8.0' 'v10.32.8') -eq 0) 'AzCopy 10.32.8.0 must be release v10.32.8.'
+        Assert ((Compare-ToolVersionPrefix 'v1.5.2' 'v1.5.6') -eq -1) 'DuckDB v1.5.2 must be older than v1.5.6.'
+        Assert ((Get-ReleaseVersionNumber 'Arsenal-Image-Mounter-v3.13.368.zip') -eq '3.13.368') 'The version was not read from a file name.'
     }
     Test-Case 'A tool card says when a newer version is out, and is amber only when Apply would update it' {
         $tool=New-TestTool any @($probe)
