@@ -2042,18 +2042,14 @@ function Get-ToolUpdateStatus($Tool) {
                 $release = Get-GitHubLatestRelease $Tool.Repo 30
                 $tag = [string](Get-JsonField $release 'tag_name' '')
                 if (-not $tag) { return (New-ToolUpdateStatus $id 'Failed' -Message "GitHub named no latest release for $($Tool.Repo).") }
-                $record = Read-ToolReleaseRecord $Tool
-                if (-not $record) { return (New-ToolUpdateStatus $id 'Unknown' '' $tag "The latest release is $tag. Dingo has no record of which release is in the folder, so an update installs $tag and records it.") }
-                if ($record.Version -eq $tag) { return (New-ToolUpdateStatus $id 'Current' $record.Version $tag "$tag is the latest release.") }
-                return (New-ToolUpdateStatus $id 'Available' $record.Version $tag "The latest release is $tag.")
+                return (Get-ReleaseToolStatus $Tool $tag $tag)
             }
             'mega-page' {
                 $offer = Get-MegaPageOffer $Tool
                 $name = [string]$offer.Info.Name
-                $record = Read-ToolReleaseRecord $Tool
-                if (-not $record) { return (New-ToolUpdateStatus $id 'Unknown' '' $name "The vendor offers $name. Dingo has no record of which download is in the folder, so an update installs $name and records it.") }
-                if ($record.Version -eq $name) { return (New-ToolUpdateStatus $id 'Current' $record.Version $name "$name is the latest download.") }
-                return (New-ToolUpdateStatus $id 'Available' $record.Version $name "The vendor offers $name.")
+                $label = Get-ReleaseVersionNumber $name
+                if (-not $label) { $label = $name }
+                return (Get-ReleaseToolStatus $Tool $name $label)
             }
             'python-venv' {
                 $venvPython = Join-Path (Expand-ToolRootPath $Tool.Dest) 'Scripts\python.exe'
@@ -2527,14 +2523,17 @@ function Get-ToolReleaseRecordPath($Tool) {
 
 function Read-ToolReleaseRecord($Tool) {
     # What Dingo last unpacked into the tool's folder. A tool put there by hand,
-    # or by a Dingo older than 0.8.13, has no record, so its version is unknown.
+    # or by a Dingo older than 0.8.13, has no record.
     try {
         $path = Get-ToolReleaseRecordPath $Tool
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
         $record = Read-JsonFileTolerantly $path
         $version = [string](Get-JsonField $record 'version' '')
         if (-not $version) { return $null }
-        return [PSCustomObject]@{ Version=$version; Asset=[string](Get-JsonField $record 'asset' '') }
+        return [PSCustomObject]@{
+            Version=$version; Asset=[string](Get-JsonField $record 'asset' '')
+            DetectedVersion=[string](Get-JsonField $record 'detectedVersion' '')
+        }
     } catch {
         Write-Log 'WARN' "Could not read the release record of $($Tool.Name): $($_.Exception.Message)"
         return $null
@@ -2543,8 +2542,69 @@ function Read-ToolReleaseRecord($Tool) {
 
 function Write-ToolReleaseRecord($Tool, [string]$Version, [string]$Asset) {
     $path = Get-ToolReleaseRecordPath $Tool
-    $record = [PSCustomObject]@{ version=$Version; asset=$Asset; installedUtc=[DateTime]::UtcNow.ToString('o') }
+    # What the program itself reports now, so a later check can tell that
+    # someone has since put another release in the folder by hand.
+    $detected = ''
+    try { $detected = [string](Get-ToolDetection $Tool).Version } catch { $detected = '' }
+    $record = [PSCustomObject]@{ version=$Version; asset=$Asset; detectedVersion=$detected; installedUtc=[DateTime]::UtcNow.ToString('o') }
     Write-Utf8FileAtomically $path (ConvertTo-Json -InputObject $record -Depth 3)
+}
+
+function Get-ReleaseVersionNumber([string]$Text) {
+    # The dotted number in a tag or file name: 'v5.18' gives 5.18, and
+    # 'Arsenal-Image-Mounter-v3.13.368.zip' gives 3.13.368.
+    $found = [regex]::Match([string]$Text, '\d+(?:\.\d+)+')
+    if ($found.Success) { return $found.Value }
+    return ''
+}
+
+function Compare-ToolVersionPrefix([string]$Installed, [string]$Release) {
+    # A program often reports more parts than its release tag: MemProcFS
+    # 5.14.13.203 is release v5.14, and AzCopy 10.32.8.0 is v10.32.8. So only
+    # as many parts as the release has are compared. -1 older, 0 the same,
+    # 1 newer, or $null when either has no dotted number to compare.
+    $have = Get-ReleaseVersionNumber $Installed
+    $want = Get-ReleaseVersionNumber $Release
+    if (-not $have -or -not $want) { return $null }
+    $haveParts = @($have.Split('.'))
+    $wantParts = @($want.Split('.'))
+    for ($i = 0; $i -lt $wantParts.Count; $i++) {
+        $a = if ($i -lt $haveParts.Count) { [decimal]$haveParts[$i] } else { [decimal]0 }
+        $b = [decimal]$wantParts[$i]
+        if ($a -lt $b) { return -1 }
+        if ($a -gt $b) { return 1 }
+    }
+    return 0
+}
+
+function Get-ReleaseToolStatus($Tool, [string]$Latest, [string]$LatestLabel) {
+    # Shared by the version check and the install, so the card and the update
+    # always agree on whether a download is needed.
+    $id = [string]$Tool.Id
+    $found = Get-ToolDetection $Tool
+    $onDisk = if ($found.Complete) { [string]$found.Version } else { '' }
+    $record = Read-ToolReleaseRecord $Tool
+    # A record is trusted only while the program still agrees with it. It does
+    # not when someone has put another release in the folder by hand since.
+    $recordHolds = [bool]$record
+    if ($recordHolds -and $onDisk) {
+        if ($record.DetectedVersion -and $record.DetectedVersion -ne $onDisk) { $recordHolds = $false }
+        elseif (-not $record.DetectedVersion -and (Compare-ToolVersionPrefix $onDisk $record.Version) -eq -1) { $recordHolds = $false }
+    }
+    if ($recordHolds) {
+        $have = Get-ReleaseVersionNumber $record.Version
+        if (-not $have) { $have = $record.Version }
+        if ($record.Version -eq $Latest) { return (New-ToolUpdateStatus $id 'Current' $have $LatestLabel "$LatestLabel is the latest release, and Dingo's record says it is the one in the folder.") }
+        return (New-ToolUpdateStatus $id 'Available' $have $LatestLabel "The latest release is $LatestLabel. Dingo's record says $($record.Version) is in the folder.")
+    }
+    # No record to trust, so ask the program itself.
+    $why = if ($record) { "Dingo's record says $($record.Version), but the program now reports $onDisk, so the record is out of date." } else { 'Dingo has no record of this folder.' }
+    $order = Compare-ToolVersionPrefix $onDisk $Latest
+    if ($order -eq -1) { return (New-ToolUpdateStatus $id 'Available' $onDisk $LatestLabel "$why The program reports $onDisk, and the latest release is $LatestLabel.") }
+    if ($order -eq 0) { return (New-ToolUpdateStatus $id 'Current' $onDisk $LatestLabel "$why The program reports $onDisk, which is the latest release, $LatestLabel.") }
+    # Newer than the release, or no number to compare: an update is the only
+    # way to be sure, and it writes a record for next time.
+    return (New-ToolUpdateStatus $id 'Unknown' $onDisk $LatestLabel "$why The program's own version cannot be compared with the latest release, $LatestLabel, so an update installs it and records it.")
 }
 
 function Install-GitHubReleasePackage($Tool, [bool]$SkipIfCurrent = $false) {
@@ -2554,14 +2614,14 @@ function Install-GitHubReleasePackage($Tool, [bool]$SkipIfCurrent = $false) {
     Write-Log 'INFO' "Reading the latest $($Tool.Name) release from github.com/$($Tool.Repo)."
     $release = Get-GitHubLatestRelease $Tool.Repo
     $tag = [string](Get-JsonField $release 'tag_name' '')
-    if ($SkipIfCurrent) {
-        $record = Read-ToolReleaseRecord $Tool
-        if ($record -and $tag -and $record.Version -eq $tag) {
-            Write-Log 'INFO' "$($Tool.Name) $tag is already the latest release; nothing was downloaded."
+    if ($SkipIfCurrent -and $tag) {
+        $check = Get-ReleaseToolStatus $Tool $tag $tag
+        if ($check.Status -eq 'Current') {
+            Write-Log 'INFO' "$($Tool.Name) $tag is already the latest release; nothing was downloaded. $($check.Message)"
             return
         }
-        $from = if ($record) { $record.Version } else { 'an unrecorded version' }
-        Write-Log 'INFO' "Updating $($Tool.Name) from $from to $tag."
+        $from = if ($check.Installed) { $check.Installed } else { 'an unknown version' }
+        Write-Log 'INFO' "Updating $($Tool.Name) from $from to $tag. $($check.Message)"
     }
     $assets = @(@(Get-JsonField $release 'assets' @()) | Where-Object { ([string](Get-JsonField $_ 'name' '')) -like $Tool.AssetPattern })
     if (-not $assets.Count) { throw "The latest $($Tool.Name) release ($tag) holds no file matching '$($Tool.AssetPattern)'." }
@@ -2882,13 +2942,15 @@ function Install-MegaPagePackage($Tool, [bool]$SkipIfCurrent = $false) {
         throw "The download page offered '$($info.Name)' for $($Tool.Name), but a file named like '$($Tool.AssetPattern)' was expected. Nothing was downloaded."
     }
     if ($SkipIfCurrent) {
-        $record = Read-ToolReleaseRecord $Tool
-        if ($record -and $record.Version -eq $info.Name) {
-            Write-Log 'INFO' "$($Tool.Name) $($info.Name) is already the latest download; nothing was downloaded."
+        $label = Get-ReleaseVersionNumber $info.Name
+        if (-not $label) { $label = $info.Name }
+        $check = Get-ReleaseToolStatus $Tool $info.Name $label
+        if ($check.Status -eq 'Current') {
+            Write-Log 'INFO' "$($Tool.Name) $($info.Name) is already the latest download; nothing was downloaded. $($check.Message)"
             return
         }
-        $from = if ($record) { $record.Version } else { 'an unrecorded version' }
-        Write-Log 'INFO' "Updating $($Tool.Name) from $from to $($info.Name)."
+        $from = if ($check.Installed) { $check.Installed } else { 'an unknown version' }
+        Write-Log 'INFO' "Updating $($Tool.Name) from $from to $($info.Name). $($check.Message)"
     }
 
     $stem = Join-Path $env:TEMP ("Dingo-mega-{0}" -f [Guid]::NewGuid().ToString('N'))
@@ -3611,7 +3673,7 @@ function Get-PackageKindState($Setting) {
                 if ($updating -and $status -eq 'Preferred') { $status = 'Partial' }
             }
             'Unknown' {
-                $text = "Installed; version not recorded, latest is $($update.Latest)"
+                $text = if ($have) { "Installed ($have); latest is $($update.Latest), cannot compare" } else { "Installed; version not recorded, latest is $($update.Latest)" }
                 if ($updating -and $status -eq 'Preferred') { $status = 'Partial' }
             }
             'Current' {
