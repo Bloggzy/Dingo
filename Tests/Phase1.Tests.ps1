@@ -956,6 +956,89 @@ try {
         Assert (($script:Installed -join ',') -eq 'en-GB') "Dingo started $($script:Installed -join ', ') while a pack was still installing."
         Set-RunScopedFlag 'PackStillRunning' $false
     }
+    Test-Case 'Apply waits for the display pack the window started early, and does not start a second' {
+        # The window starts the pack when the card is selected. Its process holds
+        # a named lock. Another thread stands in for that process here.
+        $lockName = "Local\Dingo_Test_$([guid]::NewGuid().ToString('N'))"
+        Set-Item -Path function:Get-EarlyPackLockName -Value ([scriptblock]::Create("'$lockName'"))
+        Assert (-not (Test-EarlyLanguagePackRunning)) 'A lock nobody holds read as an install in progress.'
+        Assert (-not (Wait-EarlyLanguagePack)) 'Dingo waited although nothing was running.'
+        $holder = [powershell]::Create()
+        [void]$holder.AddScript({
+            param($Name)
+            $mutex = New-Object Threading.Mutex($true, $Name)
+            Start-Sleep -Milliseconds 2500
+            $mutex.ReleaseMutex(); $mutex.Dispose()
+        }).AddArgument($lockName)
+        $handle = $holder.BeginInvoke()
+        try {
+            $deadline = (Get-Date).AddSeconds(5)
+            while (-not (Test-EarlyLanguagePackRunning) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }
+            Assert (Test-EarlyLanguagePackRunning) 'A held lock did not read as an install in progress.'
+            # No second download is started while the early one runs.
+            $script:PackJobs = @{}
+            function Select-DisplayLanguagePackToInstall { param([string[]]$Candidates) throw 'A second download was considered.' }
+            Assert ((Start-DisplayLanguagePackPrefetch @('en-GB')) -eq '') 'A second download was started beside the early one.'
+            # The install step waits for it to finish, then carries on.
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            Assert (Wait-EarlyLanguagePack 30) 'Dingo did not report that it waited for the early install.'
+            Assert ($watch.Elapsed.TotalSeconds -ge 1) "Dingo did not wait: it returned after $([math]::Round($watch.Elapsed.TotalSeconds,1))s."
+            Assert (-not (Test-EarlyLanguagePackRunning)) 'A released lock still read as an install in progress.'
+        } finally {
+            [void]$holder.EndInvoke($handle); $holder.Dispose()
+        }
+        # When Apply gets there first, it holds the lock for the whole plan, so an
+        # early install approved a moment later finds it taken and does nothing.
+        function Select-DisplayLanguagePackToInstall { param([string[]]$Candidates) '' }
+        $script:PlanPackLock = $null
+        [void](Start-DisplayLanguagePackPrefetch @('en-GB'))
+        $probe = [powershell]::Create()
+        [void]$probe.AddScript({
+            param($Name)
+            $mutex = New-Object Threading.Mutex($false, $Name)
+            $got = $false
+            try { $got = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $got = $true }
+            if ($got) { $mutex.ReleaseMutex() }
+            $mutex.Dispose()
+            $got
+        }).AddArgument($lockName)
+        Assert (-not [bool]@($probe.Invoke())[0]) 'An early install could take the lock while Apply held it.'
+        Assert (-not (Wait-EarlyLanguagePack 5)) 'The worker waited on its own lock.'
+        Stop-PrestartedPackJobs
+        $probe.Commands.Clear()
+        [void]$probe.AddScript({
+            param($Name)
+            $mutex = New-Object Threading.Mutex($false, $Name)
+            $got = $mutex.WaitOne(0)
+            if ($got) { $mutex.ReleaseMutex() }
+            $mutex.Dispose()
+            $got
+        }).AddArgument($lockName)
+        Assert ([bool]@($probe.Invoke())[0]) 'Apply kept the lock after the plan ended.'
+        $probe.Dispose()
+    }
+    Test-Case 'The language card says when Windows is already installing its pack in the background' {
+        $card = ($script:Settings | Where-Object Id -eq 'display-language').PSObject.Copy()
+        $card.DesiredState = 'Australian English (en-AU)'
+        function Get-DisplayLanguagePackSource { param([string]$Language) '' }
+        Clear-DisplayPackCache
+        try {
+            $script:EarlyPack = [pscustomobject]@{ Packs='en-GB,en-AU'; State='Running' }
+            $advisory = Get-SettingAdvisory $card
+            Assert ($advisory -match 'in the background now') 'A running early install is not described on the card.'
+            Assert ($advisory -match 'Dingo waits for it') 'The card does not say that Apply waits for the early install.'
+            $script:EarlyPack.State = 'Asking'
+            Assert ((Get-SettingAdvisory $card) -match 'Accept the Windows prompt') 'A pending approval is not described on the card.'
+            # An early install for another language says nothing about this one.
+            $script:EarlyPack = [pscustomobject]@{ Packs='de-DE'; State='Running' }
+            Assert ((Get-SettingAdvisory $card) -match 'must download') 'Another language''s early install changed this card''s note.'
+            $script:EarlyPack.Packs = 'en-GB,en-AU'; $script:EarlyPack.State = 'Failed'
+            Assert ((Get-SettingAdvisory $card) -match 'must download') 'A failed early install did not fall back to the download warning.'
+        } finally {
+            $script:EarlyPack = $null
+            Clear-DisplayPackCache
+        }
+    }
     Test-Case 'The Microsoft 365 Copilot card reads and removes the app for this account only' {
         $script:M365 = @([pscustomobject]@{ Name='Microsoft.MicrosoftOfficeHub'; PackageFullName='Microsoft.MicrosoftOfficeHub_1_x64__8wekyb3d8bbwe' })
         function Get-AppxPackage { param($Name, $ErrorAction) @($script:M365 | Where-Object Name -eq $Name) }

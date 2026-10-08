@@ -25,6 +25,8 @@ Current version: **0.8.14**.
 4. Turn on the switch on each card you want. Or press **Choose all my preferred settings** in Tweaks, and **Choose all tools** in Tools.
 5. Press **Apply selected changes**. Windows asks for approval if the plan touches the whole computer.
 
+The display language is the slow one. When the computer has no pack for the chosen language, Windows takes about ten minutes to install it. So Dingo starts it as soon as you select the **Display language** card. Windows asks for approval at that moment. The pack then installs while you choose the other settings. If it is not done when you press Apply, Dingo waits for it. If you refuse that first prompt, Apply installs the pack instead.
+
 You need nothing else. Windows PowerShell 5.1 is already part of Windows 11.
 
 ## Use the command line
