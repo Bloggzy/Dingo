@@ -4921,6 +4921,20 @@ function Stop-PackJob($Job, [string]$Language) {
     }
 }
 
+function Get-EarlyPackCandidates($Item) {
+    $choice = try { Get-LocaleChoice (Get-LanguageChoiceTable) ([string]$Item.DesiredState) } catch { $null }
+    if (-not $choice) { return '' }
+    return (@($choice.Packs) -join ',')
+}
+
+function Get-EarlyPackState($Item) {
+    # What the early install is doing for this card's choice, or an empty string
+    # when there is none for it.
+    $early = Get-Variable -Name EarlyPack -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if (-not $early -or $early.Packs -ne (Get-EarlyPackCandidates $Item)) { return '' }
+    return [string]$early.State
+}
+
 function Write-EarlyPackStatus([string]$Path, [string]$State, [string]$Pack, [string]$Message) {
     # The window reads this to tell the card what the early install is doing.
     if (-not $Path) { return }
@@ -7609,20 +7623,6 @@ function Update-AdministratorProgress($Pending) {
     $done = if ($total -ge 1) { " $($finished.Count) of $total finished." } else { '' }
     $hint = if ($phase -eq 'Downloading') { ' A language pack comes from Windows Update, so this step is the slow one.' } else { '' }
     $SummaryText.Text = "$heading$body$clock$done$hint"
-}
-
-function Get-EarlyPackCandidates($Item) {
-    $choice = try { Get-LocaleChoice (Get-LanguageChoiceTable) ([string]$Item.DesiredState) } catch { $null }
-    if (-not $choice) { return '' }
-    return (@($choice.Packs) -join ',')
-}
-
-function Get-EarlyPackState($Item) {
-    # What the early install is doing for this card's choice, or an empty string
-    # when there is none for it.
-    $early = Get-Variable -Name EarlyPack -Scope Script -ValueOnly -ErrorAction SilentlyContinue
-    if (-not $early -or $early.Packs -ne (Get-EarlyPackCandidates $Item)) { return '' }
-    return [string]$early.State
 }
 
 function Request-EarlyLanguagePack {
