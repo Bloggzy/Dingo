@@ -91,6 +91,11 @@ param(
     # option, which is Update unless the Options tab says otherwise.
     [ValidateSet('Update','Keep')][string]$InstalledTools,
     [switch]$UpdateCheck,
+    # The window starts the display-language download as soon as the card is
+    # selected, in its own elevated process. LanguagePacks is the candidate
+    # list, comma separated, best first.
+    [switch]$EarlyLanguagePack,
+    [string]$LanguagePacks,
     [Parameter(ValueFromRemainingArguments=$true)]
     [object[]]$UnexpectedArguments
 )
@@ -138,6 +143,11 @@ $script:InstalledToolsMode = 'Update'
 # What the background version check found, by tool id. Only the window fills it.
 $script:ToolUpdateInfo = @{}
 $script:ToolUpdateCheck = $null
+# The display-pack install the window starts when the language card is
+# selected. Only the window fills these.
+$script:EarlyPack = $null
+$script:EarlyPackDeclined = $false
+$script:EarlyPackTried = @{}
 # A folder inside the tools folder, so moving the tools folder moves this too.
 $script:ShimDirectory = Join-Path $script:DefaultToolRoot 'bin'
 # Only files carrying this marker are ever deleted, so a launcher someone wrote
@@ -218,7 +228,7 @@ function Exit-DingoSingleInstance {
 # Keep the launcher separate from the WPF host so a failed GUI process cannot
 # strand the command shell, and hold the per-user mutex for the host's lifetime.
 # Avoid persistent user-wide shell workarounds; the host process only owns the UI.
-if (-not ($SelfTest -or $StateSelfTest -or $UiSelfTest -or $Apply -or $WhatIf -or $ListSettings -or $RecoveryReport -or $Help -or $Version -or $Include -or $Exclude -or $script:UnexpectedArguments.Count -or $MachineWorker -or $ElevationBroker -or $FinalizeInternationalSettings -or $WpfHost -or $UpdateCheck)) {
+if (-not ($SelfTest -or $StateSelfTest -or $UiSelfTest -or $Apply -or $WhatIf -or $ListSettings -or $RecoveryReport -or $Help -or $Version -or $Include -or $Exclude -or $script:UnexpectedArguments.Count -or $MachineWorker -or $ElevationBroker -or $FinalizeInternationalSettings -or $WpfHost -or $UpdateCheck -or $EarlyLanguagePack)) {
     if (-not (Enter-DingoSingleInstance)) {
         Add-Type -AssemblyName PresentationFramework
         [System.Windows.MessageBox]::Show('Dingo is already running for this Windows account.', 'Dingo is already running', 'OK', 'Information') | Out-Null
@@ -358,6 +368,10 @@ function Get-SettingAdvisory($Setting) {
     # Windows Update. That is minutes, not seconds, so say so before the person
     # clicks Apply rather than leaving them watching a clock.
     if (Test-SettingNeedsLanguageDownload $Setting) {
+        switch (Get-EarlyPackState $Setting) {
+            'Asking' { return "Dingo has asked for administrator approval to start the display pack for $($Setting.DesiredState) now, so Windows can install it while you choose the rest. Accept the Windows prompt. If you refuse, Apply installs it instead." }
+            'Running' { return "Windows is installing the display pack for $($Setting.DesiredState) in the background now. Dingo started it when you selected this card. It usually takes about ten minutes. If it has not finished when you click Apply, Dingo waits for it. If you clear this card, Windows still finishes installing the pack, but Dingo does not switch to it." }
+        }
         return "This computer has no display pack for $($Setting.DesiredState), so Windows must download one from Windows Update. That one step usually takes about ten minutes, and can hold up the whole run. Dingo waits fifteen minutes at most, stops sooner if nothing is moving, and every other selected change still runs."
     }
     if ($Setting.Id -eq 'windows-update') {
@@ -4782,6 +4796,14 @@ function Start-DisplayLanguagePackPrefetch([string[]]$Candidates) {
     # milliseconds of registry work. Starting it here lets the rest of the plan
     # run while Windows fetches it, instead of queueing behind it.
     if (-not (Get-Variable -Name PackJobs -Scope Script -ErrorAction SilentlyContinue)) { $script:PackJobs = @{} }
+    # The window may have started this already. The install step waits for it.
+    if (Test-EarlyLanguagePackRunning) {
+        Write-Log 'INFO' 'The display pack Dingo started when the card was selected is still installing, so no second download was started.'
+        return ''
+    }
+    # Holding the lock for the rest of the plan stops an early install whose
+    # approval came in after Apply from starting a second download.
+    Enter-PlanPackLock
     $pack = try { Select-DisplayLanguagePackToInstall $Candidates } catch { '' }
     if (-not $pack -or $script:PackJobs.ContainsKey($pack)) { return '' }
     try {
@@ -4803,7 +4825,31 @@ function Get-PrestartedPackJob([string]$Language) {
     return $job
 }
 
+function Enter-PlanPackLock {
+    # Taken once per plan, on the worker's only thread, and kept until the plan
+    # ends. The lock is re-entrant, so the worker never waits on itself.
+    if (Get-Variable -Name PlanPackLock -Scope Script -ValueOnly -ErrorAction SilentlyContinue) { return }
+    try {
+        $createdNew = $false
+        $lock = New-Object Threading.Mutex($false, (Get-EarlyPackLockName), [ref]$createdNew)
+        $owned = $false
+        try { $owned = $lock.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
+        if ($owned) { $script:PlanPackLock = $lock } else { $lock.Dispose() }
+    } catch {
+        Write-Log 'WARN' "Could not take the display-pack lock: $($_.Exception.Message)"
+    }
+}
+
+function Exit-PlanPackLock {
+    $lock = Get-Variable -Name PlanPackLock -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if (-not $lock) { return }
+    try { $lock.ReleaseMutex() } catch { }
+    $lock.Dispose()
+    $script:PlanPackLock = $null
+}
+
 function Stop-PrestartedPackJobs {
+    Exit-PlanPackLock
     if (-not (Get-Variable -Name PackJobs -Scope Script -ErrorAction SilentlyContinue)) { return }
     foreach ($key in @($script:PackJobs.Keys)) {
         try {
@@ -4821,6 +4867,7 @@ function Install-RequiredDisplayLanguagePack([string[]]$Candidates) {
     # English variants only through a parent pack. Nothing already present is
     # downloaded again.
     if (-not @($Candidates).Count) { throw 'No display-language pack was named for this choice.' }
+    [void](Wait-EarlyLanguagePack)
     Write-WorkerProgress 'Working' 'Checking which Windows language packs are already installed'
     foreach ($candidate in $Candidates) {
         $source = Get-DisplayLanguagePackSource $candidate
@@ -4872,6 +4919,70 @@ function Stop-PackJob($Job, [string]$Language) {
         Set-RunScopedFlag 'PackStillRunning' $true
         Write-Log 'WARN' "Windows would not stop the $Language display-pack install, so it carries on in the background: $($_.Exception.Message)"
     }
+}
+
+function Write-EarlyPackStatus([string]$Path, [string]$State, [string]$Pack, [string]$Message) {
+    # The window reads this to tell the card what the early install is doing.
+    if (-not $Path) { return }
+    try {
+        Write-Utf8FileAtomically $Path (ConvertTo-Json -InputObject ([PSCustomObject]@{ State=$State; Pack=$Pack; Message=$Message; Updated=(Get-Date).ToString('o') }))
+    } catch {
+        Write-Log 'WARN' "Could not write the early display-pack status: $($_.Exception.Message)"
+    }
+}
+
+function Get-EarlyPackLockName {
+    # Held by the early display-pack process for as long as it runs. Global, so
+    # the administrator worker sees it whichever account each one runs as.
+    return 'Global\Dingo_EarlyLanguagePack'
+}
+
+function Test-EarlyLanguagePackRunning {
+    # True only while another process holds the lock. The lock is re-entrant,
+    # so the early process itself, which holds it, gets a false here.
+    $mutex = $null
+    if (-not [Threading.Mutex]::TryOpenExisting((Get-EarlyPackLockName), [ref]$mutex)) { return $false }
+    try {
+        $acquired = $false
+        try { $acquired = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $acquired = $true }
+        if ($acquired) { $mutex.ReleaseMutex(); return $false }
+        return $true
+    } catch {
+        Write-Log 'WARN' "Could not check for an early display-pack install: $($_.Exception.Message)"
+        return $false
+    } finally { $mutex.Dispose() }
+}
+
+function Wait-EarlyLanguagePack([int]$TimeoutSeconds = 900) {
+    # Windows installs one language pack at a time. Starting a second one while
+    # the early one runs would only queue behind it, so the worker waits for it
+    # instead. True when there was one to wait for.
+    if (-not (Test-EarlyLanguagePackRunning)) { return $false }
+    $mutex = $null
+    if (-not [Threading.Mutex]::TryOpenExisting((Get-EarlyPackLockName), [ref]$mutex)) { return $false }
+    Write-Log 'INFO' 'Windows is still installing the display pack that Dingo started when the card was selected. Waiting for it rather than starting another.'
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        while ($true) {
+            $acquired = $false
+            try { $acquired = $mutex.WaitOne(5000) } catch [Threading.AbandonedMutexException] { $acquired = $true }
+            if ($acquired) {
+                $mutex.ReleaseMutex()
+                Write-Log 'INFO' "The early display-pack install finished after Dingo waited $([int]$timer.Elapsed.TotalSeconds) seconds for it."
+                return $true
+            }
+            if (Test-WorkerCancelled) {
+                Set-RunScopedFlag 'PackStillRunning' $true
+                throw 'Stopped at your request while Windows was installing the display pack that Dingo started earlier. Windows carries on with it in the background.'
+            }
+            if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                Set-RunScopedFlag 'PackStillRunning' $true
+                throw "Windows did not finish the display pack that Dingo started earlier within $([math]::Round($TimeoutSeconds / 60)) minutes. It carries on in the background. Sign out and back in once it is done, or run Dingo again."
+            }
+            $remaining = [math]::Max(0, [int]($TimeoutSeconds - $timer.Elapsed.TotalSeconds))
+            Write-WorkerProgress 'Downloading' "Windows is still installing the display pack that Dingo started when you selected this card. Waited $([math]::Floor($timer.Elapsed.TotalMinutes))m $($timer.Elapsed.Seconds)s so far; Dingo waits $([math]::Floor($remaining / 60))m $($remaining % 60)s more at most"
+        }
+    } finally { $mutex.Dispose() }
 }
 
 function Get-RegistryKindState($Setting) {
@@ -5812,6 +5923,52 @@ if ($UpdateCheck) {
     } catch {
         Write-Log 'ERROR' "The version check stopped: $($_.Exception.Message)"
         exit 1
+    }
+}
+
+if ($ElevationBroker -and $EarlyLanguagePack) {
+    # The same hand-off as an apply, for the display pack the window starts
+    # early. Its only output is a status file, so a refused prompt goes there.
+    try {
+        $workerArguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -EarlyLanguagePack -LanguagePacks "{1}" -ResultPath "{2}" -WorkerLogPath "{3}"' -f $PSCommandPath,$LanguagePacks,$ResultPath,$WorkerLogPath
+        $workerProcess = Start-Process -FilePath (Get-PowerShellHostPath) -ArgumentList $workerArguments -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+        if (-not $workerProcess) { throw 'Windows returned no process handle after administrator approval.' }
+        exit $workerProcess.ExitCode
+    } catch {
+        Write-EarlyPackStatus $ResultPath 'Declined' '' "Administrator approval was cancelled or failed: $($_.Exception.Message)"
+        exit 1
+    }
+}
+
+if ($EarlyLanguagePack) {
+    $script:LogFile = $WorkerLogPath
+    $lock = $null
+    try {
+        if (-not (Test-IsAdministrator)) { throw 'The early display-pack process was not elevated.' }
+        $candidates = @(([string]$LanguagePacks) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if (-not $candidates.Count) { throw 'No display-language pack was named.' }
+        $createdNew = $false
+        $lock = New-Object Threading.Mutex($false, (Get-EarlyPackLockName), [ref]$createdNew)
+        $owned = $false
+        try { $owned = $lock.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
+        if (-not $owned) {
+            $lock.Dispose(); $lock = $null
+            Write-Log 'INFO' 'Dingo is already installing a display pack, in Apply or an earlier early start, so this one did nothing.'
+            Write-EarlyPackStatus $ResultPath 'Busy' '' 'Dingo is already installing a display pack, in Apply or an earlier early start.'
+            exit 0
+        }
+        Write-Log 'INFO' "Early display-pack install started as $([Security.Principal.WindowsIdentity]::GetCurrent().Name) for $($candidates -join ', ')."
+        Write-EarlyPackStatus $ResultPath 'Running' '' ''
+        $source = Install-RequiredDisplayLanguagePack $candidates
+        Write-Log 'INFO' "Early display-pack install finished; $source carries the interface."
+        Write-EarlyPackStatus $ResultPath 'Done' $source ''
+        exit 0
+    } catch {
+        Write-Log 'ERROR' "Early display-pack install failed: $($_.Exception.Message)"
+        Write-EarlyPackStatus $ResultPath 'Failed' '' $_.Exception.Message
+        exit 1
+    } finally {
+        if ($lock) { try { $lock.ReleaseMutex() } catch { }; $lock.Dispose() }
     }
 }
 
@@ -7454,6 +7611,97 @@ function Update-AdministratorProgress($Pending) {
     $SummaryText.Text = "$heading$body$clock$done$hint"
 }
 
+function Get-EarlyPackCandidates($Item) {
+    $choice = try { Get-LocaleChoice (Get-LanguageChoiceTable) ([string]$Item.DesiredState) } catch { $null }
+    if (-not $choice) { return '' }
+    return (@($choice.Packs) -join ',')
+}
+
+function Get-EarlyPackState($Item) {
+    # What the early install is doing for this card's choice, or an empty string
+    # when there is none for it.
+    $early = Get-Variable -Name EarlyPack -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if (-not $early -or $early.Packs -ne (Get-EarlyPackCandidates $Item)) { return '' }
+    return [string]$early.State
+}
+
+function Request-EarlyLanguagePack {
+    # A display pack is about ten minutes of Windows work that nothing else in
+    # the plan depends on. On a test VM almost all of it was Windows unpacking
+    # and installing, not downloading, so it cannot be made smaller. It can be
+    # started sooner: the moment the card is selected, so it runs while the
+    # person chooses everything else instead of after Apply.
+    # Read with Get-Variable: the test suites load Dingo one function at a time
+    # and never run the assignments at the top of the file.
+    foreach ($name in @('UiSelfTest','ApplyInProgress','EarlyPackDeclined')) {
+        if (Get-Variable -Name $name -Scope Script -ValueOnly -ErrorAction SilentlyContinue) { return }
+    }
+    if ($null -eq (Get-Variable -Name EarlyPackTried -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) { return }
+    $running = Get-Variable -Name EarlyPack -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($running -and $running.State -in @('Asking','Running')) { return }
+    $item = @($script:Settings | Where-Object { $_.Kind -eq 'Language' -and $_.Selected }) | Select-Object -First 1
+    if (-not $item) { return }
+    if (-not (Test-SettingNeedsLanguageDownload $item)) { return }
+    $packs = Get-EarlyPackCandidates $item
+    # One try per choice. A failure is left to Apply, which tries again and
+    # reports it on the card.
+    if (-not $packs -or $script:EarlyPackTried.ContainsKey($packs)) { return }
+    $script:EarlyPackTried[$packs] = $true
+    $statusPath = Join-Path $env:TEMP "Dingo-earlypack-$([Guid]::NewGuid().ToString('N')).json"
+    $logPath = if ($script:LogFile) { [IO.Path]::ChangeExtension($script:LogFile, '.language-pack.log') } else { '' }
+    # UAC goes through the broker, as it does for Apply, so the window never
+    # waits on the prompt.
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}" -ElevationBroker -EarlyLanguagePack -LanguagePacks "{1}" -ResultPath "{2}" -WorkerLogPath "{3}"' -f $PSCommandPath,$packs,$statusPath,$logPath
+    try {
+        $process = Start-Process -FilePath (Get-PowerShellHostPath) -ArgumentList $arguments -WindowStyle Hidden -PassThru -ErrorAction Stop
+    } catch {
+        Write-Log 'WARN' "The early display-pack install could not start, so Apply will do it: $($_.Exception.Message)"
+        return
+    }
+    Write-Log 'INFO' "Asked for administrator approval to start the $packs display pack early (process $($process.Id)); its log is $logPath."
+    $timer = New-Object Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromSeconds(2)
+    $script:EarlyPack = [PSCustomObject]@{ Process=$process; Packs=$packs; StatusPath=$statusPath; Timer=$timer; State='Asking'; Item=$item }
+    Update-CardAdvisory $item
+    $timer.Add_Tick({
+        param($sender,$eventArgs)
+        $early = $script:EarlyPack
+        if (-not $early) { $sender.Stop(); return }
+        $status = $null
+        try { if (Test-Path -LiteralPath $early.StatusPath -PathType Leaf) { $status = ConvertFrom-Json ([IO.File]::ReadAllText($early.StatusPath)) } } catch { }
+        $exited = $early.Process.HasExited
+        $state = if ($status) { [string]$status.State } elseif ($exited) { 'Failed' } else { $early.State }
+        if ($state -ne $early.State) {
+            $early.State = $state
+            if ($state -eq 'Running') { Write-Log 'INFO' "Administrator approval given; Windows is installing the $($early.Packs) display pack in the background." }
+            Update-CardAdvisory $early.Item
+        }
+        if (-not $exited) { return }
+        $sender.Stop()
+        Remove-Item -LiteralPath $early.StatusPath -Force -ErrorAction SilentlyContinue
+        $message = if ($status) { [string]$status.Message } else { 'it stopped without saying why' }
+        switch ($state) {
+            'Done' {
+                Write-Log 'INFO' "The early display-pack install finished; $($status.Pack) carries the interface."
+                Clear-DisplayPackCache
+                if (-not $script:ApplyInProgress) { $SummaryText.Text = "The display pack for $($early.Item.DesiredState) is installed. Click Apply selected changes to switch to it." }
+            }
+            'Declined' {
+                $script:EarlyPackDeclined = $true
+                Write-Log 'INFO' "The early display-pack install did not start, so Apply will do it: $message"
+            }
+            'Running' {
+                # The process ended without writing its last word.
+                $early.State = 'Failed'
+                Write-Log 'WARN' 'The early display-pack process ended while still marked as running; Apply will check the pack again.'
+            }
+            default { Write-Log 'WARN' "The early display-pack install did not finish ($state), so Apply will try again: $message" }
+        }
+        Update-CardAdvisory $early.Item
+    })
+    $timer.Start()
+}
+
 function Update-SelectionSummary {
     $selected = @($script:Settings | Where-Object Selected)
     $selectedAdmin = @($selected | Where-Object RequiresAdmin)
@@ -7469,6 +7717,7 @@ function Update-SelectionSummary {
         $AdminSummaryText.Text = ''
         $AdminSummaryText.Visibility = 'Collapsed'
     }
+    Request-EarlyLanguagePack
 }
 
 function Update-CardAdvisory($Item) {
@@ -7589,6 +7838,9 @@ function New-SettingCard($Item) {
             $sender.Tag.ApplyCheck.IsChecked = $true
             # Shown the moment the choice is made, not only at the next refresh.
             Update-CardAdvisory $sender.Tag.Setting
+            # A card that was already selected raises no Checked event, so a new
+            # language choice asks for its pack here.
+            Request-EarlyLanguagePack
         })
         [void]$choices.Children.Add($combo)
         [void]$choices.Children.Add((New-CardText "Dingo prefers $($Item.PreferredState)." 11 'Normal' '#627D98'))
@@ -8326,5 +8578,13 @@ $window.Add_Closing({
         $SummaryText.Text = 'Stopping. Dingo is finishing the setting it is on, then it will show you the results.'
     }
 })
-$window.Add_Closed({ Stop-ToolUpdateCheck; Write-Log 'INFO' 'Application closed.' })
+$window.Add_Closed({
+    Stop-ToolUpdateCheck
+    # Windows cannot always call a language pack back, so it is left to finish.
+    if ($script:EarlyPack -and $script:EarlyPack.State -in @('Asking','Running')) {
+        try { $script:EarlyPack.Timer.Stop() } catch {}
+        Write-Log 'INFO' "Closed while the early $($script:EarlyPack.Packs) display-pack install was still $($script:EarlyPack.State.ToLowerInvariant()); Windows finishes it in the background."
+    }
+    Write-Log 'INFO' 'Application closed.'
+})
 [void]$window.ShowDialog()
