@@ -1721,6 +1721,56 @@ try {
         $state = Get-RegistryKindState $card
         Assert ($state.Status -eq 'Alternate' -and $state.DisplayText -eq 'Configured: Enabled/default') "Present policy value said '$($state.DisplayText)'."
     }
+    Test-Case 'A worker file swap waits out a reader instead of ending the worker' {
+        # On a VM the window read the result file while the worker swapped it,
+        # and that one IOException ended the administrator worker.
+        $path = Join-Path $scratch 'busy-result.json'
+        Write-Utf8FileAtomically $path 'before'
+        $reader = [powershell]::Create()
+        [void]$reader.AddScript({
+            param($Path)
+            $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            Start-Sleep -Milliseconds 600
+            $stream.Dispose()
+        }).AddArgument($path)
+        $handle = $reader.BeginInvoke()
+        try {
+            Start-Sleep -Milliseconds 200
+            Write-Utf8FileAtomically $path 'after'
+            Assert ((Read-SharedTextFile $path) -eq 'after') 'The swap did not land once the reader let go.'
+        } finally { [void]$reader.EndInvoke($handle); $reader.Dispose() }
+    }
+    Test-Case 'The window reads worker files without blocking the worker' {
+        $path = Join-Path $scratch 'shared-progress.json'
+        Write-Utf8FileAtomically $path '{"Phase":"Working"}'
+        $stream = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        try {
+            $temporary = "$path.new"
+            [IO.File]::WriteAllText($temporary, '{"Phase":"Finished"}')
+            [IO.File]::Replace($temporary, $path, "$path.bak", $true)
+        } finally { $stream.Dispose() }
+        Assert ((Read-WorkerProgressFile $path).Phase -eq 'Finished') 'The progress file was not replaced while the window read it.'
+        Remove-Item -LiteralPath "$path.bak" -Force -ErrorAction SilentlyContinue
+    }
+    Test-Case 'A failed progress checkpoint is a warning, not a stopped worker' {
+        $missing = Join-Path $scratch 'no-such-folder\result.json'
+        Write-WorkerCheckpoint @([pscustomobject]@{ Id='x' }) $missing
+        Assert-Throws { Write-WorkerResults @([pscustomobject]@{ Id='x' }) $missing } 'does not exist'
+    }
+    Test-Case 'The sign-in finalizer knows which sign-in registered it' {
+        # Explorer runs RunOnce when Dingo restarts it. The finalizer must not
+        # spend itself then, before the sign-in that resets the formats.
+        $sid = Get-LogonSessionSid
+        Assert ($sid -match '^S-1-5-5-\d+-\d+$') "No logon session SID: '$sid'."
+        $written = @{}
+        function Test-Path { $true }
+        function New-ItemProperty { param($LiteralPath, $Name, $Value, $PropertyType, [switch]$Force) $written[$Name] = $Value }
+        Register-InternationalSettingsFinalizer 'ISO-style / 24-hour (yyyy-MM-dd HH:mm)'
+        $command = [string]$written['DingoFinalizeInternationalSettings']
+        Assert ($command -like "*-FinalizeLogonSession `"$sid`"*") "The finalizer command does not carry the logon session: $command"
+        $source = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Dingo.ps1') -Raw
+        Assert ($source -match '\$FinalizeLogonSession -eq \(Get-LogonSessionSid\)') 'The finalizer does not compare the logon session before it runs.'
+    }
     "Passed $script:Passed phase 1 tests on PowerShell $($PSVersionTable.PSVersion)."
 } finally {
     $resolvedScratch = [IO.Path]::GetFullPath($scratch)

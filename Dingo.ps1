@@ -80,6 +80,7 @@ param(
     [switch]$WpfHost,
     [switch]$FinalizeInternationalSettings,
     [string]$FinalizeFormatState,
+    [string]$FinalizeLogonSession,
     [string]$PlanPath,
     [string]$ResultPath,
     [string]$WorkerLogPath,
@@ -463,7 +464,18 @@ function Write-Utf8FileAtomically {
         if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
             $temporaryBackup = -not [bool]$BackupPath
             $backup = if ($BackupPath) { [IO.Path]::GetFullPath($BackupPath) } else { "$fullPath.replace-backup-$([Guid]::NewGuid().ToString('N'))" }
-            [IO.File]::Replace($temporaryPath, $fullPath, $backup, $true)
+            # The window reads the worker's files while the worker rewrites them,
+            # and a reader without delete sharing makes Replace fail for a moment.
+            # On a VM that one failure ended the whole administrator worker.
+            for ($attempt = 1; ; $attempt++) {
+                try {
+                    [IO.File]::Replace($temporaryPath, $fullPath, $backup, $true)
+                    break
+                } catch [IO.IOException] {
+                    if ($attempt -ge 20) { throw }
+                    Start-Sleep -Milliseconds 100
+                }
+            }
             if ($temporaryBackup) { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue }
         } else {
             [IO.File]::Move($temporaryPath, $fullPath)
@@ -4525,6 +4537,18 @@ function Get-ConfiguredDateTimeFormatState {
     return ''
 }
 
+function Get-LogonSessionSid {
+    # S-1-5-5-X-Y names one sign-in. It stays the same when Explorer restarts
+    # and changes after a sign-out and sign-in.
+    # WindowsIdentity.Groups leaves the logon SID out on .NET Framework, and
+    # whoami does not.
+    try {
+        $sid = [string](& (Join-Path $env:SystemRoot 'System32\whoami.exe') /logonid 2>$null | Select-Object -First 1)
+        if ($sid.Trim() -match '^S-1-5-5-\d+-\d+$') { return $sid.Trim() }
+    } catch { }
+    return ''
+}
+
 function Register-InternationalSettingsFinalizer([string]$FormatState = '') {
     $setting = Get-IsoTimeSetting
     # The finalizer runs in a new process after sign-in, so the chosen format is
@@ -4533,7 +4557,9 @@ function Register-InternationalSettingsFinalizer([string]$FormatState = '') {
     if ($setting -and $state -notin @($setting.StateOptions)) { throw "'$state' is not a date and time format Dingo offers." }
     $runOncePath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
     if (-not (Test-Path -LiteralPath $runOncePath)) { New-Item -Path $runOncePath -Force | Out-Null }
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -FinalizeInternationalSettings -FinalizeFormatState "{1}" -WorkerLogPath "{2}"' -f $PSCommandPath,$state,$script:LogFile
+    # Explorer also runs RunOnce when Dingo restarts it, which is before the
+    # sign-in this is for. The logon session lets the finalizer tell the two apart.
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -FinalizeInternationalSettings -FinalizeFormatState "{1}" -FinalizeLogonSession "{2}" -WorkerLogPath "{3}"' -f $PSCommandPath,$state,(Get-LogonSessionSid),$script:LogFile
     $command = '"{0}" {1}' -f (Join-Path $PSHOME 'powershell.exe'),$arguments
     New-ItemProperty -LiteralPath $runOncePath -Name 'DingoFinalizeInternationalSettings' -Value $command -PropertyType String -Force | Out-Null
     Write-Log 'INFO' "Registered a one-time sign-in finalizer so Windows language initialization cannot replace the '$state' date and time formats."
@@ -5288,6 +5314,17 @@ function Write-WorkerResults([System.Collections.IEnumerable]$Results, [string]$
     Write-Utf8FileAtomically $Path $json
 }
 
+function Write-WorkerCheckpoint([System.Collections.IEnumerable]$Results, [string]$Path) {
+    # Only tells the window which cards are done so far. The worker writes the
+    # full results again at the end, so a missed checkpoint must not stop it.
+    if (-not $Path) { return }
+    try {
+        Write-WorkerResults $Results $Path
+    } catch {
+        Write-Log 'WARN' "Could not update the progress results file; the work carries on: $($_.Exception.Message)"
+    }
+}
+
 function New-ApplyPlan([array]$Selected) {
     # Copy only the model, never WPF controls. Deep-copy nested entries and
     # requirements so later card edits cannot alter a preflighted operation.
@@ -5350,7 +5387,7 @@ function Invoke-AdministratorPlan([array]$Plan, [array]$AllSettings, [string]$Ch
         if (-not $setting) {
             $unknown = New-ApplyResult ([string]$request.Id) @((New-OperationComponent 'Administrator plan' 'Failed' 'Unknown setting ID.')) 'Unknown setting ID.'
             [void]$results.Add($unknown)
-            if ($CheckpointPath) { Write-WorkerResults $results $CheckpointPath }
+            Write-WorkerCheckpoint $results $CheckpointPath
             continue
         }
         $components = New-Object System.Collections.ArrayList
@@ -5365,7 +5402,7 @@ function Invoke-AdministratorPlan([array]$Plan, [array]$AllSettings, [string]$Ch
         $result = New-ApplyResult $setting.Id @($components) $message
         [void]$results.Add($result)
         Write-Log $(if ($result.Success) { 'INFO' } else { 'ERROR' }) "ADMINISTRATOR $($result.Outcome.ToUpperInvariant()) [$($setting.Id)] $message"
-        if ($CheckpointPath) { Write-WorkerResults $results $CheckpointPath }
+        Write-WorkerCheckpoint $results $CheckpointPath
         Write-WorkerProgress 'Finished' $message
     }
     # Nothing should still be downloading once the plan is over.
@@ -5404,13 +5441,24 @@ function Format-Duration([TimeSpan]$Span) {
     '{0}:{1:00}' -f [math]::Floor($Span.TotalMinutes),$Span.Seconds
 }
 
+function Read-SharedTextFile([string]$Path) {
+    # Opens with delete sharing, so the worker can swap the file in while the
+    # window reads it. Get-Content does not share delete, and the worker's
+    # File.Replace then fails.
+    $stream = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try {
+        $reader = New-Object IO.StreamReader($stream, (New-Object Text.UTF8Encoding($false)), $true)
+        try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $stream.Dispose() }
+}
+
 function Read-WorkerProgressFile([string]$Path) {
     # Read failures are normal: the worker replaces this file about twice a
     # second. The caller keeps showing the last good reading instead.
     if (-not $Path) { return $null }
     try {
         if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        $raw = Read-SharedTextFile $Path
         if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
         return ConvertFrom-Json $raw
     } catch { return $null }
@@ -5422,7 +5470,7 @@ function Read-WorkerFinishedIds([string]$Path) {
     if (-not $Path) { return @() }
     try {
         if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
-        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        $raw = Read-SharedTextFile $Path
         if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
         return @(@(ConvertFrom-JsonList $raw) | ForEach-Object { [string]$_.Id } | Where-Object { $_ })
     } catch { return @() }
@@ -6007,10 +6055,16 @@ if ($FinalizeInternationalSettings) {
     try {
         # A pending display-language change is committed while the user profile is
         # initialising. Apply custom formats afterwards so that commit cannot reset them.
-        Start-Sleep -Seconds 3
         $isoSetting = Get-IsoTimeSetting
         $formatState = if ($FinalizeFormatState) { $FinalizeFormatState } else { [string]$isoSetting.PreferredState }
         if ($formatState -notin @($isoSetting.StateOptions)) { throw "'$formatState' is not a date and time format Dingo offers." }
+        if ($FinalizeLogonSession -and $FinalizeLogonSession -eq (Get-LogonSessionSid)) {
+            # Windows deleted the RunOnce value before it started this process.
+            Register-InternationalSettingsFinalizer $formatState
+            Write-Log 'INFO' 'The sign-in finalizer started in the same sign-in, because Explorer restarted. It waits for the next sign-in.'
+            exit 0
+        }
+        Start-Sleep -Seconds 3
         foreach ($entry in $isoSetting.Entries) { Set-EntryValue $entry $formatState $isoSetting }
         Send-InternationalSettingChange
         Write-Log 'INFO' "One-time sign-in finalizer reapplied and verified the '$formatState' date and time formats."
@@ -7668,7 +7722,7 @@ function Request-EarlyLanguagePack {
         $early = $script:EarlyPack
         if (-not $early) { $sender.Stop(); return }
         $status = $null
-        try { if (Test-Path -LiteralPath $early.StatusPath -PathType Leaf) { $status = ConvertFrom-Json ([IO.File]::ReadAllText($early.StatusPath)) } } catch { }
+        try { if (Test-Path -LiteralPath $early.StatusPath -PathType Leaf) { $status = ConvertFrom-Json (Read-SharedTextFile $early.StatusPath) } } catch { }
         $exited = $early.Process.HasExited
         $state = if ($status) { [string]$status.State } elseif ($exited) { 'Failed' } else { $early.State }
         if ($state -ne $early.State) {
