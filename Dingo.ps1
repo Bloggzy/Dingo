@@ -2892,17 +2892,34 @@ function Get-MegaShareLinkParts([string]$Link) {
     return [PSCustomObject]@{ FileId = $match.Groups['id'].Value; KeyText = $match.Groups['key'].Value }
 }
 
+function Get-MegaLinksFromHtml([string]$Html) {
+    # Every MEGA file link on a page, in page order, each with where it sits.
+    # The older '#!id!key' form is turned into the current one, so a vendor who
+    # pastes either kind is read the same way.
+    $pattern = 'https://mega(?:\.co)?\.nz/(?:file/(?<id>[A-Za-z0-9_-]{1,32})#(?<key>[A-Za-z0-9_-]{43})|#!(?<oldid>[A-Za-z0-9_-]{1,32})!(?<oldkey>[A-Za-z0-9_-]{43}))(?![A-Za-z0-9_-])'
+    foreach ($match in [regex]::Matches($Html, $pattern)) {
+        $id = if ($match.Groups['id'].Success) { $match.Groups['id'].Value } else { $match.Groups['oldid'].Value }
+        $key = if ($match.Groups['key'].Success) { $match.Groups['key'].Value } else { $match.Groups['oldkey'].Value }
+        [PSCustomObject]@{ Link = "https://mega.nz/file/$id#$key"; Index = $match.Index; End = $match.Index + $match.Length }
+    }
+}
+
 function Select-MegaLinkFromHtml([string]$Html, [string]$LinkName, [string]$Where = 'the download page') {
     # A download page lists several products, each with its own link. Take the
     # words just before each link, with the markup taken out, and keep the link
     # whose own product is named there. Reading it this way rather than by tag
     # or class survives a redesign. Anything other than one match stops the
     # install, because guessing which file to run is the one thing never to do.
+    #
+    # The words looked at stop at the link before, so a product named just
+    # above one link is never read as the name of the next one down.
     $found = New-Object System.Collections.ArrayList
-    foreach ($match in [regex]::Matches($Html, 'https://mega\.nz/file/[A-Za-z0-9_-]{1,32}#[A-Za-z0-9_-]{43}')) {
-        $start = [Math]::Max(0, $match.Index - 600)
-        $before = ($Html.Substring($start, $match.Index - $start) -replace '<[^>]+>', ' ') -replace '\s+', ' '
-        if ($before.IndexOf($LinkName, [StringComparison]::OrdinalIgnoreCase) -ge 0) { [void]$found.Add($match.Value) }
+    $previousEnd = 0
+    foreach ($item in @(Get-MegaLinksFromHtml $Html)) {
+        $start = [Math]::Max($previousEnd, $item.Index - 600)
+        $previousEnd = $item.End
+        $before = ($Html.Substring($start, $item.Index - $start) -replace '<[^>]+>', ' ') -replace '\s+', ' '
+        if ($before.IndexOf($LinkName, [StringComparison]::OrdinalIgnoreCase) -ge 0) { [void]$found.Add($item.Link) }
     }
     $unique = @($found | Sort-Object -Unique)
     if ($unique.Count -eq 0) {
@@ -2914,7 +2931,7 @@ function Select-MegaLinkFromHtml([string]$Html, [string]$LinkName, [string]$Wher
     return $unique[0]
 }
 
-function Get-MegaLinkFromPage([string]$PageUrl, [string]$LinkName, [int]$TimeoutSeconds = 60) {
+function Get-MegaDownloadPage([string]$PageUrl, [string]$LinkName, [int]$TimeoutSeconds = 60) {
     # The vendor publishes a fresh MEGA link for each release, so the address
     # cannot live in the catalog. The catalog names the page and the product
     # instead, and the link is read from the page next to that product name.
@@ -2926,7 +2943,7 @@ function Get-MegaLinkFromPage([string]$PageUrl, [string]$LinkName, [int]$Timeout
             Invoke-WebRequest -Uri $PageUrl -UseBasicParsing -TimeoutSec $TimeoutSeconds -ErrorAction Stop
         } "Reading $PageUrl"
     } catch { throw (New-DownloadFailure "The $LinkName download page" $PageUrl $_) }
-    return (Select-MegaLinkFromHtml ([string]$page.Content) $LinkName $PageUrl)
+    return [string]$page.Content
 }
 
 function Get-MegaApiFailureMessage([int]$Code) {
@@ -2991,14 +3008,46 @@ function Get-MegaFileInfo($LinkParts, $FileKey, [int]$TimeoutSeconds = 60) {
     return [PSCustomObject]@{ Name = $name; Size = $size; Url = $downloadUrl }
 }
 
+function Get-MegaLinkOffer([string]$Link) {
+    $parts = Get-MegaShareLinkParts $Link
+    $fileKey = Get-MegaFileKey $parts.KeyText
+    $info = Get-MegaFileInfo $parts $fileKey
+    [PSCustomObject]@{ Link=$Link; Parts=$parts; FileKey=$fileKey; Info=$info }
+}
+
 function Get-MegaPageOffer($Tool) {
     # The file the vendor's page offers today. Its name carries the version, such
     # as Arsenal-Image-Mounter-v3.13.368.zip, so the name is the version.
-    $link = Get-MegaLinkFromPage $Tool.Url $Tool.LinkName
-    $parts = Get-MegaShareLinkParts $link
-    $fileKey = Get-MegaFileKey $parts.KeyText
-    $info = Get-MegaFileInfo $parts $fileKey
-    [PSCustomObject]@{ Link=$link; Parts=$parts; FileKey=$fileKey; Info=$info }
+    $html = Get-MegaDownloadPage $Tool.Url $Tool.LinkName
+    $byName = $null
+    $nameFailure = ''
+    try { $byName = Select-MegaLinkFromHtml $html $Tool.LinkName $Tool.Url } catch { $nameFailure = $_.Exception.Message }
+    if ($byName) {
+        $offer = Get-MegaLinkOffer $byName
+        if ($offer.Info.Name -notlike $Tool.AssetPattern) {
+            throw "The download page offered '$($offer.Info.Name)' for $($Tool.Name), but a file named like '$($Tool.AssetPattern)' was expected. Nothing was downloaded."
+        }
+        return $offer
+    }
+
+    # The product name did not single out one link, so the page has been laid
+    # out again. Ask MEGA for the name of each file on the page instead. The
+    # name is decrypted with the key in its own link, so it is the real name
+    # of that file, and only a page with exactly one file of the expected name
+    # is used. Only file details are fetched here; nothing is downloaded.
+    $links = @(@(Get-MegaLinksFromHtml $html) | ForEach-Object { $_.Link } | Select-Object -Unique)
+    if (-not $links.Count -or $links.Count -gt 20) { throw $nameFailure }
+    Write-Log 'WARN' "$nameFailure Checking the name of each of the $($links.Count) file(s) on the page instead."
+    $matching = New-Object System.Collections.ArrayList
+    foreach ($candidate in $links) {
+        try { $offer = Get-MegaLinkOffer $candidate } catch { Write-Log 'WARN' "Could not read the file behind $candidate. $($_.Exception.Message)"; continue }
+        if ($offer.Info.Name -like $Tool.AssetPattern) { [void]$matching.Add($offer) }
+    }
+    if ($matching.Count -ne 1) {
+        throw "$nameFailure Of the $($links.Count) file(s) on the page, $($matching.Count) are named like '$($Tool.AssetPattern)', so Dingo could not tell which one is meant. Download $($Tool.Name) by hand from $($Tool.Url)."
+    }
+    Write-Log 'INFO' "$($matching[0].Info.Name) is the only file on the page named like '$($Tool.AssetPattern)', so it is used."
+    return $matching[0]
 }
 
 function Install-MegaPagePackage($Tool, [bool]$SkipIfCurrent = $false) {
@@ -3012,10 +3061,8 @@ function Install-MegaPagePackage($Tool, [bool]$SkipIfCurrent = $false) {
     $link = $offer.Link
     $fileKey = $offer.FileKey
     $info = $offer.Info
+    # Get-MegaPageOffer has already checked the name against the catalog pattern.
     Write-Log 'INFO' "MEGA offers $($info.Name) ($(Format-ByteSize $info.Size)) for $($Tool.Name)."
-    if ($info.Name -notlike $Tool.AssetPattern) {
-        throw "The download page offered '$($info.Name)' for $($Tool.Name), but a file named like '$($Tool.AssetPattern)' was expected. Nothing was downloaded."
-    }
     if ($SkipIfCurrent) {
         $label = Get-ReleaseVersionNumber $info.Name
         if (-not $label) { $label = $info.Name }
@@ -6704,6 +6751,12 @@ if ($SelfTest) {
     $refused = $false
     try { [void](Select-MegaLinkFromHtml ($samplePage + $samplePage.Replace($goodLink, "https://mega.nz/file/BBBBBBBB#$otherKey")) 'Arsenal Image Mounter') } catch { $refused = $true }
     if (-not $refused) { throw 'A page offering two links for one product must stop the install, not guess.' }
+    # A short layout puts one product's name close above the next product's
+    # link. Only the words since the link before may name a link.
+    $tightPage = "<p>Arsenal Image Mounter <a href=`"$goodLink`">DOWNLOAD</a></p><p>Hibernation Recon <a href=`"https://mega.nz/file/AAAAAAAA#$otherKey`">DOWNLOAD</a></p>"
+    if ((Select-MegaLinkFromHtml $tightPage 'Arsenal Image Mounter') -ne $goodLink) { throw 'A product name was read as the name of the next link down.' }
+    # The older '#!id!key' form of a link is read as the current form.
+    if ((Select-MegaLinkFromHtml "Arsenal Image Mounter <a href=`"https://mega.nz/#!n5ADXSZR!$keyText`">" 'Arsenal Image Mounter') -ne $goodLink) { throw 'An older MEGA link was not read.' }
 
     # The MEGA cipher. CTR undoes itself, so decrypting twice must give back
     # exactly what went in. The size is chosen to cross several chunk edges and

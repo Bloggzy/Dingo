@@ -356,7 +356,7 @@ Arsenal Image Mounter mounts a forensic disk image as a real disk, so ordinary W
 It is the one tool that is in neither winget nor a GitHub release. Arsenal Recon publish it only through their own download page, behind a MEGA link that changes with every release. So the catalog holds a page address and a product name, never a download address:
 
 1. Dingo reads <https://arsenalrecon.com/downloads> over HTTPS.
-2. It finds the link whose product name sits next to it. If no link matches, or more than one does, Dingo stops and tells you to download it by hand. It never guesses which file to run.
+2. It finds the link whose product name sits just before it. If no link matches, or more than one does, the page has been laid out again. Then Dingo asks MEGA for the name of each file on the page, and uses the one file named like `Arsenal-Image-Mounter-v*.zip`. If there is not exactly one, Dingo stops and tells you to download it by hand. It never guesses which file to run.
 3. It asks MEGA for the file, and refuses any address that is not MEGA's own storage.
 4. It checks the file name MEGA reports against `Arsenal-Image-Mounter-v*.zip`.
 5. It downloads and decrypts the file, then checks it against the checksum carried inside the link itself.
@@ -533,7 +533,7 @@ Detect rules:
 | `file` | `path` | A file that must exist. Wildcards allowed. Use forward slashes |
 | `command` | `command` | A program on the PATH, such as `rg.exe` |
 
-A `mega-page` entry is for a vendor who publishes only through a MEGA link that changes with each release. Dingo reads the page, takes the one link that sits next to `linkName`, checks the file name against `assetPattern`, and checks the decrypted file against the checksum carried in the link. See the Arsenal Image Mounter section above for what each step guards against.
+A `mega-page` entry is for a vendor who publishes only through a MEGA link that changes with each release. Dingo reads the page, takes the one link that sits next to `linkName` (or, if the page no longer shows that, the one file on the page whose name matches `assetPattern`), checks the file name against `assetPattern`, and checks the decrypted file against the checksum carried in the link. See the Arsenal Image Mounter section above for what each step guards against.
 
 A tool entry Dingo cannot read is skipped, and the reason is logged. A broken `Tools.json` is ignored, and the built-in list is used. Dingo always starts.
 

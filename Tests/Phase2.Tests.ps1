@@ -419,6 +419,25 @@ try {
         Assert ((Compare-ToolVersionPrefix 'v1.5.2' 'v1.5.6') -eq -1) 'DuckDB v1.5.2 must be older than v1.5.6.'
         Assert ((Get-ReleaseVersionNumber 'Arsenal-Image-Mounter-v3.13.368.zip') -eq '3.13.368') 'The version was not read from a file name.'
     }
+    Test-Case 'A MEGA page that no longer names the product next to its link still finds the one file by name' {
+        $key='A'*43
+        $tool=[pscustomobject]@{ Name='Arsenal Image Mounter'; Url='https://example.com/d'; LinkName='Arsenal Image Mounter'; AssetPattern='Arsenal-Image-Mounter-v*.zip' }
+        $script:megaNames=@{ 'AAAA'='Hibernation-Recon-v1.2.zip'; 'BBBB'='Arsenal-Image-Mounter-v3.14.1.zip'; 'CCCC'='Registry-Recon-v2.4.zip' }
+        function Get-MegaLinkOffer([string]$Link) {
+            $id=([regex]::Match($Link,'/file/([^#]+)#')).Groups[1].Value
+            [pscustomobject]@{ Link=$Link; Info=[pscustomobject]@{ Name=$script:megaNames[$id]; Size=1 } }
+        }
+        # The redesign puts each button above its product name.
+        $script:megaPage=(@('AAAA','BBBB','CCCC') | ForEach-Object { "<a href=`"https://mega.nz/file/$_#$key`">DOWNLOAD</a> Product" }) -join "`n"
+        function Get-MegaDownloadPage { $script:megaPage }
+        Assert ((Get-MegaPageOffer $tool).Info.Name -eq 'Arsenal-Image-Mounter-v3.14.1.zip') 'The one file named like the pattern was not chosen.'
+        # Two files of that name: refuse rather than guess.
+        $script:megaNames['CCCC']='Arsenal-Image-Mounter-v3.14.2.zip'
+        Assert-Throws { Get-MegaPageOffer $tool } '2 are named like'
+        # The name finds a link, but MEGA says the file is something else.
+        $script:megaPage="Arsenal Image Mounter <a href=`"https://mega.nz/file/AAAA#$key`">DOWNLOAD</a>"
+        Assert-Throws { Get-MegaPageOffer $tool } 'Hibernation-Recon-v1\.2\.zip'
+    }
     Test-Case 'A tool card says when a newer version is out, and is amber only when Apply would update it' {
         $tool=New-TestTool any @($probe)
         $script:ToolUpdateInfo=@{ 'tool-probe'=(New-ToolUpdateStatus 'tool-probe' 'Available' '1.0' '2.0' 'winget offers 2.0.') }
