@@ -316,6 +316,7 @@ The cards are shown in name order, and the **Install tools** tab has a search bo
 | `tool-powershell` | PowerShell 7 | yes |
 | `tool-python` | Python 3.13 | yes |
 | `tool-sqlitebrowser` | DB Browser for SQLite | yes |
+| `tool-hashcheck` | HashCheck | yes |
 | `tool-dotnet-desktop-9` | .NET 9 Desktop Runtime | yes |
 | `tool-dotnet-desktop-10` | .NET 10 Desktop Runtime | yes |
 | `tool-eztools` | Eric Zimmerman's tools | yes |

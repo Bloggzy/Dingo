@@ -1345,6 +1345,18 @@ function Get-BuiltInToolCatalog {
             )
         },
         [PSCustomObject]@{
+            # idrassi's fork, not gurnec's original: the original stopped at
+            # 2.4.0 in 2016 and has no SHA-256. The fork also registers a
+            # Windows 11 package so the hash entry shows in the new context menu.
+            id='tool-hashcheck'; name='HashCheck'; category='Forensics'
+            description='Adds a Checksums tab to file Properties, and a menu entry that creates or checks hash files. Supports MD5, SHA-1, SHA-256, SHA-512, and SHA3.'
+            install=[PSCustomObject]@{ kind='winget'; package='idrassi.HashCheckShellExtension'; scope='machine' }
+            detect=@(
+                [PSCustomObject]@{ kind='uninstall-key'; match='HashCheck*' },
+                [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\HashCheck\HashCheck.dll' }
+            )
+        },
+        [PSCustomObject]@{
             id='tool-memprocfs'; name='MemProcFS'; category='Memory'
             description='Reads a memory image as a file system you can browse, and runs a forensic analysis over it. Command-line tool. Downloaded from the author''s own GitHub releases and unpacked into the tools folder.'
             install=[PSCustomObject]@{
