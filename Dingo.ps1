@@ -55,6 +55,43 @@
 # and print only the syntax, and no blank line after it swallows this line.
 #requires -version 5.1
 
+# MAP OF THIS FILE
+# The parts are in this order. Search for the name after each part to find its
+# start. Names are used, not line numbers, because line numbers change on edits.
+#
+#  1. Parameters, start-up, single instance, the window launcher  param(
+#  2. Admin and managed-device checks                             Test-IsAdministrator
+#  3. Log, journal, recovery report, result objects               Initialize-Log
+#  4. Language, region, date and time choice tables               Get-DateTimeFormatChoices
+#  5. Building blocks for one setting (entries, tabs, cards)      New-Entry
+#  6. Options file: tools folder, installed-tools mode            Get-JsonField
+#  7. Tool catalog: built-in list and Tools.json                  Get-BuiltInToolCatalog
+#  8. Winget, downloads, free space, winget repair                Get-WingetPath
+#  9. Find installed tools and check versions                     Get-UninstallEntry
+# 10. Installers, one per tool kind
+#       winget                                                    Install-WingetPackage
+#       install script                                            Install-ScriptPackage
+#       GitHub release                                            Install-GitHubReleasePackage
+#       MEGA download page                                        Install-MegaPagePackage
+#       Python venv                                               Install-PythonVenvPackage
+# 11. Tool extras: PATH, shims, shortcuts, file associations      Send-EnvironmentChange
+# 12. THE TWEAK LIST: every tweak card is defined here            Get-Settings
+# 13. Tweak helpers: registry, Terminal, Widgets, folder view,
+#     M365 Copilot, services, Defender samples                    Test-SettingHasScope
+# 14. Language, region, time, and display-language packs          Get-IsoTimeSetting
+# 15. Read and change each setting kind (*KindState, *KindPart)   Get-RegistryKindState
+# 16. Apply plan and the elevated admin worker                    New-ApplyPlan
+# 17. Command-line help and output                                Write-CliStatus
+# 18. Setting kind handlers and preflight checks                  Register-SettingHandler
+# 19. MAIN SCRIPT: runs here. Command-line switches               [void](Initialize-DingoToolRoot)
+# 20. Self-tests                                                  if ($SelfTest)
+# 21. Command-line apply                                          if ($Apply -or
+# 22. The window: XAML layout                                     [xml]$xaml
+# 23. The window: card, tab and button code                       Set-ToolRootStatus
+#
+# To add a tool, change part 7. To add a tweak, change part 12. A tweak of a
+# new kind also needs parts 15 and 18.
+
 [CmdletBinding(PositionalBinding=$false)]
 param(
     [switch]$SelfTest,
