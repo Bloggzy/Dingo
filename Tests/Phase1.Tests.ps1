@@ -29,6 +29,9 @@ $script:ShimDirectory = 'C:\DFIR\Tools\bin'
 $script:StartMenuShortcutDirectory = 'C:\Dingo-Test-Not-Used'
 $script:DesktopShortcutDirectory = 'C:\Dingo-Test-Not-Used'
 $script:ToolCatalogCache = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
+# A tool install refreshes launchers when the launcher folder is on the PATH.
+# The real computer PATH must never decide that here.
+function Get-MachinePathValue { 'C:\Windows;C:\Windows\System32' }
 Initialize-SettingHandlers
 $script:Settings = Get-Settings
 $script:Passed = 0
@@ -168,6 +171,65 @@ try {
         Assert (-not (Test-SettingPreflight $setting).Available) 'Shortcut preflight missed collision.'
         Assert-Throws { Set-ShortcutKindPart $setting Created Machine } 'not created by Dingo'
         Assert (-not (Test-Path -LiteralPath (Join-Path $scratch 'New First Link.lnk'))) 'Earlier shortcut was created before conflict detection.'
+    }
+    Test-Case 'A tool install refreshes its own launchers and shortcuts only where that card is on' {
+        $root = Join-Path $scratch 'launch-root'
+        $saved = @{ Shim=$script:ShimDirectory; Start=$script:StartMenuShortcutDirectory; Desk=$script:DesktopShortcutDirectory
+                    Token=(Get-Variable ToolRootToken -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
+                    Name=(Get-Variable ToolRootVariableName -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
+                    Env=[Environment]::GetEnvironmentVariable('DINGO_TOOL_ROOT') }
+        try {
+            $script:ToolRootToken = '%DINGO_TOOL_ROOT%'; $script:ToolRootVariableName = 'DINGO_TOOL_ROOT'
+            [Environment]::SetEnvironmentVariable('DINGO_TOOL_ROOT', $root, 'Process')
+            $script:ShimDirectory = Join-Path $root 'bin'
+            $script:StartMenuShortcutDirectory = Join-Path $root 'start'
+            $script:DesktopShortcutDirectory = Join-Path $root 'desk'
+            foreach ($file in @('Velociraptor\velociraptor.exe','Volatility2\volatility_2.6_win64_standalone.exe','ArsenalImageMounter\ArsenalImageMounter.exe','ArsenalImageMounter\aim_cli.exe','Hayabusa\hayabusa-1.0.0-win-x64.exe')) {
+                $path = Join-Path $root $file
+                New-Item -ItemType Directory -Path (Split-Path $path) -Force | Out-Null
+                [IO.File]::WriteAllText($path, 'stub')
+            }
+            New-Item -ItemType Directory -Path $script:StartMenuShortcutDirectory, $script:DesktopShortcutDirectory -Force | Out-Null
+            # The Desktop card is on: Dingo has a shortcut there already. The
+            # Start menu folder holds none of Dingo's, so that card is off.
+            Write-ToolShortcut $script:DesktopShortcutDirectory 'Earlier Tool' ([pscustomobject]@{ Target=(Join-Path $env:WINDIR 'System32\notepad.exe'); Arguments='' })
+            function Find-InstalledTool { [pscustomobject]@{ Version='1' } }
+            function Get-MachinePathValue { "C:\Windows;$root\bin\" }
+            $card = { param($id) $script:Settings | Where-Object Id -eq $id }
+
+            Set-PackageKindPart (& $card 'tool-velociraptor') Installed Machine
+            Assert (Test-ShimIsCurrent (Join-Path $root 'bin\velociraptor.cmd') (Join-Path $root 'Velociraptor\velociraptor.exe')) 'An install did not write its launcher.'
+            Assert (-not (Test-Path -LiteralPath (Join-Path $root 'bin\hayabusa.cmd'))) 'An install wrote a launcher for another tool.'
+
+            Set-PackageKindPart (& $card 'tool-arsenalimagemounter') Installed Machine
+            Assert (Test-Path -LiteralPath (Join-Path $root 'bin\aim_cli.cmd')) 'Arsenal did not get its launcher.'
+            Assert (Test-ShortcutIsCurrent (Join-Path $root 'desk\Arsenal Image Mounter.lnk') ([pscustomobject]@{ Target=(Join-Path $root 'ArsenalImageMounter\ArsenalImageMounter.exe'); Arguments='' })) 'A shortcut card that is on did not get the new shortcut.'
+            Assert (-not @(Get-ChildItem -LiteralPath $script:StartMenuShortcutDirectory).Count) 'A shortcut card that is off got a shortcut.'
+
+            # A newer Hayabusa beside the old one: the launcher follows the update.
+            $newer = Join-Path $root 'Hayabusa\hayabusa-2.0.0-win-x64.exe'
+            [IO.File]::WriteAllText($newer, 'stub')
+            (Get-Item -LiteralPath $newer).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(5)
+            Set-PackageKindPart (& $card 'tool-hayabusa') Installed Machine
+            Assert (Test-ShimIsCurrent (Join-Path $root 'bin\hayabusa.cmd') $newer) 'The hayabusa launcher did not move to the newest program.'
+
+            # A file Dingo did not write is left alone, and the install still succeeds.
+            $foreign = Join-Path $root 'bin\vol2.cmd'
+            [IO.File]::WriteAllText($foreign, "@echo off`r`necho mine`r`n")
+            Set-PackageKindPart (& $card 'tool-volatility2') Installed Machine
+            Assert ([IO.File]::ReadAllText($foreign) -eq "@echo off`r`necho mine`r`n") 'A launcher Dingo did not write was replaced.'
+            Remove-Item -LiteralPath $foreign
+
+            # Run tools from anywhere is off: no launcher, and the PATH is not touched.
+            function Get-MachinePathValue { 'C:\Windows' }
+            function Add-FolderToMachinePath { throw 'Unexpected PATH write' }
+            Set-PackageKindPart (& $card 'tool-volatility2') Installed Machine
+            Assert (-not (Test-Path -LiteralPath $foreign)) 'A launcher was written while Run tools from anywhere is off.'
+        } finally {
+            $script:ShimDirectory = $saved.Shim; $script:StartMenuShortcutDirectory = $saved.Start; $script:DesktopShortcutDirectory = $saved.Desk
+            $script:ToolRootToken = $saved.Token; $script:ToolRootVariableName = $saved.Name
+            [Environment]::SetEnvironmentVariable('DINGO_TOOL_ROOT', $saved.Env, 'Process')
+        }
     }
     Test-Case 'Installed leaves detected tools alone in both scopes, in both modes, for every installer kind' {
         function Find-InstalledTool { [pscustomobject]@{Version='old-but-approved'} }

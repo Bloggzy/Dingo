@@ -3340,8 +3340,11 @@ function Remove-FolderFromMachinePath([string]$Folder) {
     return $true
 }
 
-function Get-ExpectedShims {
+function Get-ExpectedShims([string]$OnlyToolId = '') {
+    # With OnlyToolId, only that tool's launchers come back. Every tool is still
+    # walked, so a name another tool already claims is never handed over.
     $shims = New-Object System.Collections.Specialized.OrderedDictionary
+    $owners = @{}
     foreach ($tool in (Get-ToolCatalog)) {
         if (-not $tool.Shims) { continue }
         $from = Expand-ToolRootPath $tool.Shims.From
@@ -3361,9 +3364,13 @@ function Get-ExpectedShims {
                 continue
             }
             $shims[$name] = $file.FullName
+            $owners[$name] = [string]$tool.Id
         }
     }
-    return $shims
+    if (-not $OnlyToolId) { return $shims }
+    $mine = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach ($name in @($shims.Keys)) { if ($owners[$name] -eq $OnlyToolId) { $mine[$name] = $shims[$name] } }
+    return $mine
 }
 
 function Get-DingoShimFiles {
@@ -3470,8 +3477,10 @@ function Set-ToolPathKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     Send-EnvironmentChange
 }
 
-function Get-ExpectedShortcuts {
+function Get-ExpectedShortcuts([string]$OnlyToolId = '') {
+    # With OnlyToolId, only that tool's shortcuts come back, as for launchers.
     $wanted = New-Object System.Collections.Specialized.OrderedDictionary
+    $owners = @{}
     foreach ($tool in (Get-ToolCatalog)) {
         foreach ($shortcut in @($tool.Shortcuts)) {
             $target = Expand-ToolRootPath $shortcut.Target
@@ -3487,9 +3496,13 @@ function Get-ExpectedShortcuts {
                 Target = (Get-Item -LiteralPath $target).FullName
                 Arguments = [string]$shortcut.Arguments
             }
+            $owners[$shortcut.Name] = [string]$tool.Id
         }
     }
-    return $wanted
+    if (-not $OnlyToolId) { return $wanted }
+    $mine = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach ($name in @($wanted.Keys)) { if ($owners[$name] -eq $OnlyToolId) { $mine[$name] = $wanted[$name] } }
+    return $mine
 }
 
 function Read-ShortcutFile([string]$Path) {
@@ -3907,7 +3920,57 @@ function Get-PackageKindState($Setting) {
     return $state
 }
 
+function Update-ToolLaunchers($Tool) {
+    # The Run tools from anywhere and shortcut cards are the choice to have
+    # launchers and shortcuts at all. Once one is on, a tool installed or
+    # updated later gets its own straight away, rather than waiting for that
+    # card to be applied again. A card that is off is never turned on here, and
+    # the PATH is never changed here.
+    # Nothing here fails the install: the tool is in place either way, and the
+    # card says Partly set up until it is applied.
+    try {
+        $shims = Get-ExpectedShims $Tool.Id
+        if ($shims.Count -and (Test-PathContainsFolder (Get-MachinePathValue) $script:ShimDirectory)) {
+            foreach ($name in @($shims.Keys)) { Assert-DingoFileOwnership (Join-Path $script:ShimDirectory "$name.cmd") Shim }
+            if (-not (Test-Path -LiteralPath $script:ShimDirectory -PathType Container)) {
+                New-Item -ItemType Directory -Path $script:ShimDirectory -Force -ErrorAction Stop | Out-Null
+            }
+            foreach ($name in @($shims.Keys)) { Write-ToolShim $name $shims[$name] }
+            Write-Log 'INFO' "Wrote the launcher(s) $(@($shims.Keys) -join ', ') for $($Tool.Name) into $script:ShimDirectory."
+        }
+    } catch {
+        Write-Log 'WARN' "$($Tool.Name) is installed, but its launchers were not written: $($_.Exception.Message) Apply Run tools from anywhere to write them."
+    }
+    try {
+        $shortcuts = Get-ExpectedShortcuts $Tool.Id
+        if ($shortcuts.Count) {
+            foreach ($folderInfo in @(
+                [PSCustomObject]@{ Folder=$script:StartMenuShortcutDirectory; Card='Start menu shortcuts' },
+                [PSCustomObject]@{ Folder=$script:DesktopShortcutDirectory; Card='Desktop shortcuts' }
+            )) {
+                $folder = [Environment]::ExpandEnvironmentVariables([string]$folderInfo.Folder)
+                # A folder with no Dingo shortcut in it means that card is off.
+                if (-not @(Get-DingoShortcutFiles $folder).Count) { continue }
+                try {
+                    foreach ($name in @($shortcuts.Keys)) { Assert-DingoFileOwnership (Join-Path $folder ($name + '.lnk')) Shortcut }
+                    foreach ($name in @($shortcuts.Keys)) { Write-ToolShortcut $folder $name $shortcuts[$name] }
+                    Write-Log 'INFO' "Wrote the shortcut(s) $(@($shortcuts.Keys) -join ', ') for $($Tool.Name) into $folder."
+                } catch {
+                    Write-Log 'WARN' "$($Tool.Name) is installed, but its shortcuts were not written to $($folder): $($_.Exception.Message) Apply $($folderInfo.Card) to write them."
+                }
+            }
+        }
+    } catch {
+        Write-Log 'WARN' "$($Tool.Name) is installed, but its shortcuts were not checked: $($_.Exception.Message)"
+    }
+}
+
 function Set-PackageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
+    Invoke-PackageKindChange $Setting $DesiredState
+    Update-ToolLaunchers @($Setting.Entries)[0]
+}
+
+function Invoke-PackageKindChange($Setting, [string]$DesiredState) {
     $tool = @($Setting.Entries)[0]
     $update = $DesiredState -eq 'Update installed tool'
     if ($DesiredState -ne $Setting.PreferredState -and -not $update) { throw "Dingo installs or updates $($tool.Name) but never removes it." }

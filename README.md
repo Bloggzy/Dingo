@@ -439,6 +439,12 @@ The folder goes at the **end** of the PATH, so no tool can shadow a Windows comm
 
 Shortcuts are written for window tools only, and only for tools that are on disk. 7-Zip, Notepad++, and DB Browser make their own Start menu entries, so Dingo does not add more.
 
+These cards turn the feature on or off. After a card is on, each tool you install or update later gets its launcher or shortcut straight away. You do not need to apply the card again. This also moves the `hayabusa` launcher to the new program after an update.
+
+- A launcher is written only when `bin` is already on the computer PATH. A tool install never changes the PATH.
+- A shortcut is written only to a folder that already holds a Dingo shortcut.
+- If a file with the same name is not Dingo's, Dingo leaves it alone. The tool still installs, and the card says **Partly set up**. Apply the card to see why.
+
 All three cards are reversible. Turning one off removes only the files Dingo marked as its own.
 
 ### File associations
