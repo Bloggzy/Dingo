@@ -1065,6 +1065,7 @@ function ConvertTo-ToolDefinition($Raw) {
     $assetPattern = [string](Get-JsonField $install 'assetPattern' '')
     $linkName = [string](Get-JsonField $install 'linkName' '')
     $stripRoot = [bool](Get-JsonField $install 'stripRoot' $false)
+    $fileName = [string](Get-JsonField $install 'fileName' '')
     $expectedHash = [string](Get-JsonField $install 'sha256' '')
     if ($expectedHash -and $expectedHash -notmatch '^[0-9a-fA-F]{64}$') { throw "Tool '$id' needs a 64-character SHA256 hash." }
     $python = [string](Get-JsonField $install 'python' '')
@@ -1085,7 +1086,15 @@ function ConvertTo-ToolDefinition($Raw) {
         # A pattern may hold * and ?, because a release file carries its version.
         # Anything that could turn it into a path is refused.
         if ($assetPattern -match '[\\/:"<>|]' -or $assetPattern -match '[\x00-\x1f]') { throw "Tool '$id' has an assetPattern that is not a usable file name." }
-        if ($assetPattern -notlike '*.zip') { throw "Tool '$id' must name a .zip release file, because Dingo unpacks nothing else." }
+        if ($assetPattern -notlike '*.zip' -and $assetPattern -notlike '*.gz') { throw "Tool '$id' must name a .zip or .gz release file, because Dingo unpacks nothing else." }
+        # A .gz file holds one file and no name Dingo can trust, and the release
+        # name carries the version. So the catalog names the program it becomes,
+        # which keeps one steady path that each update replaces.
+        if ($assetPattern -like '*.gz') {
+            if ([string]::IsNullOrWhiteSpace($fileName) -or $fileName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $fileName -match '^\.+$') {
+                throw "Tool '$id' downloads a .gz file, so it needs a fileName for the program it unpacks to."
+            }
+        } elseif ($fileName) { throw "Tool '$id' names a fileName, which only a .gz release file uses." }
         if ([string]::IsNullOrWhiteSpace($dest)) { throw "Tool '$id' needs a dest folder for its release download." }
     } elseif ($installKind -eq 'mega-page') {
         # A vendor who publishes only through MEGA issues a new link for every
@@ -1226,6 +1235,7 @@ function ConvertTo-ToolDefinition($Raw) {
         AssetPattern = $assetPattern
         LinkName = $linkName
         StripRoot = $stripRoot
+        FileName = $fileName
         Python = $python
         Packages = $packages
         Arguments = @(Get-JsonField $install 'arguments' @())
@@ -1422,6 +1432,25 @@ function Get-BuiltInToolCatalog {
             )
         },
         [PSCustomObject]@{
+            # The repository is archived and its last build is 2.6 from 2016,
+            # so this release never changes. The program reports no version.
+            id='tool-volatility2'; name='Volatility 2'; category='Memory'
+            description='The older Volatility 2.6, for memory images and plugins that Volatility 3 does not cover. Dingo takes the standalone Windows program, so no Python 2 install is needed. Command-line tool called vol2, so it does not clash with vol from Volatility 3. The project is archived, and 2.6 from 2016 is its last release.'
+            install=[PSCustomObject]@{
+                kind='github-release'; scope='machine'
+                repo='volatilityfoundation/volatility'
+                assetPattern='volatility_*_win64_standalone.zip'
+                dest='%DINGO_TOOL_ROOT%\Volatility2'
+                # The archive wraps the program in a folder that carries the
+                # version. Taking it off keeps one steady path.
+                stripRoot=$true
+            }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/Volatility2'; pattern='volatility_*_win64_standalone.exe'; recurse=$false; name='vol2' }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/Volatility2/volatility_*_win64_standalone.exe' }
+            )
+        },
+        [PSCustomObject]@{
             id='tool-hayabusa'; name='Hayabusa'; category='Event logs'
             description='Scans Windows event logs with Sigma rules and writes a timeline. Command-line tool. The program file carries its version, so Dingo makes one launcher called hayabusa that points at the newest copy.'
             install=[PSCustomObject]@{
@@ -1433,6 +1462,23 @@ function Get-BuiltInToolCatalog {
             shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/Hayabusa'; pattern='hayabusa-*-win-x64.exe'; recurse=$false; name='hayabusa' }
             detect=@(
                 [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/Hayabusa/hayabusa-*-win-x64.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-velociraptor'; name='Velociraptor'; category='Forensics'
+            description='Collects and hunts for forensic evidence with VQL queries, and reads collections taken on other computers. Command-line tool; velociraptor gui starts a local server that you use in the browser. The program asks for administrator rights, so start it from an administrator terminal. Velocidex publish the Windows program compressed as a .gz file, so Dingo unpacks it to velociraptor.exe in the tools folder.'
+            install=[PSCustomObject]@{
+                kind='github-release'; scope='machine'
+                repo='Velocidex/velociraptor'
+                # Not the -legacy build for old Windows, and not the MSI, which
+                # installs Velociraptor as a client service.
+                assetPattern='velociraptor-v*-windows-amd64.exe.gz'
+                fileName='velociraptor.exe'
+                dest='%DINGO_TOOL_ROOT%\Velociraptor'
+            }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/Velociraptor'; pattern='velociraptor.exe'; recurse=$false }
+            detect=@(
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/Velociraptor/velociraptor.exe' }
             )
         },
         [PSCustomObject]@{
@@ -2568,6 +2614,53 @@ function Expand-DingoZipArchive([string]$ArchivePath, [string]$Destination, [swi
     }
 }
 
+function Expand-DingoGzipFile([string]$ArchivePath, [string]$Destination, [string]$FileName) {
+    # A .gz file holds one compressed file, such as velociraptor-v0.77.3-
+    # windows-amd64.exe.gz. The catalog names the file it becomes, so the name
+    # inside the download is never used as a path. As with a zip, the file is
+    # unpacked beside the destination first and moved in only when it is whole.
+    if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $FileName -match '^\.+$') {
+        throw "'$FileName' is not a usable file name, so nothing was unpacked."
+    }
+    $root = ([IO.Path]::GetFullPath($Destination)).TrimEnd('\')
+    $target = Join-Path $root $FileName
+    $staged = "$target.dingo-unpack-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+    try {
+        # The last four bytes of a gzip file give the unpacked size, modulo 4 GiB.
+        $source = [IO.File]::OpenRead($ArchivePath)
+        try {
+            if ($source.Length -lt 18) { throw 'This download is too short to be a .gz file. Nothing was unpacked.' }
+            $magic = New-Object byte[] 2
+            [void]$source.Read($magic, 0, 2)
+            if ($magic[0] -ne 0x1f -or $magic[1] -ne 0x8b) { throw 'This download is not a .gz file. Nothing was unpacked.' }
+            [void]$source.Seek(-4, [IO.SeekOrigin]::End)
+            $sizeBytes = New-Object byte[] 4
+            [void]$source.Read($sizeBytes, 0, 4)
+            $needed = [int64][BitConverter]::ToUInt32($sizeBytes, 0)
+        } finally { $source.Dispose() }
+        # The staged copy and the copy already in place sit on this drive at the
+        # same moment, so the file has to fit on it twice.
+        Assert-EnoughFreeSpace $root ($needed * 2) 'Unpacking this download'
+
+        $source = [IO.File]::OpenRead($ArchivePath)
+        try {
+            $gzip = New-Object IO.Compression.GZipStream($source, [IO.Compression.CompressionMode]::Decompress)
+            try {
+                $output = [IO.File]::Create($staged)
+                try { $gzip.CopyTo($output) } finally { $output.Dispose() }
+            } finally { $gzip.Dispose() }
+        } finally { $source.Dispose() }
+
+        if (Test-FileIsLocked $target) {
+            throw "$FileName is open right now, so nothing was changed. Close the program, then try again."
+        }
+        Move-Item -LiteralPath $staged -Destination $target -Force -ErrorAction Stop
+        return 1
+    } finally {
+        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-GitHubLatestRelease([string]$Repo, [int]$TimeoutSeconds = 60) {
     Initialize-DingoWebSession
     $uri = "https://api.github.com/repos/$Repo/releases/latest"
@@ -2712,7 +2805,8 @@ function Install-GitHubReleasePackage($Tool, [bool]$SkipIfCurrent = $false) {
         throw "The download address for $assetName is '$downloadUrl', which is not a release file of $($Tool.Repo)."
     }
 
-    $archivePath = Join-Path $env:TEMP ("Dingo-release-{0}.zip" -f [Guid]::NewGuid().ToString('N'))
+    $isGzip = $assetName -like '*.gz'
+    $archivePath = Join-Path $env:TEMP ("Dingo-release-{0}{1}" -f [Guid]::NewGuid().ToString('N'), $(if ($isGzip) { '.gz' } else { '.zip' }))
     $progress = $ProgressPreference
     try {
         # The progress bar makes Invoke-WebRequest many times slower on a large file.
@@ -2742,7 +2836,7 @@ function Install-GitHubReleasePackage($Tool, [bool]$SkipIfCurrent = $false) {
             New-Item -ItemType Directory -Path $destination -Force -ErrorAction Stop | Out-Null
             Write-Log 'INFO' "Created $destination."
         }
-        $written = Expand-DingoZipArchive $archivePath $destination -StripRootFolder:$Tool.StripRoot
+        $written = if ($isGzip) { Expand-DingoGzipFile $archivePath $destination $Tool.FileName } else { Expand-DingoZipArchive $archivePath $destination -StripRootFolder:$Tool.StripRoot }
         Write-Log 'INFO' "Unpacked $written file(s) of $($Tool.Name) $tag into $destination."
         Write-ToolReleaseRecord $Tool $tag $assetName
     } finally {
@@ -6426,18 +6520,18 @@ if ($SelfTest) {
     }
     # Tool cards offer an explicit update action, but never uninstall.
     $builtInTools = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
-    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9','tool-dotnet-desktop-10','tool-memprocfs','tool-volatility3','tool-hayabusa','tool-duckdb')) {
+    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9','tool-dotnet-desktop-10','tool-memprocfs','tool-volatility3','tool-volatility2','tool-hayabusa','tool-velociraptor','tool-duckdb')) {
         if (@($builtInTools | Where-Object Id -eq $expectedId).Count -ne 1) { throw "The built-in tool catalog is missing '$expectedId'." }
     }
     # The tools that come straight from a GitHub release. Each one must name a
     # repository rather than an address, must ask for a zip, must unpack inside
     # the tools folder, and must offer its program to the PATH card.
-    foreach ($releaseId in @('tool-memprocfs','tool-volatility3','tool-hayabusa','tool-duckdb','tool-azcopy')) {
+    foreach ($releaseId in @('tool-memprocfs','tool-volatility3','tool-volatility2','tool-hayabusa','tool-velociraptor','tool-duckdb','tool-azcopy')) {
         $releaseTool = $builtInTools | Where-Object Id -eq $releaseId | Select-Object -First 1
         if ($releaseTool.InstallKind -ne 'github-release') { throw "'$releaseId' must use the github-release install kind." }
         if ($releaseTool.Url) { throw "'$releaseId' must not name a download address; Dingo builds it from the repository." }
         if ($releaseTool.Repo -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$') { throw "'$releaseId' must name a GitHub repository as owner/name." }
-        if ($releaseTool.AssetPattern -notlike '*.zip') { throw "'$releaseId' must ask for a zip file." }
+        if ($releaseTool.AssetPattern -notlike '*.zip' -and -not ($releaseTool.AssetPattern -like '*.gz' -and $releaseTool.FileName)) { throw "'$releaseId' must ask for a zip file, or a .gz file with a fileName." }
         if ($releaseTool.Dest -notlike "$($script:ToolRootToken)\*") { throw "'$releaseId' must unpack inside the tools folder." }
         if ($releaseTool.Scope -ne 'machine') { throw "Writing to the tools folder needs administrator approval, so '$releaseId' must be machine scope." }
         if (-not $releaseTool.Shims -or $releaseTool.Shims.From -notlike "$($script:ToolRootToken)/*") { throw "'$releaseId' must offer its command-line program from the tools folder." }
@@ -6456,6 +6550,29 @@ if ($SelfTest) {
     $hayabusaTool = $builtInTools | Where-Object Id -eq 'tool-hayabusa' | Select-Object -First 1
     if ($hayabusaTool.Shims.Name -ne 'hayabusa') { throw 'The Hayabusa launcher must be called hayabusa.' }
     if ((($builtInTools | Where-Object Id -eq 'tool-duckdb' | Select-Object -First 1).Shims.Name)) { throw 'DuckDB names its own launcher, so no override is needed.' }
+    # Volatility 2 must not take vol, which belongs to Volatility 3.
+    $vol2Tool = $builtInTools | Where-Object Id -eq 'tool-volatility2' | Select-Object -First 1
+    if ($vol2Tool.Shims.Name -ne 'vol2') { throw 'The Volatility 2 launcher must be called vol2.' }
+    if (-not $vol2Tool.StripRoot) { throw 'Volatility 2 must drop the versioned folder, or its launcher moves.' }
+    # Velociraptor ships one .gz program whose name carries the version, so it
+    # is unpacked to one steady name, and the -legacy build is never taken.
+    $veloTool = $builtInTools | Where-Object Id -eq 'tool-velociraptor' | Select-Object -First 1
+    if ($veloTool.FileName -ne 'velociraptor.exe') { throw 'Velociraptor must unpack to velociraptor.exe.' }
+    if ('velociraptor-v0.77.3-windows-amd64.exe.gz' -notlike $veloTool.AssetPattern) { throw 'Velociraptor must match the Windows AMD64 program.' }
+    foreach ($otherAsset in @('velociraptor-v0.77.3-windows-amd64-legacy.exe.gz','velociraptor-v0.77.3-windows-amd64.msi','velociraptor-v0.77.3-windows-arm64.exe.gz','velociraptor-v0.77.3-windows-amd64.exe.sig')) {
+        if ($otherAsset -like $veloTool.AssetPattern) { throw "Velociraptor must not match $otherAsset." }
+    }
+    if ((Get-Command Install-GitHubReleasePackage).Definition -notmatch 'Expand-DingoGzipFile \$archivePath \$destination \$Tool\.FileName') { throw 'A .gz release download must unpack to the catalog fileName.' }
+    # A .gz release needs a fileName, and a zip release must not carry one.
+    foreach ($badGz in @(
+        [PSCustomObject]@{ id='tool-test-gz'; name='Test'; install=[PSCustomObject]@{ kind='github-release'; repo='a/b'; assetPattern='t-*.exe.gz'; dest='%DINGO_TOOL_ROOT%\T' }; detect=@([PSCustomObject]@{ kind='file'; path='C:/t.exe' }) },
+        [PSCustomObject]@{ id='tool-test-gz'; name='Test'; install=[PSCustomObject]@{ kind='github-release'; repo='a/b'; assetPattern='t-*.exe.gz'; fileName='..\t.exe'; dest='%DINGO_TOOL_ROOT%\T' }; detect=@([PSCustomObject]@{ kind='file'; path='C:/t.exe' }) },
+        [PSCustomObject]@{ id='tool-test-gz'; name='Test'; install=[PSCustomObject]@{ kind='github-release'; repo='a/b'; assetPattern='t-*.zip'; fileName='t.exe'; dest='%DINGO_TOOL_ROOT%\T' }; detect=@([PSCustomObject]@{ kind='file'; path='C:/t.exe' }) }
+    )) {
+        $refused = $false
+        try { [void](ConvertTo-ToolDefinition $badGz) } catch { $refused = $true }
+        if (-not $refused) { throw "A release entry with assetPattern '$($badGz.install.assetPattern)' and fileName '$($badGz.install.fileName)' was accepted." }
+    }
     # An archive must never write outside the folder it was told to fill.
     $zipTestRoot = Join-Path $env:TEMP ("Dingo-zip-test-{0}" -f [Guid]::NewGuid().ToString('N'))
     try {
@@ -6484,6 +6601,27 @@ if ($SelfTest) {
         try { [void](Expand-DingoZipArchive $escapeZip $unpackRoot) } catch { $escapeRefused = $true }
         if (-not $escapeRefused) { throw 'An archive entry pointing outside the folder was accepted.' }
         if (Test-Path -LiteralPath (Join-Path $zipTestRoot 'escaped.txt')) { throw 'An archive entry escaped the folder it was given.' }
+        # A .gz file becomes the one file the catalog names, and again must
+        # overwrite on a second run.
+        $gzPath = Join-Path $zipTestRoot 'tool-v1.2.3.exe.gz'
+        $gzOut = [IO.File]::Create($gzPath)
+        try {
+            $gzWriter = New-Object IO.Compression.GZipStream($gzOut, [IO.Compression.CompressionMode]::Compress)
+            try { $gzBytes = [Text.Encoding]::ASCII.GetBytes('dingo-gz'); $gzWriter.Write($gzBytes, 0, $gzBytes.Length) } finally { $gzWriter.Dispose() }
+        } finally { $gzOut.Dispose() }
+        foreach ($pass in 1..2) {
+            if ((Expand-DingoGzipFile $gzPath $unpackRoot 'tool.exe') -ne 1) { throw 'A .gz file did not unpack one file.' }
+        }
+        if ([IO.File]::ReadAllText((Join-Path $unpackRoot 'tool.exe')) -ne 'dingo-gz') { throw 'A .gz file did not unpack to the name it was given.' }
+        if (@(Get-ChildItem -LiteralPath $unpackRoot -Filter '*.dingo-unpack-*' -Force).Count) { throw 'Unpacking a .gz file left its staged copy behind.' }
+        foreach ($badName in @('..\escaped.exe','..','')) {
+            $refused = $false
+            try { [void](Expand-DingoGzipFile $gzPath $unpackRoot $badName) } catch { $refused = $true }
+            if (-not $refused) { throw "A .gz file was unpacked to the name '$badName'." }
+        }
+        $refused = $false
+        try { [void](Expand-DingoGzipFile $goodZip $unpackRoot 'notgz.exe') } catch { $refused = $true }
+        if (-not $refused -or (Test-Path -LiteralPath (Join-Path $unpackRoot 'notgz.exe'))) { throw 'A file that is not .gz was unpacked as one.' }
     } finally {
         Remove-Item -LiteralPath $zipTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }

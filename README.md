@@ -322,7 +322,9 @@ The cards are shown in name order, and the **Install tools** tab has a search bo
 | `tool-eztools` | Eric Zimmerman's tools | yes |
 | `tool-memprocfs` | MemProcFS | yes |
 | `tool-volatility3` | Volatility 3 | yes |
+| `tool-volatility2` | Volatility 2 | yes |
 | `tool-hayabusa` | Hayabusa | yes |
+| `tool-velociraptor` | Velociraptor | yes |
 | `tool-duckdb` | DuckDB | yes |
 | `tool-arsenalimagemounter` | Arsenal Image Mounter | yes |
 | `tool-azurestorageexplorer` | Azure Storage Explorer | yes |
@@ -337,17 +339,23 @@ The table above is the order Dingo installs in, not the order the window shows. 
 
 Most tools come from winget, so you need a network connection. Dingo also checks the winget version before it installs anything. A client older than 1.6 cannot read the package list Microsoft publishes today, and every install fails with `0x8a15000f`, "Data required by the source is missing". When Dingo is running as an administrator it repairs winget itself with `Repair-WinGetPackageManager`, then carries on. Otherwise it stops and tells you to install the latest App Installer from <https://aka.ms/getwinget>. Before it repairs anything, Dingo checks it can reach the App Installer download, and the PowerShell Gallery when the repair module is missing or too old. A computer with no route out is told so by name, rather than waiting for a download to time out. Eric Zimmerman's tools are not in winget. Dingo runs the author's own `Get-ZimmermanTools.ps1` over HTTPS and checks its SHA256 before running it. They install to `EZTools` inside the tools folder, `C:\DFIR\Tools` by default, and the download is several hundred megabytes.
 
-MemProcFS, Volatility 3, Hayabusa, DuckDB, and AzCopy are not in winget either. Each one ships a zip on its own GitHub releases page, so Dingo reads the latest release, downloads the Windows file, and unpacks it into its own folder inside the tools folder:
+MemProcFS, Volatility 3, Volatility 2, Hayabusa, Velociraptor, DuckDB, and AzCopy are not in winget either. Each one ships a file on its own GitHub releases page, so Dingo reads the latest release, downloads the Windows file, and unpacks it into its own folder inside the tools folder:
 
 | Tool | Folder | Command |
 | --- | --- | --- |
 | MemProcFS | `MemProcFS` | `MemProcFS` |
 | Volatility 3 | `Volatility3` | `vol`, `volshell` |
+| Volatility 2 | `Volatility2` | `vol2` |
 | Hayabusa | `Hayabusa` | `hayabusa` |
+| Velociraptor | `Velociraptor` | `velociraptor` |
 | DuckDB | `DuckDB` | `duckdb` |
 | AzCopy | `AzCopy` | `azcopy` |
 
-All five are command-line tools, so they get no Start menu or Desktop shortcut. Select **Run tools from anywhere** to type the commands above from any folder. Volatility 3 is the standalone Windows build, so no Python install is needed.
+All seven are command-line tools, so they get no Start menu or Desktop shortcut. Select **Run tools from anywhere** to type the commands above from any folder. Volatility 3 and Volatility 2 are the standalone Windows builds, so no Python install is needed.
+
+Volatility 2 is the older 2.6 release. Its command is `vol2`, so it does not clash with `vol` from Volatility 3. The project is archived, and 2.6 from 2016 is its last release, so Dingo will not find an update for it.
+
+Velociraptor publishes its Windows program compressed as a `.gz` file, such as `velociraptor-v0.77.3-windows-amd64.exe.gz`. Dingo takes the plain AMD64 program, not the `-legacy` build or the MSI. It unpacks it to `velociraptor.exe`, so the path stays the same after an update. The program asks Windows for administrator rights. If your account is an administrator, start it from an administrator terminal. A normal terminal gives "The requested operation requires elevation".
 
 ### Arsenal Image Mounter
 
