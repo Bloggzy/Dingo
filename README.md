@@ -313,8 +313,10 @@ The cards are shown in name order, and the **Install tools** tab has a search bo
 | `tool-7zip` | 7-Zip | yes |
 | `tool-notepadplusplus` | Notepad++ | yes |
 | `tool-ripgrep` | ripgrep | no |
+| `tool-librewolf` | LibreWolf | yes |
 | `tool-powershell` | PowerShell 7 | yes |
 | `tool-python` | Python 3.13 | yes |
+| `tool-uv` | uv | yes |
 | `tool-sqlitebrowser` | DB Browser for SQLite | yes |
 | `tool-hashcheck` | HashCheck | yes |
 | `tool-dotnet-desktop-9` | .NET 9 Desktop Runtime | yes |

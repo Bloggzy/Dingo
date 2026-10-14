@@ -1289,6 +1289,15 @@ function Get-BuiltInToolCatalog {
             )
         },
         [PSCustomObject]@{
+            id='tool-librewolf'; name='LibreWolf'; category='Browsers'
+            description='Web browser built on Firefox, with telemetry removed and stronger privacy settings by default. Useful as a second browser for research that should stay apart from your main one.'
+            install=[PSCustomObject]@{ kind='winget'; package='LibreWolf.LibreWolf'; scope='machine' }
+            detect=@(
+                [PSCustomObject]@{ kind='uninstall-key'; match='LibreWolf*' },
+                [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\LibreWolf\librewolf.exe' }
+            )
+        },
+        [PSCustomObject]@{
             id='tool-powershell'; name='PowerShell 7'; category='Scripting'
             description='The current PowerShell, pwsh.exe. It sits beside Windows PowerShell 5.1 and does not replace it. Many newer DFIR scripts need it. The installer adds pwsh to the PATH itself.'
             # The package also offers an MSIX, and winget picks it first. Deployed
@@ -1313,6 +1322,18 @@ function Get-BuiltInToolCatalog {
             install=[PSCustomObject]@{ kind='winget'; package='Python.Python.3.13'; scope='machine' }
             detect=@(
                 [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\Python313\python.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            # winget installs uv as a portable zip. Machine scope, because the
+            # package depends on the Visual C++ runtime, which needs an
+            # administrator to install. winget adds the uv command to the PATH.
+            id='tool-uv'; name='uv'; category='Scripting'
+            description='Fast Python package and project manager from Astral. Replaces pip, pipx, and venv for most work, with the commands uv and uvx. It can download its own Python, so it does not need the Python 3.13 card.'
+            install=[PSCustomObject]@{ kind='winget'; package='astral-sh.uv'; scope='machine' }
+            detect=@(
+                [PSCustomObject]@{ kind='uninstall-key'; match='uv' },
+                [PSCustomObject]@{ kind='command'; command='uv.exe' }
             )
         },
         [PSCustomObject]@{
@@ -6583,7 +6604,7 @@ if ($SelfTest) {
     }
     # Tool cards offer an explicit update action, but never uninstall.
     $builtInTools = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
-    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9','tool-dotnet-desktop-10','tool-memprocfs','tool-volatility3','tool-volatility2','tool-hayabusa','tool-velociraptor','tool-duckdb')) {
+    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9','tool-dotnet-desktop-10','tool-memprocfs','tool-volatility3','tool-volatility2','tool-hayabusa','tool-velociraptor','tool-duckdb','tool-uv','tool-librewolf')) {
         if (@($builtInTools | Where-Object Id -eq $expectedId).Count -ne 1) { throw "The built-in tool catalog is missing '$expectedId'." }
     }
     # The tools that come straight from a GitHub release. Each one must name a
