@@ -463,6 +463,7 @@ All four cards are reversible. Turning one off removes only the files Dingo mark
 - The LibreWolf installer makes its Start menu shortcut with no app ID, but the LibreWolf window has one. Windows groups a pin and a window by this ID, so without it an open LibreWolf gets a second taskbar button. Dingo writes the ID onto the shortcut before it pins it. The ID is the one LibreWolf uses for its install, such as `83C1C0F3FA8524B1` for `C:\Program Files\LibreWolf`.
 - On Windows 11 24H2 and later, you can unpin a Dingo pin, and Windows does not pin it again.
 - If your organisation already sets the Start Layout policy, the card says **Set by another policy**, and Dingo does not change it.
+- To remove the pins, choose **Not pinned** and apply, then sign out and sign in. Dingo keeps the policy but empties its layout file. Windows removes a pin only when the layout file stops listing it. Removing the policy leaves the pins on the taskbar.
 
 Microsoft documents this in [Configure the Windows taskbar pinned apps](https://learn.microsoft.com/en-us/windows/configuration/taskbar/pinned-apps).
 

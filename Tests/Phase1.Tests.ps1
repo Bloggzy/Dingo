@@ -35,6 +35,7 @@ function Get-MachinePathValue { 'C:\Windows;C:\Windows\System32' }
 # The taskbar pin card reads a machine policy. The real one must never decide
 # what a test writes.
 $script:TaskbarLayoutPath = 'C:\Dingo-Test-Not-Used\TaskbarLayout.xml'
+$script:TaskbarPolicySubKey = 'SOFTWARE\Dingo-Test-Not-Used'
 function Get-TaskbarPolicyValues { [PSCustomObject]@{ Locked=$null; File='' } }
 Initialize-SettingHandlers
 $script:Settings = Get-Settings
@@ -1839,6 +1840,17 @@ try {
         Update-TaskbarLayoutIfOn
         Assert ((Get-TaskbarPinKindState $card).Status -eq 'Preferred') 'An install did not add the app to the layout.'
         Assert ([IO.File]::ReadAllText($script:TaskbarLayoutPath) -match 'LibreWolf\.lnk') 'The layout does not name the LibreWolf shortcut.'
+        # Off keeps the policy and empties the file, because Windows unpins only
+        # what an updated layout stops listing.
+        function Test-Path { param([string]$LiteralPath, $PathType) if ($LiteralPath -like 'HKLM:*') { throw 'The test must not touch the registry.' } [IO.File]::Exists($LiteralPath) }
+        function Remove-ItemProperty { throw 'Turning the card off must not remove the policy.' }
+        Set-TaskbarPinKindPart $card 'Not pinned' 'Machine'
+        Remove-Item Function:\Test-Path, Function:\Remove-ItemProperty
+        $state = Get-TaskbarPinKindState $card
+        Assert ($state.Status -eq 'Alternate') "An empty layout did not read Not pinned: $($state.Status)."
+        Assert ([IO.File]::ReadAllText($script:TaskbarLayoutPath) -match '#leaveempty') 'The empty layout has no placeholder.'
+        Update-TaskbarLayoutIfOn
+        Assert ((Get-TaskbarPinKindState $card).Status -eq 'Alternate') 'An install turned the card back on.'
     }
     Test-Case 'A pinned shortcut is given the app ID its window uses' {
         $link = Join-Path $scratch 'Browser.lnk'

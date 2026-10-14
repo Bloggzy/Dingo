@@ -3803,6 +3803,8 @@ function New-TaskbarLayoutXml($Pins) {
     [void]$lines.Add('  <CustomTaskbarLayoutCollection>')
     [void]$lines.Add('    <defaultlayout:TaskbarLayout>')
     [void]$lines.Add('      <taskbar:TaskbarPinList>')
+    # With no pins, the list holds Microsoft's empty placeholder.
+    if (-not @($Pins).Count) { [void]$lines.Add('        <taskbar:DesktopApp DesktopApplicationLinkPath="#leaveempty" />') }
     foreach ($pin in @($Pins)) {
         if ($pin.Aumid) {
             [void]$lines.Add("        <taskbar:UWA AppUserModelID=`"$([Security.SecurityElement]::Escape($pin.Aumid))`"$generation />")
@@ -3844,6 +3846,9 @@ function Get-TaskbarPinKindState($Setting) {
         return (New-StateResult 'Alternate' $Setting.AlternateState "No taskbar layout from Dingo.$skippedText")
     }
     $current = if ($fileExists) { [IO.File]::ReadAllText($script:TaskbarLayoutPath) } else { '' }
+    if ($policy.File -and $current -eq (New-TaskbarLayoutXml @())) {
+        return (New-StateResult 'Alternate' $Setting.AlternateState "Dingo's taskbar layout is empty, so Windows removes the pins Dingo added at each account's next sign-in.$skippedText")
+    }
     $unmatched = @(Get-TaskbarPinsWithoutAppId $wanted.Pins | ForEach-Object Name)
     if ($unmatched.Count) {
         return (New-StateResult 'Partial' 'Partly set up' "The Start menu shortcut for $($unmatched -join ', ') does not carry the app ID its window uses, so the pin and the open window would show as two buttons. Apply the card again.$skippedText")
@@ -3888,12 +3893,16 @@ function Set-TaskbarPinKindPart($Setting, [string]$DesiredState, [string]$Scope)
         New-ItemProperty -LiteralPath $key -Name 'StartLayoutFile' -Value $script:TaskbarLayoutPath -PropertyType ExpandString -Force -ErrorAction Stop | Out-Null
         New-ItemProperty -LiteralPath $key -Name 'LockedStartLayout' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
     } else {
-        if ($policy.File) {
-            Remove-ItemProperty -LiteralPath $key -Name 'StartLayoutFile' -ErrorAction Stop
-            Remove-ItemProperty -LiteralPath $key -Name 'LockedStartLayout' -ErrorAction SilentlyContinue
+        # Removing the policy leaves the pins in place (VM test, 2026-10-14).
+        # Windows unpins a policy pin only when an updated layout file no
+        # longer lists it, so the policy stays and the file is emptied. A
+        # computer Dingo never pinned on is left with no policy at all.
+        if (-not $policy.File) {
+            if (Test-Path -LiteralPath $script:TaskbarLayoutPath -PathType Leaf) { Remove-Item -LiteralPath $script:TaskbarLayoutPath -Force -ErrorAction Stop }
+            return
         }
-        if (Test-Path -LiteralPath $script:TaskbarLayoutPath -PathType Leaf) { Remove-Item -LiteralPath $script:TaskbarLayoutPath -Force -ErrorAction Stop }
-        Write-Log 'INFO' 'Removed the Dingo taskbar layout and its Start Layout policy.'
+        [IO.File]::WriteAllText($script:TaskbarLayoutPath, (New-TaskbarLayoutXml @()), (New-Object Text.UTF8Encoding($false)))
+        Write-Log 'INFO' "Emptied the Dingo taskbar layout in $script:TaskbarLayoutPath. Windows removes the pins at each account's next sign-in."
     }
 }
 
@@ -3902,6 +3911,9 @@ function Update-TaskbarLayoutIfOn {
     # layout straight away. A card that is off is never turned on here.
     try {
         if (-not (Test-TaskbarPolicyIsDingo (Get-TaskbarPolicyValues))) { return }
+        # An empty layout means the card is off.
+        if (-not (Test-Path -LiteralPath $script:TaskbarLayoutPath -PathType Leaf)) { return }
+        if ([IO.File]::ReadAllText($script:TaskbarLayoutPath) -eq (New-TaskbarLayoutXml @())) { return }
         Write-TaskbarLayout
     } catch {
         Write-Log 'WARN' "The taskbar layout was not updated: $($_.Exception.Message) Apply Pin to taskbar to update it."
@@ -4571,7 +4583,7 @@ function Get-Settings {
         'Created' 'Not created' 'Shortcut' @([PSCustomObject]@{ Scope='Machine'; Folder=$script:DesktopShortcutDirectory }) $false $false @{} 'Tool shortcuts'))
     # RestartRequired, because Explorer reads the layout when someone signs in.
     [void]$settings.Add((New-Setting 'tools-taskbar-pins' 'Tools' 'Pin to taskbar' `
-        "Pins Windows Terminal and LibreWolf to the taskbar for every account on this computer, after the apps already pinned there. It uses the Start Layout policy, the way Microsoft supports for taskbar pins. Sign out and back in after you apply it. Windows can show the pins straight away, but until you sign in again an open LibreWolf gets a second taskbar button. LibreWolf is pinned only once it is installed. Turning this off removes the policy and Dingo's layout file." `
+        "Pins Windows Terminal and LibreWolf to the taskbar for every account on this computer, after the apps already pinned there. It uses the Start Layout policy, the way Microsoft supports for taskbar pins. Sign out and back in after you apply it. Windows can show the pins straight away, but until you sign in again an open LibreWolf gets a second taskbar button. LibreWolf is pinned only once it is installed. Turning this off empties Dingo's layout file, and Windows removes the pins at the next sign-in." `
         'Pinned' 'Not pinned' 'TaskbarPin' @() $false $true @{} 'Tool shortcuts'))
     # Added last on purpose. The elevated worker runs the plan in this order, so
     # the launchers are written after the tools they point at are installed.
