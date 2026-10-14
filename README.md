@@ -429,6 +429,7 @@ A tool with its own installer goes where that installer puts it. A tool without 
 | --- | --- | --- |
 | `tools-start-menu` | Start menu shortcuts | Writes shortcuts to `...\Start Menu\Programs\DFIR Tools` |
 | `tools-desktop` | Desktop shortcuts | Writes shortcuts to `C:\Users\Public\Desktop` |
+| `tools-taskbar-pins` | Pin to taskbar | Pins Windows Terminal and LibreWolf to the taskbar |
 | `tools-on-path` | Run tools from anywhere | Puts the tools `bin` folder on the computer PATH |
 
 **Run tools from anywhere** writes one small `.cmd` launcher per command-line tool into `bin` inside the tools folder, `C:\DFIR\Tools\bin` by default, then adds that one folder to the PATH. You can then type this from any folder:
@@ -447,7 +448,24 @@ These cards turn the feature on or off. After a card is on, each tool you instal
 - A shortcut is written only to a folder that already holds a Dingo shortcut.
 - If a file with the same name is not Dingo's, Dingo leaves it alone. The tool still installs, and the card says **Partly set up**. Apply the card to see why.
 
-All three cards are reversible. Turning one off removes only the files Dingo marked as its own.
+All four cards are reversible. Turning one off removes only the files Dingo marked as its own.
+
+**Pin to taskbar** pins Windows Terminal and LibreWolf for every account on the computer. Windows 11 gives scripts only one supported way to pin: the Start Layout policy, with a taskbar layout file. Dingo writes the file to `C:\ProgramData\Dingo\TaskbarLayout.xml`, then sets these two values in `HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer`:
+
+| Value | Data |
+| --- | --- |
+| `StartLayoutFile` | the path to the file |
+| `LockedStartLayout` | `1` |
+
+- Sign out and sign in again after you apply the card. On Windows 11 25H2 the pins can appear straight away. But until you sign in again, LibreWolf opened from its pin gets a second taskbar button. After the sign-in, the pin and the window share one button.
+- Dingo adds pins after the apps already on the taskbar. It never removes a pin.
+- LibreWolf is pinned through its own Start menu shortcut, so it is pinned only once it is installed. If you install LibreWolf after the card is on, Dingo adds it to the file straight away.
+- The LibreWolf installer makes its Start menu shortcut with no app ID, but the LibreWolf window has one. Windows groups a pin and a window by this ID, so without it an open LibreWolf gets a second taskbar button. Dingo writes the ID onto the shortcut before it pins it. The ID is the one LibreWolf uses for its install, such as `83C1C0F3FA8524B1` for `C:\Program Files\LibreWolf`.
+- On Windows 11 24H2 and later, you can unpin a Dingo pin, and Windows does not pin it again.
+- If your organisation already sets the Start Layout policy, the card says **Set by another policy**, and Dingo does not change it.
+- To remove the pins, choose **Not pinned** and apply, then sign out and sign in. Dingo keeps the policy but empties its layout file. Windows removes a pin only when the layout file stops listing it. Removing the policy leaves the pins on the taskbar.
+
+Microsoft documents this in [Configure the Windows taskbar pinned apps](https://learn.microsoft.com/en-us/windows/configuration/taskbar/pinned-apps).
 
 ### File associations
 
