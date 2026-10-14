@@ -3643,12 +3643,115 @@ function Set-ShortcutKindPart($Setting, [string]$DesiredState, [string]$Scope) {
 # LockedStartLayout set to 1. These are the values the Start Layout policy in
 # StartMenu.admx writes. Explorer reads the file when someone signs in.
 # A packaged app is pinned by its AUMID. A desktop app is pinned by its own
-# Start menu shortcut, which carries the app ID Windows groups its windows by.
+# Start menu shortcut. Windows puts a pin and a window on one button only when
+# both carry the same app ID (AUMID).
+# MozillaApp marks a Firefox-based browser. Its window takes the install hash
+# as its app ID, but the LibreWolf installer leaves its shortcut without one.
+# Pinned as it is, the open window gets a second button (VM test, 2026-10-14).
 function Get-TaskbarPinCatalog {
     @(
-        [PSCustomObject]@{ Name='Windows Terminal'; Aumid='Microsoft.WindowsTerminal_8wekyb3d8bbwe!App'; Program='' },
-        [PSCustomObject]@{ Name='LibreWolf'; Aumid=''; Program='%ProgramFiles%\LibreWolf\librewolf.exe' }
+        [PSCustomObject]@{ Name='Windows Terminal'; Aumid='Microsoft.WindowsTerminal_8wekyb3d8bbwe!App'; Program=''; MozillaApp=$false },
+        [PSCustomObject]@{ Name='LibreWolf'; Aumid=''; Program='%ProgramFiles%\LibreWolf\librewolf.exe'; MozillaApp=$true }
     )
+}
+
+function Initialize-ShortcutAppIdType {
+    if ('Dingo.ShortcutAppId' -as [type]) { return }
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+namespace Dingo {
+    public static class ShortcutAppId {
+        [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+        class ShellLink { }
+        [ComImport, Guid("0000010b-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IPersistFile {
+            void GetClassID(out Guid classId);
+            [PreserveSig] int IsDirty();
+            void Load([MarshalAs(UnmanagedType.LPWStr)] string fileName, uint mode);
+            void Save([MarshalAs(UnmanagedType.LPWStr)] string fileName, [MarshalAs(UnmanagedType.Bool)] bool remember);
+            void SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string fileName);
+            void GetCurFile(out IntPtr fileName);
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct PropertyKey { public Guid Format; public uint Id; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct PropVariant { public ushort Type; public ushort R1, R2, R3; public IntPtr Value; public IntPtr Value2; }
+        [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IPropertyStore {
+            void GetCount(out uint count);
+            void GetAt(uint index, out PropertyKey key);
+            void GetValue(ref PropertyKey key, out PropVariant value);
+            void SetValue(ref PropertyKey key, ref PropVariant value);
+            void Commit();
+        }
+        [DllImport("ole32.dll")]
+        static extern int PropVariantClear(ref PropVariant value);
+        static PropertyKey AppIdKey() {
+            PropertyKey key = new PropertyKey();
+            key.Format = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
+            key.Id = 5;
+            return key;
+        }
+        public static string Get(string path) {
+            object link = new ShellLink();
+            try {
+                ((IPersistFile)link).Load(path, 0);
+                PropertyKey key = AppIdKey();
+                PropVariant value;
+                ((IPropertyStore)link).GetValue(ref key, out value);
+                try { return value.Type == 31 ? Marshal.PtrToStringUni(value.Value) : ""; }
+                finally { PropVariantClear(ref value); }
+            } finally { Marshal.ReleaseComObject(link); }
+        }
+        public static void Set(string path, string appId) {
+            object link = new ShellLink();
+            try {
+                ((IPersistFile)link).Load(path, 2);
+                PropertyKey key = AppIdKey();
+                PropVariant value = new PropVariant();
+                value.Type = 31;
+                value.Value = Marshal.StringToCoTaskMemUni(appId);
+                try {
+                    IPropertyStore store = (IPropertyStore)link;
+                    store.SetValue(ref key, ref value);
+                    store.Commit();
+                } finally { PropVariantClear(ref value); }
+                ((IPersistFile)link).Save(null, true);
+            } finally { Marshal.ReleaseComObject(link); }
+        }
+        // Firefox names an install by CityHash64 of its folder path in UTF-16,
+        // as upper-case hex, with the CityHash 1.0 that Mozilla ships. Only the
+        // 33 to 64 byte case is here: it is the one checked against real
+        // installs, and every folder of 17 to 32 characters falls in it.
+        static ulong Fetch(byte[] s, int i) { return BitConverter.ToUInt64(s, i); }
+        static ulong Rotate(ulong v, int n) { return n == 0 ? v : (v >> n) | (v << (64 - n)); }
+        static ulong ShiftMix(ulong v) { return v ^ (v >> 47); }
+        public static string MozillaInstallHash(string folder) {
+            byte[] s = System.Text.Encoding.Unicode.GetBytes(folder);
+            int n = s.Length;
+            if (n < 33 || n > 64) { throw new ArgumentException("Dingo cannot work out the app ID for a folder path of this length: " + folder); }
+            const ulong k0 = 0xc3a5c85c97cb3127UL, k2 = 0x9ae16a3b2f90404fUL;
+            unchecked {
+                ulong z = Fetch(s, 24);
+                ulong a = Fetch(s, 0) + ((ulong)n + Fetch(s, n - 16)) * k0;
+                ulong b = Rotate(a + z, 52);
+                ulong c = Rotate(a, 37);
+                a += Fetch(s, 8); c += Rotate(a, 7); a += Fetch(s, 16);
+                ulong vf = a + z, vs = b + Rotate(a, 31) + c;
+                a = Fetch(s, 16) + Fetch(s, n - 32);
+                z = Fetch(s, n - 8);
+                b = Rotate(a + z, 52);
+                c = Rotate(a, 37);
+                a += Fetch(s, n - 24); c += Rotate(a, 7); a += Fetch(s, n - 16);
+                ulong wf = a + z, ws = b + Rotate(a, 31) + c;
+                ulong r = ShiftMix((vf + ws) * k2 + (wf + vs) * k0);
+                return (ShiftMix(r * k0 + vs) * k2).ToString("X");
+            }
+        }
+    }
+}
+'@
 }
 
 function Find-StartMenuShortcutFor([string]$Program) {
@@ -3672,13 +3775,18 @@ function Get-TaskbarPins {
     $skipped = New-Object System.Collections.ArrayList
     foreach ($entry in (Get-TaskbarPinCatalog)) {
         if ($entry.Aumid) {
-            [void]$pins.Add([PSCustomObject]@{ Name=$entry.Name; Aumid=$entry.Aumid; LinkPath='' })
+            [void]$pins.Add([PSCustomObject]@{ Name=$entry.Name; Aumid=$entry.Aumid; LinkPath=''; LinkAumid='' })
             continue
         }
         $program = [Environment]::ExpandEnvironmentVariables($entry.Program)
         $link = if (Test-Path -LiteralPath $program -PathType Leaf) { Find-StartMenuShortcutFor $program } else { $null }
-        if ($link) { [void]$pins.Add([PSCustomObject]@{ Name=$entry.Name; Aumid=''; LinkPath=$link }) }
-        else { [void]$skipped.Add($entry.Name) }
+        if (-not $link) { [void]$skipped.Add($entry.Name); continue }
+        $linkAumid = ''
+        if ($entry.MozillaApp) {
+            Initialize-ShortcutAppIdType
+            $linkAumid = [Dingo.ShortcutAppId]::MozillaInstallHash((Split-Path -Parent $program))
+        }
+        [void]$pins.Add([PSCustomObject]@{ Name=$entry.Name; Aumid=''; LinkPath=$link; LinkAumid=$linkAumid })
     }
     [PSCustomObject]@{ Pins=@($pins); Skipped=@($skipped) }
 }
@@ -3736,14 +3844,32 @@ function Get-TaskbarPinKindState($Setting) {
         return (New-StateResult 'Alternate' $Setting.AlternateState "No taskbar layout from Dingo.$skippedText")
     }
     $current = if ($fileExists) { [IO.File]::ReadAllText($script:TaskbarLayoutPath) } else { '' }
+    $unmatched = @(Get-TaskbarPinsWithoutAppId $wanted.Pins | ForEach-Object Name)
+    if ($unmatched.Count) {
+        return (New-StateResult 'Partial' 'Partly set up' "The Start menu shortcut for $($unmatched -join ', ') does not carry the app ID its window uses, so the pin and the open window would show as two buttons. Apply the card again.$skippedText")
+    }
     if ($policy.File -and "$($policy.Locked)" -eq '1' -and $current -eq (New-TaskbarLayoutXml $wanted.Pins)) {
         return (New-StateResult 'Preferred' $Setting.PreferredState "Pins $($names -join ' and ') for each account at its next sign-in.$skippedText")
     }
     return (New-StateResult 'Partial' 'Partly set up' "The taskbar layout in $script:TaskbarLayoutPath does not match the installed apps. Apply the card again.$skippedText")
 }
 
+function Get-TaskbarPinsWithoutAppId($Pins) {
+    foreach ($pin in @($Pins)) {
+        if (-not $pin.LinkAumid) { continue }
+        Initialize-ShortcutAppIdType
+        if ([Dingo.ShortcutAppId]::Get($pin.LinkPath) -ne $pin.LinkAumid) { $pin }
+    }
+}
+
 function Write-TaskbarLayout {
     $pins = (Get-TaskbarPins).Pins
+    # Pin and window share a button only when the shortcut carries the window's
+    # app ID. Windows copies the shortcut when it pins it, so this comes first.
+    foreach ($pin in @(Get-TaskbarPinsWithoutAppId $pins)) {
+        [Dingo.ShortcutAppId]::Set($pin.LinkPath, $pin.LinkAumid)
+        Write-Log 'INFO' "Gave the $($pin.Name) shortcut $($pin.LinkPath) the app ID $($pin.LinkAumid), which its window uses."
+    }
     $folder = Split-Path -Parent $script:TaskbarLayoutPath
     if (-not (Test-Path -LiteralPath $folder -PathType Container)) { New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop | Out-Null }
     [IO.File]::WriteAllText($script:TaskbarLayoutPath, (New-TaskbarLayoutXml $pins), (New-Object Text.UTF8Encoding($false)))
@@ -7408,9 +7534,13 @@ if ($SelfTest) {
         throw "'tools-taskbar-pins' must be a reversible Tool shortcuts card that requests administrator approval and asks for a sign-out."
     }
     $pinXml = [xml](New-TaskbarLayoutXml @(
-        [PSCustomObject]@{ Name='A'; Aumid='Microsoft.WindowsTerminal_8wekyb3d8bbwe!App'; LinkPath='' },
-        [PSCustomObject]@{ Name='B'; Aumid=''; LinkPath='C:\ProgramData\Microsoft\Windows\Start Menu\Programs\A & B.lnk' }
+        [PSCustomObject]@{ Name='A'; Aumid='Microsoft.WindowsTerminal_8wekyb3d8bbwe!App'; LinkPath=''; LinkAumid='' },
+        [PSCustomObject]@{ Name='B'; Aumid=''; LinkPath='C:\ProgramData\Microsoft\Windows\Start Menu\Programs\A & B.lnk'; LinkAumid='' }
     ))
+    # Read from installs.ini and the open windows of real installs.
+    Initialize-ShortcutAppIdType
+    if ([Dingo.ShortcutAppId]::MozillaInstallHash('C:\Program Files\LibreWolf') -ne '83C1C0F3FA8524B1') { throw 'The LibreWolf app ID must match the one its window uses.' }
+    if ([Dingo.ShortcutAppId]::MozillaInstallHash('C:\Program Files\Mozilla Firefox') -ne '308046B0AF4A39CB') { throw 'The Firefox install hash must match the one Firefox uses.' }
     $pinNs = New-Object Xml.XmlNamespaceManager $pinXml.NameTable
     $pinNs.AddNamespace('t', 'http://schemas.microsoft.com/Start/2014/TaskbarLayout')
     if ($pinXml.SelectNodes('//t:TaskbarPinList/*', $pinNs).Count -ne 2) { throw 'The taskbar layout must list one pin per app.' }

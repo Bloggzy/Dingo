@@ -1821,7 +1821,7 @@ try {
     Test-Case 'The taskbar pin card leaves another policy alone and follows the installed apps' {
         $card = $script:Settings | Where-Object Id -eq 'tools-taskbar-pins'
         $script:TaskbarLayoutPath = Join-Path $scratch 'TaskbarLayout.xml'
-        function Get-TaskbarPins { [PSCustomObject]@{ Pins=@([PSCustomObject]@{ Name='Windows Terminal'; Aumid='Microsoft.WindowsTerminal_8wekyb3d8bbwe!App'; LinkPath='' }); Skipped=@('LibreWolf') } }
+        function Get-TaskbarPins { [PSCustomObject]@{ Pins=@([PSCustomObject]@{ Name='Windows Terminal'; Aumid='Microsoft.WindowsTerminal_8wekyb3d8bbwe!App'; LinkPath=''; LinkAumid='' }); Skipped=@('LibreWolf') } }
         function Get-TaskbarPolicyValues { [PSCustomObject]@{ Locked=1; File='C:\Corp\Layout.xml' } }
         $state = Get-TaskbarPinKindState $card
         Assert ($state.Status -eq 'Unavailable') "Another policy was not left alone: $($state.Status)."
@@ -1833,12 +1833,26 @@ try {
         function Get-TaskbarPolicyValues { [PSCustomObject]@{ Locked=1; File=$script:TaskbarLayoutPath } }
         Assert ((Get-TaskbarPinKindState $card).Status -eq 'Preferred') 'A current layout did not read Pinned.'
         function Get-TaskbarPins { [PSCustomObject]@{ Pins=@(
-            [PSCustomObject]@{ Name='Windows Terminal'; Aumid='Microsoft.WindowsTerminal_8wekyb3d8bbwe!App'; LinkPath='' },
-            [PSCustomObject]@{ Name='LibreWolf'; Aumid=''; LinkPath='C:\ProgramData\Microsoft\Windows\Start Menu\Programs\LibreWolf.lnk' }); Skipped=@() } }
+            [PSCustomObject]@{ Name='Windows Terminal'; Aumid='Microsoft.WindowsTerminal_8wekyb3d8bbwe!App'; LinkPath=''; LinkAumid='' },
+            [PSCustomObject]@{ Name='LibreWolf'; Aumid=''; LinkPath='C:\ProgramData\Microsoft\Windows\Start Menu\Programs\LibreWolf.lnk'; LinkAumid='' }); Skipped=@() } }
         Assert ((Get-TaskbarPinKindState $card).Status -eq 'Partial') 'A layout without a newly installed app did not read Partly set up.'
         Update-TaskbarLayoutIfOn
         Assert ((Get-TaskbarPinKindState $card).Status -eq 'Preferred') 'An install did not add the app to the layout.'
         Assert ([IO.File]::ReadAllText($script:TaskbarLayoutPath) -match 'LibreWolf\.lnk') 'The layout does not name the LibreWolf shortcut.'
+    }
+    Test-Case 'A pinned shortcut is given the app ID its window uses' {
+        $link = Join-Path $scratch 'Browser.lnk'
+        $shell = New-Object -ComObject WScript.Shell
+        $made = $shell.CreateShortcut($link); $made.TargetPath = (Join-Path $env:WINDIR 'notepad.exe'); $made.Save()
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+        Initialize-ShortcutAppIdType
+        Assert ([Dingo.ShortcutAppId]::Get($link) -eq '') 'A new shortcut should carry no app ID.'
+        $pin = [PSCustomObject]@{ Name='Browser'; Aumid=''; LinkPath=$link; LinkAumid='83C1C0F3FA8524B1' }
+        Assert (@(Get-TaskbarPinsWithoutAppId @($pin)).Count -eq 1) 'A shortcut without the app ID was not found.'
+        [Dingo.ShortcutAppId]::Set($link, '83C1C0F3FA8524B1')
+        Assert ([Dingo.ShortcutAppId]::Get($link) -eq '83C1C0F3FA8524B1') 'The app ID was not written to the shortcut.'
+        Assert ((Read-ShortcutFile $link).Target -like '*notepad.exe') 'Writing the app ID changed the shortcut target.'
+        Assert (@(Get-TaskbarPinsWithoutAppId @($pin)).Count -eq 0) 'A shortcut with the app ID still counts as without.'
     }
     Test-Case 'A failed progress checkpoint is a warning, not a stopped worker' {
         $missing = Join-Path $scratch 'no-such-folder\result.json'

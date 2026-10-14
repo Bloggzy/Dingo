@@ -460,6 +460,7 @@ All four cards are reversible. Turning one off removes only the files Dingo mark
 - The pins appear after you sign out and sign in again.
 - Dingo adds pins after the apps already on the taskbar. It never removes a pin.
 - LibreWolf is pinned through its own Start menu shortcut, so it is pinned only once it is installed. If you install LibreWolf after the card is on, Dingo adds it to the file straight away.
+- The LibreWolf installer makes its Start menu shortcut with no app ID, but the LibreWolf window has one. Windows groups a pin and a window by this ID, so without it an open LibreWolf gets a second taskbar button. Dingo writes the ID onto the shortcut before it pins it. The ID is the one LibreWolf uses for its install, such as `83C1C0F3FA8524B1` for `C:\Program Files\LibreWolf`.
 - On Windows 11 24H2 and later, you can unpin a Dingo pin, and Windows does not pin it again.
 - If your organisation already sets the Start Layout policy, the card says **Set by another policy**, and Dingo does not change it.
 
