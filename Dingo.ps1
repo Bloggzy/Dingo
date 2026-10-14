@@ -4571,7 +4571,7 @@ function Get-Settings {
         'Created' 'Not created' 'Shortcut' @([PSCustomObject]@{ Scope='Machine'; Folder=$script:DesktopShortcutDirectory }) $false $false @{} 'Tool shortcuts'))
     # RestartRequired, because Explorer reads the layout when someone signs in.
     [void]$settings.Add((New-Setting 'tools-taskbar-pins' 'Tools' 'Pin to taskbar' `
-        "Pins Windows Terminal and LibreWolf to the taskbar for every account on this computer, after the apps already pinned there. It uses the Start Layout policy, the way Microsoft supports for taskbar pins. The pins appear after you sign out and back in. LibreWolf is pinned only once it is installed. Turning this off removes the policy and Dingo's layout file." `
+        "Pins Windows Terminal and LibreWolf to the taskbar for every account on this computer, after the apps already pinned there. It uses the Start Layout policy, the way Microsoft supports for taskbar pins. Sign out and back in after you apply it. Windows can show the pins straight away, but until you sign in again an open LibreWolf gets a second taskbar button. LibreWolf is pinned only once it is installed. Turning this off removes the policy and Dingo's layout file." `
         'Pinned' 'Not pinned' 'TaskbarPin' @() $false $true @{} 'Tool shortcuts'))
     # Added last on purpose. The elevated worker runs the plan in this order, so
     # the launchers are written after the tools they point at are installed.
