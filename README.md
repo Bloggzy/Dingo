@@ -427,6 +427,7 @@ A tool with its own installer goes where that installer puts it. A tool without 
 | --- | --- | --- |
 | `tools-start-menu` | Start menu shortcuts | Writes shortcuts to `...\Start Menu\Programs\DFIR Tools` |
 | `tools-desktop` | Desktop shortcuts | Writes shortcuts to `C:\Users\Public\Desktop` |
+| `tools-taskbar-pins` | Pin to taskbar | Pins Windows Terminal and LibreWolf to the taskbar |
 | `tools-on-path` | Run tools from anywhere | Puts the tools `bin` folder on the computer PATH |
 
 **Run tools from anywhere** writes one small `.cmd` launcher per command-line tool into `bin` inside the tools folder, `C:\DFIR\Tools\bin` by default, then adds that one folder to the PATH. You can then type this from any folder:
@@ -445,7 +446,22 @@ These cards turn the feature on or off. After a card is on, each tool you instal
 - A shortcut is written only to a folder that already holds a Dingo shortcut.
 - If a file with the same name is not Dingo's, Dingo leaves it alone. The tool still installs, and the card says **Partly set up**. Apply the card to see why.
 
-All three cards are reversible. Turning one off removes only the files Dingo marked as its own.
+All four cards are reversible. Turning one off removes only the files Dingo marked as its own.
+
+**Pin to taskbar** pins Windows Terminal and LibreWolf for every account on the computer. Windows 11 gives scripts only one supported way to pin: the Start Layout policy, with a taskbar layout file. Dingo writes the file to `C:\ProgramData\Dingo\TaskbarLayout.xml`, then sets these two values in `HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer`:
+
+| Value | Data |
+| --- | --- |
+| `StartLayoutFile` | the path to the file |
+| `LockedStartLayout` | `1` |
+
+- The pins appear after you sign out and sign in again.
+- Dingo adds pins after the apps already on the taskbar. It never removes a pin.
+- LibreWolf is pinned through its own Start menu shortcut, so it is pinned only once it is installed. If you install LibreWolf after the card is on, Dingo adds it to the file straight away.
+- On Windows 11 24H2 and later, you can unpin a Dingo pin, and Windows does not pin it again.
+- If your organisation already sets the Start Layout policy, the card says **Set by another policy**, and Dingo does not change it.
+
+Microsoft documents this in [Configure the Windows taskbar pinned apps](https://learn.microsoft.com/en-us/windows/configuration/taskbar/pinned-apps).
 
 ### File associations
 

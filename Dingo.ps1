@@ -199,6 +199,11 @@ $script:DesktopShortcutDirectory = Join-Path $env:PUBLIC 'Desktop'
 # Written into the shortcut comment. Only shortcuts carrying this are ever
 # deleted, so one placed by hand or by an installer is left alone.
 $script:ShortcutMarker = 'Created by Dingo. Safe to delete.'
+# The taskbar pin card writes Microsoft's taskbar layout file here, and points
+# the Start Layout policy at it. Dingo only ever removes the policy when it
+# still points at this file.
+$script:TaskbarLayoutPath = Join-Path $env:ProgramData 'Dingo\TaskbarLayout.xml'
+$script:TaskbarPolicySubKey = 'SOFTWARE\Policies\Microsoft\Windows\Explorer'
 # Dingo registers its own handler names so ownership is never in doubt. Only an
 # extension pointing at a name starting with this is ever given back.
 $script:AssociationProgIdPrefix = 'Dingo.'
@@ -3612,6 +3617,150 @@ function Set-ShortcutKindPart($Setting, [string]$DesiredState, [string]$Scope) {
     }
 }
 
+# Windows 11 lets scripts pin to the taskbar only through the Start Layout
+# policy: a LayoutModification XML file, named by StartLayoutFile, with
+# LockedStartLayout set to 1. These are the values the Start Layout policy in
+# StartMenu.admx writes. Explorer reads the file when someone signs in.
+# A packaged app is pinned by its AUMID. A desktop app is pinned by its own
+# Start menu shortcut, which carries the app ID Windows groups its windows by.
+function Get-TaskbarPinCatalog {
+    @(
+        [PSCustomObject]@{ Name='Windows Terminal'; Aumid='Microsoft.WindowsTerminal_8wekyb3d8bbwe!App'; Program='' },
+        [PSCustomObject]@{ Name='LibreWolf'; Aumid=''; Program='%ProgramFiles%\LibreWolf\librewolf.exe' }
+    )
+}
+
+function Find-StartMenuShortcutFor([string]$Program) {
+    # The installer's own all-users shortcut, not one Dingo wrote.
+    $root = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return $null }
+    foreach ($file in @(Get-ChildItem -LiteralPath $root -Filter '*.lnk' -File -Recurse -ErrorAction SilentlyContinue | Sort-Object FullName)) {
+        try { $link = Read-ShortcutFile $file.FullName } catch { continue }
+        if ($link.Description -eq $script:ShortcutMarker) { continue }
+        if ($link.Target -and [string]::Equals([IO.Path]::GetFullPath($link.Target), [IO.Path]::GetFullPath($Program), [StringComparison]::OrdinalIgnoreCase)) {
+            return $file.FullName
+        }
+    }
+    return $null
+}
+
+function Get-TaskbarPins {
+    # A desktop app that is not installed, or has no Start menu shortcut, is
+    # left out, and the card names it.
+    $pins = New-Object System.Collections.ArrayList
+    $skipped = New-Object System.Collections.ArrayList
+    foreach ($entry in (Get-TaskbarPinCatalog)) {
+        if ($entry.Aumid) {
+            [void]$pins.Add([PSCustomObject]@{ Name=$entry.Name; Aumid=$entry.Aumid; LinkPath='' })
+            continue
+        }
+        $program = [Environment]::ExpandEnvironmentVariables($entry.Program)
+        $link = if (Test-Path -LiteralPath $program -PathType Leaf) { Find-StartMenuShortcutFor $program } else { $null }
+        if ($link) { [void]$pins.Add([PSCustomObject]@{ Name=$entry.Name; Aumid=''; LinkPath=$link }) }
+        else { [void]$skipped.Add($entry.Name) }
+    }
+    [PSCustomObject]@{ Pins=@($pins); Skipped=@($skipped) }
+}
+
+function New-TaskbarLayoutXml($Pins) {
+    # PinGeneration lets a person unpin a Dingo pin for good. Windows reads it
+    # from 24H2 (build 26100) with the June 2025 update. On an older build a
+    # layout that uses it pins nothing, so it is left out there.
+    $generation = if ([Environment]::OSVersion.Version.Build -ge 26100) { ' PinGeneration="1"' } else { '' }
+    $lines = New-Object System.Collections.ArrayList
+    [void]$lines.Add('<?xml version="1.0" encoding="utf-8"?>')
+    [void]$lines.Add('<!-- Written by Dingo. Safe to delete. -->')
+    [void]$lines.Add('<LayoutModificationTemplate xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification" xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout" xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout" xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout" Version="1">')
+    [void]$lines.Add('  <CustomTaskbarLayoutCollection>')
+    [void]$lines.Add('    <defaultlayout:TaskbarLayout>')
+    [void]$lines.Add('      <taskbar:TaskbarPinList>')
+    foreach ($pin in @($Pins)) {
+        if ($pin.Aumid) {
+            [void]$lines.Add("        <taskbar:UWA AppUserModelID=`"$([Security.SecurityElement]::Escape($pin.Aumid))`"$generation />")
+        } else {
+            [void]$lines.Add("        <taskbar:DesktopApp DesktopApplicationLinkPath=`"$([Security.SecurityElement]::Escape($pin.LinkPath))`"$generation />")
+        }
+    }
+    [void]$lines.Add('      </taskbar:TaskbarPinList>')
+    [void]$lines.Add('    </defaultlayout:TaskbarLayout>')
+    [void]$lines.Add('  </CustomTaskbarLayoutCollection>')
+    [void]$lines.Add('</LayoutModificationTemplate>')
+    return (($lines -join "`r`n") + "`r`n")
+}
+
+function Get-TaskbarPolicyValues {
+    $values = Get-ItemProperty -LiteralPath "HKLM:\$script:TaskbarPolicySubKey" -ErrorAction SilentlyContinue
+    [PSCustomObject]@{
+        Locked = Get-JsonField $values 'LockedStartLayout' $null
+        File = [string](Get-JsonField $values 'StartLayoutFile' '')
+    }
+}
+
+function Test-TaskbarPolicyIsDingo($Policy) {
+    if ([string]::IsNullOrWhiteSpace($Policy.File)) { return $false }
+    $expanded = [Environment]::ExpandEnvironmentVariables($Policy.File)
+    return [string]::Equals($expanded, $script:TaskbarLayoutPath, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-TaskbarPinKindState($Setting) {
+    $policy = Get-TaskbarPolicyValues
+    if ($policy.File -and -not (Test-TaskbarPolicyIsDingo $policy)) {
+        return (New-StateResult 'Unavailable' 'Set by another policy' "The Start Layout policy already points at $($policy.File). Dingo leaves it alone, so it never replaces your organisation's layout.")
+    }
+    $wanted = Get-TaskbarPins
+    $names = @($wanted.Pins | ForEach-Object Name)
+    $skippedText = if ($wanted.Skipped.Count) { " Not installed, so not pinned: $($wanted.Skipped -join ', ')." } else { '' }
+    $fileExists = Test-Path -LiteralPath $script:TaskbarLayoutPath -PathType Leaf
+    if (-not $policy.File -and -not $fileExists) {
+        return (New-StateResult 'Alternate' $Setting.AlternateState "No taskbar layout from Dingo.$skippedText")
+    }
+    $current = if ($fileExists) { [IO.File]::ReadAllText($script:TaskbarLayoutPath) } else { '' }
+    if ($policy.File -and "$($policy.Locked)" -eq '1' -and $current -eq (New-TaskbarLayoutXml $wanted.Pins)) {
+        return (New-StateResult 'Preferred' $Setting.PreferredState "Pins $($names -join ' and ') for each account at its next sign-in.$skippedText")
+    }
+    return (New-StateResult 'Partial' 'Partly set up' "The taskbar layout in $script:TaskbarLayoutPath does not match the installed apps. Apply the card again.$skippedText")
+}
+
+function Write-TaskbarLayout {
+    $pins = (Get-TaskbarPins).Pins
+    $folder = Split-Path -Parent $script:TaskbarLayoutPath
+    if (-not (Test-Path -LiteralPath $folder -PathType Container)) { New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop | Out-Null }
+    [IO.File]::WriteAllText($script:TaskbarLayoutPath, (New-TaskbarLayoutXml $pins), (New-Object Text.UTF8Encoding($false)))
+    Write-Log 'INFO' "Wrote the taskbar layout with $(@($pins | ForEach-Object Name) -join ', ') to $script:TaskbarLayoutPath."
+}
+
+function Set-TaskbarPinKindPart($Setting, [string]$DesiredState, [string]$Scope) {
+    $policy = Get-TaskbarPolicyValues
+    if ($policy.File -and -not (Test-TaskbarPolicyIsDingo $policy)) {
+        throw "The Start Layout policy already points at $($policy.File). Dingo does not replace it."
+    }
+    $key = "HKLM:\$script:TaskbarPolicySubKey"
+    if ($DesiredState -eq $Setting.PreferredState) {
+        Write-TaskbarLayout
+        if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force -ErrorAction Stop | Out-Null }
+        New-ItemProperty -LiteralPath $key -Name 'StartLayoutFile' -Value $script:TaskbarLayoutPath -PropertyType ExpandString -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -LiteralPath $key -Name 'LockedStartLayout' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+    } else {
+        if ($policy.File) {
+            Remove-ItemProperty -LiteralPath $key -Name 'StartLayoutFile' -ErrorAction Stop
+            Remove-ItemProperty -LiteralPath $key -Name 'LockedStartLayout' -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $script:TaskbarLayoutPath -PathType Leaf) { Remove-Item -LiteralPath $script:TaskbarLayoutPath -Force -ErrorAction Stop }
+        Write-Log 'INFO' 'Removed the Dingo taskbar layout and its Start Layout policy.'
+    }
+}
+
+function Update-TaskbarLayoutIfOn {
+    # Like launchers, a tool installed after the card is on is added to the
+    # layout straight away. A card that is off is never turned on here.
+    try {
+        if (-not (Test-TaskbarPolicyIsDingo (Get-TaskbarPolicyValues))) { return }
+        Write-TaskbarLayout
+    } catch {
+        Write-Log 'WARN' "The taskbar layout was not updated: $($_.Exception.Message) Apply Pin to taskbar to update it."
+    }
+}
+
 function Join-WordList([string[]]$Words) {
     $items = @($Words)
     if ($items.Count -le 1) { return ($items -join '') }
@@ -3963,6 +4112,7 @@ function Update-ToolLaunchers($Tool) {
     } catch {
         Write-Log 'WARN' "$($Tool.Name) is installed, but its shortcuts were not checked: $($_.Exception.Message)"
     }
+    Update-TaskbarLayoutIfOn
 }
 
 function Set-PackageKindPart($Setting, [string]$DesiredState, [string]$Scope) {
@@ -4272,6 +4422,10 @@ function Get-Settings {
     [void]$settings.Add((New-Setting 'tools-desktop' 'Tools' 'Desktop shortcuts' `
         "Puts the same shortcuts on the shared Desktop, for every account on this computer. Turning this off removes only the shortcuts Dingo made." `
         'Created' 'Not created' 'Shortcut' @([PSCustomObject]@{ Scope='Machine'; Folder=$script:DesktopShortcutDirectory }) $false $false @{} 'Tool shortcuts'))
+    # RestartRequired, because Explorer reads the layout when someone signs in.
+    [void]$settings.Add((New-Setting 'tools-taskbar-pins' 'Tools' 'Pin to taskbar' `
+        "Pins Windows Terminal and LibreWolf to the taskbar for every account on this computer, after the apps already pinned there. It uses the Start Layout policy, the way Microsoft supports for taskbar pins. The pins appear after you sign out and back in. LibreWolf is pinned only once it is installed. Turning this off removes the policy and Dingo's layout file." `
+        'Pinned' 'Not pinned' 'TaskbarPin' @() $false $true @{} 'Tool shortcuts'))
     # Added last on purpose. The elevated worker runs the plan in this order, so
     # the launchers are written after the tools they point at are installed.
     [void]$settings.Add((New-Setting 'tools-on-path' 'Tools' 'Run tools from anywhere' `
@@ -6084,6 +6238,7 @@ function Initialize-SettingHandlers {
     } 'Get-PackageKindState' 'Set-PackageKindPart'
     Register-SettingHandler 'ToolPath' { param($entries) @('Machine') } 'Get-ToolPathKindState' 'Set-ToolPathKindPart'
     Register-SettingHandler 'Shortcut' { param($entries) @('Machine') } 'Get-ShortcutKindState' 'Set-ShortcutKindPart'
+    Register-SettingHandler 'TaskbarPin' { param($entries) @('Machine') } 'Get-TaskbarPinKindState' 'Set-TaskbarPinKindPart'
     # File types are a per-account choice, so this handler never needs elevation.
     Register-SettingHandler 'Association' { param($entries) @('User') } 'Get-AssociationKindState' 'Set-AssociationKindPart'
     Register-SettingHandler 'Terminal' { param($entries) @('User') } 'Get-TerminalKindState' 'Set-TerminalKindPart'
@@ -6330,7 +6485,7 @@ if ($FinalizeInternationalSettings) {
 
 if ($SelfTest) {
     # Tools.json may add tools, so the total is the fixed settings plus the catalog.
-    $expectedSettingCount = 36 + @(Get-ToolCatalog).Count + @(Get-ToolCatalog | Where-Object { @($_.Associations).Count }).Count
+    $expectedSettingCount = 37 + @(Get-ToolCatalog).Count + @(Get-ToolCatalog | Where-Object { @($_.Associations).Count }).Count
     if ($script:Settings.Count -ne $expectedSettingCount) { throw "Expected $expectedSettingCount settings, found $($script:Settings.Count)." }
     foreach ($workerHelper in @('Test-DisplayLanguagePackInstalled','Install-DisplayLanguagePack','Write-Utf8FileAtomically','New-ApplyResult','New-OperationComponent')) {
         if (-not (Get-Command $workerHelper -CommandType Function -ErrorAction SilentlyContinue)) { throw "Elevated-worker helper is unavailable: $workerHelper" }
@@ -6356,7 +6511,7 @@ if ($SelfTest) {
     if ($launcherAst.Extent.Text -notmatch '-ElevationBroker' -or $launcherAst.Extent.Text -match '-Verb\s+RunAs') { throw 'The WPF launcher must delegate UAC to the non-WPF elevation broker.' }
     $duplicates = $script:Settings | Group-Object Id | Where-Object Count -gt 1
     if ($duplicates) { throw "Duplicate IDs: $($duplicates.Name -join ', ')" }
-    if ($script:SettingHandlers.Count -ne 14) { throw "Expected 14 setting handlers, found $($script:SettingHandlers.Count)." }
+    if ($script:SettingHandlers.Count -ne 15) { throw "Expected 15 setting handlers, found $($script:SettingHandlers.Count)." }
     foreach ($setting in $script:Settings) { [void](Get-SettingHandler $setting.Kind) }
     foreach ($dispatcherName in @('Get-SettingState','Set-SettingPart')) {
         $dispatcherAst = $selfTestAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $dispatcherName },$true)
@@ -7227,6 +7382,19 @@ if ($SelfTest) {
         $lastToolIndex = [array]::IndexOf(@($script:Settings | ForEach-Object { $_.Id }), @($toolSettings)[-1].Id)
         if ($shortcutIndex -lt $lastToolIndex) { throw "'$shortcutId' must be applied after the tools it points at." }
     }
+    $pinSetting = $script:Settings | Where-Object Id -eq 'tools-taskbar-pins' | Select-Object -First 1
+    if (-not $pinSetting -or $pinSetting.Tab -ne 'Tool shortcuts' -or -not $pinSetting.RequiresAdmin -or -not $pinSetting.CanChoose -or -not $pinSetting.RestartRequired) {
+        throw "'tools-taskbar-pins' must be a reversible Tool shortcuts card that requests administrator approval and asks for a sign-out."
+    }
+    $pinXml = [xml](New-TaskbarLayoutXml @(
+        [PSCustomObject]@{ Name='A'; Aumid='Microsoft.WindowsTerminal_8wekyb3d8bbwe!App'; LinkPath='' },
+        [PSCustomObject]@{ Name='B'; Aumid=''; LinkPath='C:\ProgramData\Microsoft\Windows\Start Menu\Programs\A & B.lnk' }
+    ))
+    $pinNs = New-Object Xml.XmlNamespaceManager $pinXml.NameTable
+    $pinNs.AddNamespace('t', 'http://schemas.microsoft.com/Start/2014/TaskbarLayout')
+    if ($pinXml.SelectNodes('//t:TaskbarPinList/*', $pinNs).Count -ne 2) { throw 'The taskbar layout must list one pin per app.' }
+    if ($pinXml.SelectSingleNode('//t:DesktopApp', $pinNs).DesktopApplicationLinkPath -ne 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\A & B.lnk') { throw 'The taskbar layout must escape a shortcut path.' }
+    if ($pinXml.DocumentElement.SelectSingleNode('*[local-name()="CustomTaskbarLayoutCollection"]').GetAttribute('PinListPlacement')) { throw 'The taskbar layout must add pins, never replace the existing ones.' }
     $ezShortcuts = @(($builtInTools | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1).Shortcuts)
     if (@($ezShortcuts | Where-Object Name -eq 'Timeline Explorer').Count -ne 1) {
         throw "Eric Zimmerman's tools must offer a Timeline Explorer shortcut, because its installer makes none."

@@ -32,6 +32,10 @@ $script:ToolCatalogCache = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo
 # A tool install refreshes launchers when the launcher folder is on the PATH.
 # The real computer PATH must never decide that here.
 function Get-MachinePathValue { 'C:\Windows;C:\Windows\System32' }
+# The taskbar pin card reads a machine policy. The real one must never decide
+# what a test writes.
+$script:TaskbarLayoutPath = 'C:\Dingo-Test-Not-Used\TaskbarLayout.xml'
+function Get-TaskbarPolicyValues { [PSCustomObject]@{ Locked=$null; File='' } }
 Initialize-SettingHandlers
 $script:Settings = Get-Settings
 $script:Passed = 0
@@ -1813,6 +1817,28 @@ try {
         } finally { $stream.Dispose() }
         Assert ((Read-WorkerProgressFile $path).Phase -eq 'Finished') 'The progress file was not replaced while the window read it.'
         Remove-Item -LiteralPath "$path.bak" -Force -ErrorAction SilentlyContinue
+    }
+    Test-Case 'The taskbar pin card leaves another policy alone and follows the installed apps' {
+        $card = $script:Settings | Where-Object Id -eq 'tools-taskbar-pins'
+        $script:TaskbarLayoutPath = Join-Path $scratch 'TaskbarLayout.xml'
+        function Get-TaskbarPins { [PSCustomObject]@{ Pins=@([PSCustomObject]@{ Name='Windows Terminal'; Aumid='Microsoft.WindowsTerminal_8wekyb3d8bbwe!App'; LinkPath='' }); Skipped=@('LibreWolf') } }
+        function Get-TaskbarPolicyValues { [PSCustomObject]@{ Locked=1; File='C:\Corp\Layout.xml' } }
+        $state = Get-TaskbarPinKindState $card
+        Assert ($state.Status -eq 'Unavailable') "Another policy was not left alone: $($state.Status)."
+        Assert-Throws { Set-TaskbarPinKindPart $card 'Not pinned' 'Machine' } 'does not replace'
+        function Get-TaskbarPolicyValues { [PSCustomObject]@{ Locked=$null; File='' } }
+        $state = Get-TaskbarPinKindState $card
+        Assert ($state.Status -eq 'Alternate' -and $state.Details -match 'LibreWolf') "No layout should read Not pinned and name LibreWolf: $($state.Status) $($state.Details)"
+        Write-TaskbarLayout
+        function Get-TaskbarPolicyValues { [PSCustomObject]@{ Locked=1; File=$script:TaskbarLayoutPath } }
+        Assert ((Get-TaskbarPinKindState $card).Status -eq 'Preferred') 'A current layout did not read Pinned.'
+        function Get-TaskbarPins { [PSCustomObject]@{ Pins=@(
+            [PSCustomObject]@{ Name='Windows Terminal'; Aumid='Microsoft.WindowsTerminal_8wekyb3d8bbwe!App'; LinkPath='' },
+            [PSCustomObject]@{ Name='LibreWolf'; Aumid=''; LinkPath='C:\ProgramData\Microsoft\Windows\Start Menu\Programs\LibreWolf.lnk' }); Skipped=@() } }
+        Assert ((Get-TaskbarPinKindState $card).Status -eq 'Partial') 'A layout without a newly installed app did not read Partly set up.'
+        Update-TaskbarLayoutIfOn
+        Assert ((Get-TaskbarPinKindState $card).Status -eq 'Preferred') 'An install did not add the app to the layout.'
+        Assert ([IO.File]::ReadAllText($script:TaskbarLayoutPath) -match 'LibreWolf\.lnk') 'The layout does not name the LibreWolf shortcut.'
     }
     Test-Case 'A failed progress checkpoint is a warning, not a stopped worker' {
         $missing = Join-Path $scratch 'no-such-folder\result.json'
