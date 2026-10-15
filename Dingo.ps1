@@ -1342,6 +1342,24 @@ function Get-BuiltInToolCatalog {
             )
         },
         [PSCustomObject]@{
+            id='tool-git'; name='Git'; category='Scripting'
+            description='Git for Windows, with Git Bash. Clones and updates tool and rule repositories. The installer adds git to the PATH itself.'
+            install=[PSCustomObject]@{ kind='winget'; package='Git.Git'; scope='machine' }
+            detect=@(
+                [PSCustomObject]@{ kind='uninstall-key'; match='Git' },
+                [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\Git\cmd\git.exe' }
+            )
+        },
+        [PSCustomObject]@{
+            id='tool-gh'; name='GitHub CLI'; category='Scripting'
+            description='The gh command for GitHub: releases, issues, pull requests, and the API from the command line. The installer adds gh to the PATH itself.'
+            install=[PSCustomObject]@{ kind='winget'; package='GitHub.cli'; scope='machine' }
+            detect=@(
+                [PSCustomObject]@{ kind='uninstall-key'; match='GitHub CLI' },
+                [PSCustomObject]@{ kind='file'; path='%ProgramFiles%\GitHub CLI\gh.exe' }
+            )
+        },
+        [PSCustomObject]@{
             # Listed before the tools that need it, because the elevated worker
             # applies the plan in catalog order.
             id='tool-dotnet-desktop-9'; name='.NET 9 Desktop Runtime'; category='Forensics'
@@ -6897,7 +6915,7 @@ if ($SelfTest) {
     }
     # Tool cards offer an explicit update action, but never uninstall.
     $builtInTools = @(Get-BuiltInToolCatalog | ForEach-Object { ConvertTo-ToolDefinition $_ })
-    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9','tool-dotnet-desktop-10','tool-memprocfs','tool-volatility3','tool-volatility2','tool-hayabusa','tool-velociraptor','tool-duckdb','tool-uv','tool-librewolf')) {
+    foreach ($expectedId in @('tool-7zip','tool-notepadplusplus','tool-ripgrep','tool-sqlitebrowser','tool-eztools','tool-dotnet-desktop-9','tool-dotnet-desktop-10','tool-memprocfs','tool-volatility3','tool-volatility2','tool-hayabusa','tool-velociraptor','tool-duckdb','tool-uv','tool-librewolf','tool-git','tool-gh')) {
         if (@($builtInTools | Where-Object Id -eq $expectedId).Count -ne 1) { throw "The built-in tool catalog is missing '$expectedId'." }
     }
     # The tools that come straight from a GitHub release. Each one must name a
