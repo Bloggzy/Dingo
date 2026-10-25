@@ -66,7 +66,7 @@ Use a disposable snapshot and confirm that neither `Tools.json` nor `C:\Temp\Din
 
 ### Reviewed P4-F03 setup
 
-Use a disposable snapshot with the normal built-in catalog and a complete EZTools installation. Move `C:\DFIR\Tools\EZTools\net9\EvtxECmd\EvtxECmd.exe` to a backup path under `C:\Temp`; do not delete it or remove the .NET runtime. Collect evidence and preview only `tool-eztools`. Expect no UAC and preview exit code 0: the tool must read Partial / Incomplete installation, with three of four required files detected and the EvtxECmd path named as missing. Do not apply the tool card, because doing so would invoke the real upstream installer. Copy the evidence out and restore the snapshot afterward.
+Use a disposable snapshot with the normal built-in catalog and a complete EZTools installation. Move `C:\DFIR\Tools\EZTools\net\EvtxECmd\EvtxECmd.exe` to a backup path under `C:\Temp`; do not delete it or remove the .NET runtime. Collect evidence and preview only `tool-eztools`. Expect no UAC and preview exit code 0: the tool must read Partial / Incomplete installation, with three of four required files detected and the EvtxECmd path named as missing. Do not apply the tool card, because doing so would invoke the real upstream installer. Copy the evidence out and restore the snapshot afterward.
 
 ### Prepared P4-F04 fixture
 

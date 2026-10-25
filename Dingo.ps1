@@ -1363,7 +1363,7 @@ function Get-BuiltInToolCatalog {
             # Listed before the tools that need it, because the elevated worker
             # applies the plan in catalog order.
             id='tool-dotnet-desktop-9'; name='.NET 9 Desktop Runtime'; category='Forensics'
-            description="Eric Zimmerman's tools are built on .NET 9, which a fresh Windows 11 install does not include. Without this they fail to start with 'You must install .NET to run this application'."
+            description="For tools built on .NET 9, which a fresh Windows 11 install does not include. Without it they fail to start with 'You must install .NET to run this application'. Eric Zimmerman's tools moved to .NET 10 in October 2026 and no longer need this."
             install=[PSCustomObject]@{ kind='winget'; package='Microsoft.DotNet.DesktopRuntime.9'; scope='machine' }
             detect=@(
                 [PSCustomObject]@{ kind='file'; path='C:/Program Files/dotnet/shared/Microsoft.WindowsDesktop.App/9.*' }
@@ -1373,7 +1373,7 @@ function Get-BuiltInToolCatalog {
             # Listed before the tools that need it, because the elevated worker
             # applies the plan in catalog order.
             id='tool-dotnet-desktop-10'; name='.NET 10 Desktop Runtime'; category='Forensics'
-            description="Newer analyst tools are built on .NET 10, which a fresh Windows 11 install does not include. Without this they fail to start with 'You must install .NET to run this application'. This sits beside the .NET 9 runtime; it does not replace it."
+            description="Eric Zimmerman's tools and other newer analyst tools are built on .NET 10, which a fresh Windows 11 install does not include. Without this they fail to start with 'You must install .NET to run this application'. This sits beside the .NET 9 runtime; it does not replace it."
             install=[PSCustomObject]@{ kind='winget'; package='Microsoft.DotNet.DesktopRuntime.10'; scope='machine' }
             detect=@(
                 [PSCustomObject]@{ kind='file'; path='C:/Program Files/dotnet/shared/Microsoft.WindowsDesktop.App/10.*' }
@@ -1381,44 +1381,44 @@ function Get-BuiltInToolCatalog {
         },
         [PSCustomObject]@{
             id='tool-eztools'; name="Eric Zimmerman's tools"; category='Forensics'
-            description='The full DFIR tool set, including Timeline Explorer, Registry Explorer, EvtxECmd, and RECmd. Installed with the author''s own Get-ZimmermanTools script. Needs the .NET 9 Desktop Runtime, which is a card of its own on this tab.'
+            description='The full DFIR tool set, including Timeline Explorer, Registry Explorer, EvtxECmd, and RECmd. Installed with the author''s own Get-ZimmermanTools script. Needs the .NET 10 Desktop Runtime, which is a card of its own on this tab.'
             install=[PSCustomObject]@{
                 kind='script'; scope='machine'
-                url='https://raw.githubusercontent.com/EricZimmerman/Get-ZimmermanTools/d808d1dfe6446faf884576a8a1c11b6875197a19/Get-ZimmermanTools.ps1'
-                sha256='B9122527E7049D2AB3F9A58BC972189AAC62FAD9A83FDA59EA6B70C7360D7834'
+                url='https://raw.githubusercontent.com/EricZimmerman/Get-ZimmermanTools/340696dedf42d3fc2e5e35cf315be56189cda67c/Get-ZimmermanTools.ps1'
+                sha256='A849688E2EBD49F99A49B1A493D46E3E815F39226BC151FBF1CDBEAF60586F2D'
                 dest='%DINGO_TOOL_ROOT%\EZTools'
-                arguments=@('-NetVersion','9')
+                arguments=@('-NetVersion','10','-NoUpdate')
                 timeoutMinutes=45
             }
-            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/EZTools/net9'; pattern='*.exe'; recurse=$true }
+            shims=[PSCustomObject]@{ from='%DINGO_TOOL_ROOT%/EZTools/net'; pattern='*.exe'; recurse=$true }
             # Timeline Explorer is the reason most analysts open a csv at all.
             # .dat goes to Registry Explorer: on an analysis VM a .dat file is
             # almost always a registry hive, NTUSER.DAT or UsrClass.dat. Windows
             # leaves .dat unclaimed, so Dingo can take it.
             associations=@(
-                [PSCustomObject]@{ extension='.csv'; target='%DINGO_TOOL_ROOT%/EZTools/net9/TimelineExplorer/TimelineExplorer.exe'; description='Comma separated values' },
-                [PSCustomObject]@{ extension='.tsv'; target='%DINGO_TOOL_ROOT%/EZTools/net9/TimelineExplorer/TimelineExplorer.exe'; description='Tab separated values' },
-                [PSCustomObject]@{ extension='.dat'; target='%DINGO_TOOL_ROOT%/EZTools/net9/RegistryExplorer/RegistryExplorer.exe'; description='Registry hive' }
+                [PSCustomObject]@{ extension='.csv'; target='%DINGO_TOOL_ROOT%/EZTools/net/TimelineExplorer/TimelineExplorer.exe'; description='Comma separated values' },
+                [PSCustomObject]@{ extension='.tsv'; target='%DINGO_TOOL_ROOT%/EZTools/net/TimelineExplorer/TimelineExplorer.exe'; description='Tab separated values' },
+                [PSCustomObject]@{ extension='.dat'; target='%DINGO_TOOL_ROOT%/EZTools/net/RegistryExplorer/RegistryExplorer.exe'; description='Registry hive' }
             )
             # Get-ZimmermanTools makes no shortcuts at all, so the window tools are
             # invisible in the Start menu. A target that is not on disk is skipped.
             shortcuts=@(
-                [PSCustomObject]@{ name='Timeline Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/TimelineExplorer/TimelineExplorer.exe' },
-                [PSCustomObject]@{ name='Registry Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/RegistryExplorer/RegistryExplorer.exe' },
-                [PSCustomObject]@{ name='MFT Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/MFTExplorer/MFTExplorer.exe' },
-                [PSCustomObject]@{ name='ShellBags Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/ShellBagsExplorer/ShellBagsExplorer.exe' },
-                [PSCustomObject]@{ name='Jump List Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/JumpListExplorer/JumpListExplorer.exe' },
-                [PSCustomObject]@{ name='SDB Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/SDBExplorer/SDBExplorer.exe' },
-                [PSCustomObject]@{ name='EZViewer'; target='%DINGO_TOOL_ROOT%/EZTools/net9/EZViewer/EZViewer.exe' }
+                [PSCustomObject]@{ name='Timeline Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net/TimelineExplorer/TimelineExplorer.exe' },
+                [PSCustomObject]@{ name='Registry Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net/RegistryExplorer/RegistryExplorer.exe' },
+                [PSCustomObject]@{ name='MFT Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net/MFTExplorer/MFTExplorer.exe' },
+                [PSCustomObject]@{ name='ShellBags Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net/ShellBagsExplorer/ShellBagsExplorer.exe' },
+                [PSCustomObject]@{ name='Jump List Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net/JumpListExplorer/JumpListExplorer.exe' },
+                [PSCustomObject]@{ name='SDB Explorer'; target='%DINGO_TOOL_ROOT%/EZTools/net/SDBExplorer/SDBExplorer.exe' },
+                [PSCustomObject]@{ name='EZViewer'; target='%DINGO_TOOL_ROOT%/EZTools/net/EZViewer/EZViewer.exe' }
             )
-            requires=@('tool-dotnet-desktop-9')
+            requires=@('tool-dotnet-desktop-10')
             # A minimum inventory, not proof that every upstream tool downloaded.
             detectMode='all'
             detect=@(
-                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/EZTools/net9/TimelineExplorer/TimelineExplorer.exe' },
-                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/EZTools/net9/RegistryExplorer/RegistryExplorer.exe' },
-                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/EZTools/net9/EvtxECmd/EvtxECmd.exe' },
-                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/EZTools/net9/RECmd/RECmd.exe' }
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/EZTools/net/TimelineExplorer/TimelineExplorer.exe' },
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/EZTools/net/RegistryExplorer/RegistryExplorer.exe' },
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/EZTools/net/EvtxECmd/EvtxECmd.exe' },
+                [PSCustomObject]@{ kind='file'; path='%DINGO_TOOL_ROOT%/EZTools/net/RECmd/RECmd.exe' }
             )
         },
         [PSCustomObject]@{
@@ -6909,7 +6909,7 @@ if ($SelfTest) {
         $dependentMock.Requirements = @{ RequiredTools = @() }
         if (Get-SettingAdvisory $dependentMock) { throw 'A tool with no dependencies must produce no caveat.' }
         $ezRequires = @(($script:Settings | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1).Requirements['RequiredTools'])
-        if ($ezRequires -notcontains 'tool-dotnet-desktop-9') { throw "Eric Zimmerman's tools must declare the .NET runtime they need." }
+        if ($ezRequires -notcontains 'tool-dotnet-desktop-10') { throw "Eric Zimmerman's tools must declare the .NET runtime they need." }
     } finally {
         $script:DeviceIsManaged = $savedManagedState
     }
@@ -7101,6 +7101,13 @@ if ($SelfTest) {
     # move it. A literal here would silently ignore the option.
     if ($ezTool.Dest -ne "$($script:ToolRootToken)\EZTools") { throw "The Eric Zimmerman tool set must install to $($script:ToolRootToken)\EZTools." }
     if ($ezTool.Scope -ne 'machine') { throw 'Writing to the tools folder needs administrator approval.' }
+    # Upstream stopped publishing .NET 9 builds in October 2026. The script now
+    # saves to EZTools\net, and without -NoUpdate it replaces itself with a newer
+    # copy and stops before it downloads anything.
+    $ezArguments = @($ezTool.Arguments)
+    if (($ezArguments -join ' ') -notmatch '(^| )-NetVersion 10( |$)') { throw 'The Eric Zimmerman tool set must ask for the .NET 10 builds.' }
+    if ($ezArguments -notcontains '-NoUpdate') { throw 'The pinned Get-ZimmermanTools script must not update itself.' }
+    if (@($ezTool.Shortcuts | Where-Object { [string]$_.Target -notlike '*/EZTools/net/*' }).Count) { throw 'An Eric Zimmerman shortcut points outside the EZTools\net folder.' }
     $venvTool = ConvertTo-ToolDefinition ([PSCustomObject]@{ id='tool-venv'; name='Venv'; install=[PSCustomObject]@{ kind='python-venv'; python='C:/P/python.exe'; packages=@('dissect','dissect.target[full]==3.25.1'); dest='C:\x' }; detect=@([PSCustomObject]@{ kind='file'; path='x' }) })
     if ($venvTool.Packages.Count -ne 2 -or $venvTool.TimeoutSeconds -ne 1800) { throw 'A python-venv tool lost its packages or its default timeout.' }
     # Dissect is built in a venv from the Python card, never from the PATH, and
@@ -7168,10 +7175,10 @@ if ($SelfTest) {
     $ezSetting = $script:Settings | Where-Object Id -eq 'tool-eztools' | Select-Object -First 1
     if (-not $ezSetting.RequiresAdmin) { throw 'The Eric Zimmerman tool set must request administrator approval.' }
     if ([bool]$ezSetting.Requirements['WingetRequired']) { throw 'A script install must not be blocked by a missing winget.' }
-    # Eric Zimmerman's tools will not start without the .NET 9 Desktop Runtime,
+    # Eric Zimmerman's tools will not start without the .NET 10 Desktop Runtime,
     # and a fresh Windows 11 install does not have it. It must be offered, and it
     # must be installed first, because the worker applies the plan in this order.
-    $runtimeIndex = [array]::IndexOf(@($builtInTools | ForEach-Object { $_.Id }), 'tool-dotnet-desktop-9')
+    $runtimeIndex = [array]::IndexOf(@($builtInTools | ForEach-Object { $_.Id }), 'tool-dotnet-desktop-10')
     $ezIndex = [array]::IndexOf(@($builtInTools | ForEach-Object { $_.Id }), 'tool-eztools')
     if ($runtimeIndex -lt 0 -or $ezIndex -lt 0 -or $runtimeIndex -gt $ezIndex) {
         throw 'The .NET runtime must be listed before the tools that need it.'
@@ -7511,13 +7518,13 @@ if ($SelfTest) {
         New-Item -ItemType Directory -Path $shimTestDirectory -Force | Out-Null
         $foreignPath = Join-Path $shimTestDirectory 'mine.cmd'
         [IO.File]::WriteAllText($foreignPath, "@echo off`r`necho hand written`r`n", (New-Object Text.UTF8Encoding($false)))
-        Write-ToolShim 'EvtxECmd' 'C:\DFIR\Tools\EZTools\net9\EvtxeCmd\EvtxECmd.exe'
+        Write-ToolShim 'EvtxECmd' 'C:\DFIR\Tools\EZTools\net\EvtxeCmd\EvtxECmd.exe'
         $shimPath = Join-Path $shimTestDirectory 'EvtxECmd.cmd'
         $shimText = Get-Content -LiteralPath $shimPath -Raw
-        $expectedCall = '"C:\DFIR\Tools\EZTools\net9\EvtxeCmd\EvtxECmd.exe" %*'
+        $expectedCall = '"C:\DFIR\Tools\EZTools\net\EvtxeCmd\EvtxECmd.exe" %*'
         if (-not $shimText.Contains($expectedCall)) { throw 'The launcher does not call its program with the supplied arguments.' }
         if ([IO.File]::ReadAllBytes($shimPath)[0] -eq 0xEF) { throw 'A launcher must not start with a byte order mark; cmd.exe would choke on it.' }
-        if (-not (Test-ShimIsCurrent $shimPath 'C:\DFIR\Tools\EZTools\net9\EvtxeCmd\EvtxECmd.exe')) { throw 'A freshly written launcher was not recognised.' }
+        if (-not (Test-ShimIsCurrent $shimPath 'C:\DFIR\Tools\EZTools\net\EvtxeCmd\EvtxECmd.exe')) { throw 'A freshly written launcher was not recognised.' }
         if (Test-ShimIsCurrent $shimPath 'C:\Somewhere\Else.exe') { throw 'A launcher pointing elsewhere was treated as current.' }
         if (Test-ShimIsCurrent $foreignPath 'C:\anything.exe') { throw 'A hand-written file must never be treated as a Dingo launcher.' }
         $owned = @(Get-DingoShimFiles | Select-Object -ExpandProperty Name)
@@ -8772,7 +8779,7 @@ if ($UiSelfTest) {
     # reordered to match the display. The runtime still comes before its tools.
     $displayedToolOrder = @($script:Settings | Where-Object { $_.Tab -eq 'Install tools' } | Sort-Object { $ToolSettingsPanel.Children.IndexOf($_.CardControl) } | ForEach-Object { $_.Id })
     $planToolOrder = @($script:Settings | Where-Object { $_.Tab -eq 'Install tools' } | ForEach-Object { $_.Id })
-    if ([array]::IndexOf($planToolOrder, 'tool-dotnet-desktop-9') -gt [array]::IndexOf($planToolOrder, 'tool-eztools')) {
+    if ([array]::IndexOf($planToolOrder, 'tool-dotnet-desktop-10') -gt [array]::IndexOf($planToolOrder, 'tool-eztools')) {
         throw 'Sorting the cards must not reorder the plan.'
     }
     if ($displayedToolOrder.Count -ne $planToolOrder.Count) { throw 'The tool cards and the tool plan hold different tools.' }
